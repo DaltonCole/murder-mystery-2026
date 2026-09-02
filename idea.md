@@ -59,12 +59,12 @@ Fields collected per player:
     * Ability: Once per game, before round 5, may transfer their royal title to someone else. Doing so unmasks both the King/Queen and the Prince/Princess. The title then passes to a random Aristocrat — if that person already had a role, it is overwritten with King/Queen.
 * **Prince/Princess** — Count: 1
     * Goal: Protect the King/Queen
-    * Starting knowledge: *(TBD)*
-    * Ability: None
+    * Starting knowledge: None
+    * Ability: Learns of the King's/Queen's identity after round 2
 * **Priest/Priestess** — Count: 1
     * Goal: Protect the King/Queen
     * Starting knowledge: None
-    * Ability: Can protect one person per cult-recruitment round from being converted (they don't know this is what they're protecting against). The Cult Leader may not select the protected person during that round's recruitment and must choose someone else.
+    * Ability: Can protect one person per cult-recruitment round from being converted (they don't know this is what they're protecting against). The Cult Leader may not select the protected person during that round's recruitment and must choose someone else. They cannot protect the same person twice.
 * **Oracle** — Count: 1
     * Starting knowledge: None
     * Ability: After every odd round, may view a single player's entire history up to that point. That view is locked at that moment — the Oracle does not gain updates on how that player acts afterward.
@@ -221,11 +221,7 @@ These are the gaps and ambiguities left in the source notes. A multi-angle revie
     * *Option A:* Shared/simple — the whole faction wins iff the Leader's condition is met (King/Queen converted AND alive at the end); team lives or dies as one block (Secret Hitler-style).
     * *Option B:* Scoped/alternate — cult wins if the King/Queen is converted **or** the cult reaches N members by night's end; rewards recruitment momentum even if the final conversion fails.
     * *Option C:* Shared win + individual bonus — base win is the Leader's condition for everyone, but each recruited cultist also carries a personal secondary objective (stay unexposed / your recruiter survives) — Feed the Kraken-style team win with an individual layer.
-6. **Prince/Princess starting knowledge:** left blank.
-    * *Recommended:* knows the Priest/Priestess's identity — cheapest fix consistent with "None" as the doc's default elsewhere, and hands them a natural ally for the protector role they already have.
-    * *Alternative:* knows one random Aristocrat's identity (weaker seed-ally option).
-    * *Ability-not-knowledge alternative:* once per game, may swap roles with the King/Queen for a round — a mechanical hook instead of an info hook, if an ability is preferred over backfilled knowledge.
-7. **Is there a "Normal Revolutionary" catch-all**, analogous to "Normal Aristocrat," for Revolutionaries without a named character?
+6. **Is there a "Normal Revolutionary" catch-all**, analogous to "Normal Aristocrat," for Revolutionaries without a named character?
 
 ## 9. Multi-Angle Review Findings (2026-08-31)
 
