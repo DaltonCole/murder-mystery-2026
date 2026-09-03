@@ -88,6 +88,9 @@ Fields collected per player:
     * Starting knowledge: None
     * Flavor: Acts as a bartender by day; works to intoxicate one person per round for the Revolutionaries.
     * Ability: Once per round, selects a person who has a 50% chance of becoming drunk for that round. If successful, that person's ability doesn't work this round. The Bartender isn't told whether it worked; the target IS told if they're drunk.
+* **Spymaster** — Count: 1 *(new — adopted directly, see §10.1/§10.3)*
+    * Starting knowledge: None
+    * Ability: Once per game, may view a single player's faction color only (not their full history, unlike the Oracle, §5.1). Gives Revolutionary its first real tool for narrowing down who the King/Queen might be — previously neither Revolutionary nor Cultist had any identification tool at all, which review found to be the single biggest lever on hitting the 30/30/30 win-rate target (§10.1). Also resolves the former "Normal Revolutionary catch-all" open question.
 
 **Proposed / not yet finalized:**
 * Poison mechanic — poisoned players all die at the end of the night.
@@ -96,7 +99,7 @@ Fields collected per player:
 **Round-outcome mechanics:**
 * Revolutionaries operate as a democracy — they vote on who to poison.
 * If the Revolutionaries win a round, they get to poison someone.
-* If the Revolutionaries lose a round, they get a consolation "intelligence" reveal — e.g. learning the role/character of a single person ("You may have lost this one, but your intelligence network still came in! Who did you gather intelligence on?").
+* If the Revolutionaries lose a round, they get a consolation "intelligence" reveal: they choose a specific player and learn a direct yes/no answer to "is this person royalty (King/Queen or Prince/Princess)?" *(tightened from a generic role-reveal — see §10.1. Still doesn't resolve the mismatched trigger noted there — the poison action only fires on a round win, this only fires on a loss — see §8 item 9.)*
 
 ### 5.3 Cultist (secret faction)
 
@@ -105,6 +108,7 @@ Fields collected per player:
 * **Cult Leader** — Count: 1
     * Goal: Convert the King/Queen to the cult AND keep the King/Queen alive at the end of the night
     * Starting knowledge: None
+    * Ability: Before each recruitment window, may query one candidate with a direct yes/no "is this person Aristocrat-aligned?" check before deciding who to recruit. *(New — adopted directly. This was balance review's top-priority fix, bigger than any Aristocrat-side defensive change: the Cult Leader previously had zero way to find the King/Queen, making blind conversion attempts land well under a 30% success rate — see §10.1.)*
 * **Cultist** — Count: starts at 0, grows via recruitment during the game
     * Goal: Help the Cult Leader
     * Starting knowledge: Knows who their fellow cultists are
@@ -201,7 +205,7 @@ Alternating odd/even rounds, bookended by two special rounds, with an intermissi
 
 ## 8. Open Questions / TODO
 
-These are the gaps and ambiguities left in the source notes. A multi-angle review (§9) proposed concrete options for most of them — listed here as a menu, not a decision — flagged for follow-up.
+These are the gaps and ambiguities left in the source notes. Two multi-angle reviews (§9, §10) proposed concrete options for most of them — listed here as a menu, not a decision — flagged for follow-up.
 
 1. **Last round design:** completely undefined.
     * *Option A:* The Unmasking — ceremonial public faction reveal for all survivors, followed by a live vote/trial on the King/Queen's fate (Secret Hitler-style climax).
@@ -221,7 +225,35 @@ These are the gaps and ambiguities left in the source notes. A multi-angle revie
     * *Option A:* Shared/simple — the whole faction wins iff the Leader's condition is met (King/Queen converted AND alive at the end); team lives or dies as one block (Secret Hitler-style).
     * *Option B:* Scoped/alternate — cult wins if the King/Queen is converted **or** the cult reaches N members by night's end; rewards recruitment momentum even if the final conversion fails.
     * *Option C:* Shared win + individual bonus — base win is the Leader's condition for everyone, but each recruited cultist also carries a personal secondary objective (stay unexposed / your recruiter survives) — Feed the Kraken-style team win with an individual layer.
-6. **Is there a "Normal Revolutionary" catch-all**, analogous to "Normal Aristocrat," for Revolutionaries without a named character?
+6. **⚠️ Top priority — the "Blood on the Clocktower" amendment** (see bottom of doc, "# Amendments"). Dalton is considering replacing the current design with a daily public-elimination-vote format: the whole group votes each round to eliminate one player (or two, with enough players); Aristocrats hunt a new "Revolutionary Leader" role instead of protecting the King/Queen; Revolutionaries aim to survive the night; the Leader's title passes to another Revolutionary if eliminated early (mirrors the King/Queen's existing title-transfer, §5.1); Cultists keep helping the losing side (already compatible with §5.3). A four-angle review (§10) evaluated this in detail — summary before the options:
+    * **Fun:** genuinely the strongest lever available for making the game more fun — public elimination-vote formats reliably generate more real tension and table-talk than anything currently in the doc. But conditional on two things the amendment text doesn't specify: an actual scheduled discussion/debate phase before the vote (not a silent tally, which is all Accusation currently has — see item 10 below), and a defined role for eliminated players (being cut from a live 2-hour party is a much bigger deal than an abstract "poisoned" status).
+    * **Balance:** not adoptable as-is. It relocates the game's core balance flaw (no faction can *identify* its target) rather than fixing it — Aristocrats still have no way to find the Revolutionary Leader. Worse, nothing in the stated goals puts any elimination pressure on Cultists at all, which could push their win rate well above 30% instead of toward it. "Survive the night" for Revolutionary is also dangerously unscoped — does the whole faction need to avoid elimination, or just the Leader?
+    * **Simplicity:** a genuine net simplification of the core deduction loop if it *fully replaces* the odd-round tasks and Accusation (§6.1, §6.6) — those would become fully redundant and should be deleted, not kept alongside it. But the transition cost is real: it silently orphans 5 of Aristocrat's 6 characters and the whole King/Queen-conversion cascade (§5.1, §5.3), since Aristocrat's entire kit is currently built around protecting a King/Queen this amendment has no further use for. This is a full redesign of §5, not a bolt-on.
+    * **Content:** the biggest blocking question is whether the elimination vote *replaces* the round structure or runs *alongside* it — the amendment reads as a replacement ("instead of my current style") but doesn't say so outright. Two adoption paths:
+        * *Path A — clean mirror-swap:* Retire King/Queen. Revolutionary Leader becomes the universal target all three factions revolve around (Cultist's win condition becomes "convert and preserve the Revolutionary Leader," a direct swap of §5.3). The old Aristocrat protector kit (Prince/Princess, Priest/Priestess) reassigns to Revolutionary to protect their own Leader; Oracle moves to Aristocrat as a hunting tool. Potion Maker becomes an execution-immunity role (saves whoever the vote lands on) rather than an antidote-giver. A full functional kit-swap between factions, not a single new character.
+        * *Path B — additive:* Keep King/Queen as a lighter/ceremonial role (e.g. runs the nomination phase), treat "hunt the Leader" as an *added* Aristocrat objective alongside the existing one. Preserves existing character investment, but risks a dual-win-condition complexity problem and doesn't deliver the simplification the format is otherwise capable of. Weaker option.
+    * **Reusable regardless of path:** the vote mechanism itself substantially overlaps with the already-built Accusation mechanic (§6.6) — generalizing its target (anyone, not just suspected Cultists) and consequence (elimination, not exposure) gets most of the way there rather than inventing a new system. Eliminated players can fold into the existing Servant faction's separate scoring track (§5.4) rather than needing new "ghost" rules built from scratch.
+    * *Option A:* Adopt via Path A (full kit-swap) — biggest simplification payoff, biggest redesign cost.
+    * *Option B:* Adopt via Path B (additive) — lower redesign cost, weaker simplification/balance payoff, real risk of dual-win-condition bloat.
+    * *Option C:* Don't adopt for this event — keep the current task/contest design, but port the *discussion-phase* and *defined-elimination-status* lessons into the existing Accusation mechanic (§6.6) as a lighter-weight fun upgrade instead.
+    * Whichever direction: resolve first (1) does it fully replace §6.1/§6.2 or coexist, (2) what puts elimination pressure on Cultists, (3) what "survive the night" means precisely for Revolutionary.
+7. **Oracle (§5.1) and Accusation (§6.6) do overlapping jobs** — both are "find the Cultist" tools with the same odd-round cadence. Simplicity review recommends cutting or shrinking Oracle in favor of Accusation (more socially engaging — whole-table participation vs. one player's private lookup).
+    * *Option A:* Keep both as-is.
+    * *Option B:* Cut Oracle, lean on Accusation alone.
+    * *Option C:* Merge — fold Oracle's private-lookup flavor into Accusation's resolution (e.g. the exposer gets a bonus history glimpse).
+8. **The odd-round "Revolutionaries stall the Aristocrats" framing (§6.1) has no mechanic behind it** (also flagged §9.1 item 6). Simplicity review recommends cutting the framing line rather than building a new mechanic to justify it, unless Dalton wants the real sabotage tool.
+    * *Option A:* Cut the line — task rounds are just task rounds, no adversarial framing.
+    * *Option B:* Build a real sabotage action for Revolutionaries on odd rounds.
+    * *Option C:* Leave as unbacked flavor text — low cost, but inconsistent if a player asks "how do I actually stall them?"
+9. **Revolutionary's poison-action and intel-reveal fire on mutually exclusive round outcomes** (poison only on a round win, §5.2; intel only on a round loss) — balance review flags this as working against Revolutionary ever having both a target and a kill opportunity in the same window.
+    * *Option A:* Grant both on any round outcome (win or lose).
+    * *Option B:* Keep the asymmetry, but let a target identified on a loss stay "marked" for the next win's poison.
+10. **Accusation (§6.6) currently resolves as a silent app tally with no scheduled discussion phase** — fun review flags this as leaving the actual dramatic payoff of an accusation mechanic (the argument, not the tally) off the clock.
+    * *Option A:* Carve out explicit discussion time before the vote closes each eligible round.
+    * *Option B:* Leave it silent/app-only — lower time cost, less table drama.
+11. **"Servant Patronage" — proposed new mechanic, not yet decided:** once per game a Servant secretly pledges to one main faction; if that faction wins, the Servant gets a leaderboard bonus (announced anonymously via Whistledown, §6.5). Reuses existing Servant scoring and Whistledown publication — no new subsystem — and gives Servants a real stake in the main conflict instead of a purely parallel scoreboard.
+    * *Option A:* Adopt.
+    * *Option B:* Skip — Servant track stays fully separate as currently designed.
 
 ## 9. Multi-Angle Review Findings (2026-08-31)
 
@@ -231,12 +263,12 @@ Four parallel reviews of the plan above — game-balance (benchmarked against Fe
 
 1. **No player-driven accuse/vote mechanic exists anywhere in the doc.** All three named inspirations give the majority faction a collective tool against suspected minority players (Kraken's votes, Hitler's election pressure, Among Us's emergency meetings). Here, Aristocrats have zero tool to act on suspicion — only the Oracle's passive look and the Priest/Priestess's blind block exist. **Decision: adopted** — see §6.6 "The Accusation" for the mechanic as designed.
 2. **Cult recruitment trigger contradicts the cult's stated behavior.** The doc says the cult helps whichever side is *losing* (rubber-band), but only rewards recruitment when the side they helped *wins*. If they're propping up the underdog, that side is still likely to lose — so the cult may rarely grow, stalling its own win condition. **Decision: adopted, rubber-band** — recruitment decoupled onto a fixed schedule; see updated §5.3 Gameplay.
-3. **King/Queen is a single point of failure/success for all three factions' win conditions but has almost no agency.** Their only tool is a once-per-game, self-triggered, no-starting-info title transfer, and the §3 ticket system doesn't exclude them from low-involvement assignment the way it excludes the Defector. Recommend either excluding King/Queen from low-involvement assignment, or giving them a small passive ability/starting clue so they aren't a pure damage sponge for 90+ minutes. *(Still open — not covered by the latest decisions.)*
+3. **King/Queen is a single point of failure/success for all three factions' win conditions but has almost no agency.** Their only tool is a once-per-game, self-triggered, no-starting-info title transfer, and the §3 ticket system doesn't exclude them from low-involvement assignment the way it excludes the Defector. Recommend either excluding King/Queen from low-involvement assignment, or giving them a small passive ability/starting clue so they aren't a pure damage sponge for 90+ minutes. *(Still open — sharpened by §10.2 item 1: the ticket system tends to seat your most engaged player in this least-active role.)*
 4. **Poison should resolve at end-of-night, not as mid-game elimination** — see §8 item 3; both this review and the content-gap review converged on this independently. *(Still open — folded into the still-brainstormed Doctor/Medic/poison item.)*
 5. **Revolutionary's only defined win condition is single-target assassination.** If the King/Queen is well-protected (Priest/Priestess block + Potion Maker antidote + Prince/Princess), Revolutionaries may have no path to victory for the whole back half of the game. **Decision: no second win condition will be added** — Revolutionary keeps this single win condition (§5.2). This risk is accepted as-is; the new Accusation mechanic (§6.6) at least gives Revolutionaries something actionable even if the assassination plot stalls, but doesn't fully resolve the concern.
-6. **The odd-round "Revolutionaries stall the Aristocrats" framing has no mechanical lever.** The stated tension isn't backed by any mechanic that actually interferes with task completion — the Bartender's ability-suppression doesn't obviously touch the talk-to-X task system. Either give Revolutionaries a direct sabotage action on odd rounds, or reframe the fiction — right now the mechanic and the narrative don't connect.
+6. **The odd-round "Revolutionaries stall the Aristocrats" framing has no mechanical lever.** The stated tension isn't backed by any mechanic that actually interferes with task completion — the Bartender's ability-suppression doesn't obviously touch the talk-to-X task system. Either give Revolutionaries a direct sabotage action on odd rounds, or reframe the fiction — right now the mechanic and the narrative don't connect. *(Now tracked with concrete options as §8 item 8.)*
 7. **Zero-feedback abilities risk disengagement over a 2-hour game.** The Priest/Priestess never learns whether their block mattered; the Bartender never learns if their 50% roll landed. Recommend a delayed/end-game reveal ("here's who you protected/drugged and whether it worked") so these roles feel meaningful in retrospect.
-8. **Oracle's full-history reveal (available after every odd round — up to 3x/game) may be too strong** relative to the cult's information advantage, and risks flattening the "secret third faction" mystery the design otherwise depends on. Consider reducing frequency (once per game) or narrowing scope (task-talk history only, not everything).
+8. **Oracle's full-history reveal (available after every odd round — up to 3x/game) may be too strong** relative to the cult's information advantage, and risks flattening the "secret third faction" mystery the design otherwise depends on. Consider reducing frequency (once per game) or narrowing scope (task-talk history only, not everything). *(Sharpened by §10.4 item 1: Oracle and Accusation, §6.6, are now flagged as doing the same job outright — see §8 item 7.)*
 
 ### 9.2 Bridgerton Theme Integration
 
@@ -270,6 +302,42 @@ Four parallel reviews of the plan above — game-balance (benchmarked against Fe
 7. **Device/tech assumptions are unstated.** The design assumes every player has a personal smartphone, working audio, and reliable connectivity, with no stated fallback for a dead battery or forgotten phone. *Missing info: native vs. web app, one device per player guaranteed, offline/no-signal fallback at the venue — blocks the tech-stack decision.*
 8. **Faction-color reveal could leak by accident.** Aristocrat=blue / Revolutionary=red / Cultist=lime green, combined with close-quarters mingling — if a phone is glanced mid press-and-hold and color paints before anything else, a neighbor could read someone's faction at a glance. Consider making color the last thing revealed on long-press, behind a tap-through, not the first paint.
 
+## 10. Balance / Fun / Content / Simplicity Review (2026-09-03)
+
+Four parallel reviews covering the angles Dalton asked for directly: 30/30/30 balance math, fun/engagement, additional content, and a simplicity audit — each also required to evaluate the "Blood on the Clocktower" amendment below specifically. The amendment's full cross-fork analysis lives in **§8 item 6** rather than being duplicated here, since it's a decision for Dalton to make, not a finding to file away. What follows is everything else.
+
+### 10.1 Balance — target 30/30/30 (Aristocrat / Revolutionary / Cultist; Servant excluded)
+
+**Core finding: Aristocrat wins by default; Revolutionary and Cultist both lacked any way to identify the King/Queen.** Aristocrat's win condition (§5.1) is a passive default — nothing needs to happen for them to win. Revolutionary and Cultist both need to land a specific action on one hidden individual, and neither previously had a real way to find out who that is:
+* The Cult Leader had zero scouting ability — recruitment was a blind guess among all players, at ~1 recruit per 2 rounds over 6 rounds, giving real odds well under 30%. **Fixed directly** — the Cult Leader now gets a yes/no "is this candidate Aristocrat-aligned" query before each recruitment window (§5.3).
+* Revolutionary's only lead-generation tool (the round-loss intel reveal, §5.2) only fired on a round *loss*, while the poison action it would feed into only fired on a round *win* — mutually exclusive triggers. **Partially fixed directly** — the intel reveal is now a chooseable, direct "is this person royalty?" check rather than a vague role-reveal (§5.2). The win/lose trigger mismatch itself is still open — see §8 item 9.
+* Revolutionary was also character-thin (1 named role vs. Aristocrat's 6) with no identification tool of its own. **Fixed directly** — added the Spymaster character (§5.2), which also resolves the former "Normal Revolutionary catch-all" open question.
+
+Net effect: both hostile factions now have a real (if limited) way to find their target, which review found to be the single biggest lever on hitting 30/30/30 — bigger than any further defensive buff to Aristocrat would have been.
+
+### 10.2 Fun
+
+1. **King/Queen has nothing to do, and the ticket system (§3) tends to seat your most engaged player there anyway** — a purely passive damage-sponge role landing on the person most likely to want to be central to the game. Sharpens §9.1 item 3; still open.
+2. **Even-round contests (§6.2) fragment the room into three concurrent tracks.** Communal cheering/reacting — a big party-game fun multiplier — gets lost when the group splits into three side-activities instead of watching one shared spectacle.
+3. **Accusation (§6.6) has stakes but no scheduled drama** — it resolves as a silent app tally. The fun part of accusation mechanics is the argument, not the tally. See §8 item 10.
+4. **Worth keeping as-is:** the "talk to 3, credit if 1 matches, don't learn which" task mechanic (§6.1) — genuinely good uncertainty design that sustains engagement.
+5. Aristocrat's kit (Priest/Priestess, Oracle, Potion Maker) is almost entirely reactive/defensive; Revolutionary and Cultist get more proactive choices. Purely reactive roles tend to feel flatter over a 2-hour live game — worth keeping in mind for future additions.
+
+### 10.3 Content
+
+1. **Revolutionary "Spymaster" — adopted directly** (§5.2): once per game, view a single player's faction color only. Closes both the roster-asymmetry and no-ID-tool gaps at once, and resolves the former "Normal Revolutionary catch-all" question.
+2. **"Servant Patronage" — proposed, not yet adopted** (see §8 item 11): lets Servants secretly pledge to a main faction for a leaderboard bonus, announced via Whistledown. No new subsystem — reuses existing Servant scoring and Whistledown publication.
+3. Everything else already had concrete options on record in §8 (Last round, Hard tasks, Doctor/Medic + poison, Servant color, Cultist win condition) — not re-litigated here.
+
+### 10.4 Simplicity
+
+1. **Oracle (§5.1) and Accusation (§6.6) are duplicate "find the Cultist" tools** — same cadence, same problem, different UI. See §8 item 7.
+2. **The odd-round "stall the Aristocrats" framing (§6.1) has no mechanic behind it** — pure narrative debt Dalton would have to explain with nothing backing it. See §8 item 8.
+3. **Even rounds (§6.2) run three concurrent live-hosted subsystems solo** (bracket sizing, judged voting + piano audio, trivia infra) — the single largest live-ops complexity item in the doc, independent of anything else in this review. Reinforces §9.3 items 1 and 3.
+4. **Three Aristocrat characters (King/Queen, Prince/Princess, Priest/Priestess) share the literal goal "protect the King/Queen"** with only mildly differentiated abilities — not mechanically redundant, but blurs together for a first-time player memorizing who does what.
+5. **The King/Queen-conversion cascade (§5.3)** — "if converted before title-transfer used, auto-use it, and Prince/Princess also joins the cult" — is a rare edge case with a disproportionately complex explanation. Candidate for a flat cut (converting the King/Queen simply doesn't auto-convert the Prince/Princess) unless this specific twist is a deliberately loved moment — not cut here since it's original design intent; Dalton's call.
+
 # Amendments
 
 * Instead of my current style, I am thinking of converting the style to more of a blood on the clocktower style where the group decides on a single person to eliminate every round (or 2 if we have enough players). The goal of the Aristocrats would then be to remove the revolutionary leader while the goal of the revolutionists would be to survive the night. If the revolutionaist leader is eliminated too early, then their title would be passed onto another revolutionist. The cultist party would act as a balancing party.
+    * *Status: not yet decided — see §8 item 6 for the full four-angle evaluation (balance, fun, content, simplicity) and the concrete adoption options (A: full kit-swap, B: additive, C: don't adopt).*
