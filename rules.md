@@ -29,8 +29,8 @@ Three factions are locked in a hidden three-way conflict, each hunting a differe
 | Faction | Wins if... | Loses if... |
 |---|---|---|
 | **The Ton** | The Revolutionary Leader is correctly identified and Cast Out by game's end, **and** the King/Queen has not been converted to the Cult | The Leader survives uncaught, or the King/Queen ends the game converted |
-| **The Uprising** | Their Leader survives to the end without being correctly Cast Out | Their Leader is Cast Out and no successor remains |
-| **The Cult** | **Path A:** the Revolutionary Leader is converted and remains uncaught, **and** the King/Queen is *either* also converted (and remains uncaught) *or* has been Cast Out — either fate closes out the King/Queen's side of Path A, as long as the Leader is secured. **Path B:** at least one of the two is converted, *and* the Cult Leader is personally Cast Out by public vote (the "martyrdom" path) | Neither path is achieved by game's end |
+| **The Uprising** | Their Leader survives to the end, uncaught **and** unconverted | Their Leader is Cast Out with no successor remaining, **or** their Leader is secretly converted to the Cult |
+| **The Cult** | **Path A:** the Revolutionary Leader **and** the King/Queen are both converted and remain uncaught. **Path B:** the Revolutionary Leader is converted (and remains uncaught) **and** the King/Queen is Denounced. **Path C:** the King/Queen is converted (and remains uncaught) **and** the Revolutionary Leader is Denounced. **Path D:** at least one of the two is converted, **and** the Cult Leader is personally Cast Out by public vote (the "martyrdom" path) | None of the four paths is achieved by game's end |
 
 Servants sit entirely outside this three-way race.
 
@@ -84,7 +84,7 @@ Servants sit entirely outside this three-way race.
 
 | Character | Goal | Starting Knowledge | Ability |
 |---|---|---|---|
-| **Cult Leader** | Achieve Path A or Path B | None | Before each recruitment window, may query one candidate with a choice of *"is this person Ton-aligned?"* or *"is this person the Revolutionary Leader?"* May also designate which recruited Cultist holds the Deceiver and Whisperer titles below. |
+| **Cult Leader** | Achieve any of Paths A-D (§2) | None | Before each recruitment window, may query one candidate with a choice of *"is this person Ton-aligned?"* or *"is this person the Revolutionary Leader?"* May also designate which recruited Cultist holds the Deceiver and Whisperer titles below. |
 | **Cultist** | Support the Cult Leader | Knows fellow cultists | — |
 | **The Deceiver** | Protect the Cult's cover under scrutiny | Knows fellow cultists | Once per game, if targeted by another player's info-check ability (Oracle, Almanac, Spymaster, the Cult Leader's own query, the Uprising's intel query), may force that check to return a false result. |
 | **The Whisperer** | Shield a fellow cultist from exposure | Knows fellow cultists | Once per game, may shield one named fellow Cultist from being a valid nomination target for one round. |
@@ -152,10 +152,10 @@ In-fiction, this mechanic is never called an "execution" or a "vote" — to play
 
 ### Resolution by target
 
-- **The Revolutionary Leader, correctly identified:** the title passes immediately and privately to a successor. Never announced — the room only ever learns "someone was Cast Out."
-- **The King/Queen, Cast Out (not converted):** allowed, no immunity. Permanently disables the Oracle for the rest of the game — a real cost, but not a loss condition; the Ton can still win. Note this no longer closes off Cult Path A on its own (§2) — the Cult can still win Path A through the Revolutionary Leader alone.
+- **The Revolutionary Leader, correctly identified:** the title passes immediately and privately to a successor. Never announced — the room only ever learns "someone was Cast Out." This closes off Paths A and B for the *executed* Leader specifically (they can no longer be converted), but **opens the door to Path C** (§2) if the King/Queen is, or later becomes, converted. The new successor is a fresh, unconverted Leader — the Cult would need to identify and convert them separately for the Uprising's threat to renew.
+- **The King/Queen, Cast Out (not converted):** allowed, no immunity. Permanently disables the Oracle for the rest of the game — a real cost, but not a loss condition; the Ton can still win. This closes off Path A (both converted) for good, but **opens the door to Path B** (§2) if the Revolutionary Leader is, or later becomes, converted.
   - **If this happens at the Round 3 Denouncement specifically** (i.e., before Round 4 — the earliest the King/Queen can fall), the **Prince/Princess is Cast Out in the same moment**, removed from the game alongside the King/Queen. The title then passes to a random remaining Ton player, the same way it would if the King/Queen had used their own transfer ability. No new Prince/Princess is assigned — that role is simply gone for the rest of the game. This doesn't apply if the King/Queen falls later, at Round 5 or the finale.
-- **The Cult Leader, Cast Out:** if a royal conversion had already landed, this triggers Cult Path B — the martyrdom path — resolved privately and immediately, revealed publicly only at the finale. *(Because nobody outside the Cult can ever be sure a conversion has already happened, Casting Out a suspected Cult Leader always carries real risk — the "safe" choice and the "correct" choice aren't always the same thing.)*
+- **The Cult Leader, Cast Out:** if a royal conversion had already landed, this triggers Cult Path D — the martyrdom path — resolved privately and immediately, revealed publicly only at the finale. *(Because nobody outside the Cult can ever be sure a conversion has already happened, Casting Out a suspected Cult Leader always carries real risk — the "safe" choice and the "correct" choice aren't always the same thing.)*
 - **A regular Cultist, an innocent bystander, or anyone else:** simply removed. No faction or role is ever confirmed publicly for any Cast-Out player, including a correctly-caught Cultist — every result gets the same deliberately uninformative public treatment (§6). Full transparency is saved entirely for the Last Denouncement.
 
 ### What happens to a Cast Out player
