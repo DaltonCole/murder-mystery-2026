@@ -20,7 +20,7 @@ Three factions are locked in a hidden three-way conflict, each hunting a differe
 - **Late arrivals** become **Servants** — a separate, non-competing track with their own leaderboard and tasks, outside the three-way conflict.
 - **Character creation:** Character Name, Real Name, Occupation, 5 Hobbies, 5 Notable Clothing Features, and 5 Skills — each capped at 32 characters, displayed in Pascal Case. Servants' bios feed into the shared task pool too.
 - **Hidden roles:** players privately view their own faction and character by press-and-hold on their phone. Showing your screen to anyone but Dalton is against the rules.
-- **Approximate faction sizes at 20-30 players:** Servants ≈ 10% of the total. The Cult starts seeded with just the Cult Leader; the rest splits roughly evenly between the Ton and the Uprising. At 20 players that's roughly 8-9 Ton, 8-9 Uprising, and a Cult growing from 1 toward ~4 by game's end; at 30 players, roughly 13/13/1→4.
+- **Approximate faction sizes at 20-30 players:** Servants ≈ 10% of the total. The Cult starts seeded with just the Cult Leader. The remaining pool splits **unevenly on purpose — the Ton outnumbers the Uprising**, roughly 60/40, giving the Uprising a real numeric disadvantage to play against. At 20 players that's roughly 10 Ton, 7 Uprising, and a Cult growing from 1 toward ~4 by game's end; at 30 players, roughly 16 Ton, 10 Uprising, 1→4 Cult.
 
 ---
 
@@ -30,7 +30,7 @@ Three factions are locked in a hidden three-way conflict, each hunting a differe
 |---|---|---|
 | **The Ton** | The Revolutionary Leader is correctly identified and Cast Out by game's end, **and** the King/Queen has not been converted to the Cult | The Leader survives uncaught, or the King/Queen ends the game converted |
 | **The Uprising** | Their Leader survives to the end without being correctly Cast Out | Their Leader is Cast Out and no successor remains |
-| **The Cult** | **Path A:** both the King/Queen *and* the Revolutionary Leader are converted and remain uncaught, **or** **Path B:** at least one of the two is converted, *and* the Cult Leader is personally Cast Out by public vote (the "martyrdom" path) | Neither path is achieved by game's end |
+| **The Cult** | **Path A:** the Revolutionary Leader is converted and remains uncaught, **and** the King/Queen is *either* also converted (and remains uncaught) *or* has been Cast Out — either fate closes out the King/Queen's side of Path A, as long as the Leader is secured. **Path B:** at least one of the two is converted, *and* the Cult Leader is personally Cast Out by public vote (the "martyrdom" path) | Neither path is achieved by game's end |
 
 Servants sit entirely outside this three-way race.
 
@@ -94,7 +94,7 @@ Servants sit entirely outside this three-way race.
 **Recruitment schedule:** at 20 players or fewer, the Cult recruits one new member every 2 rounds, flat, for the whole game. **At 21-30 players**, that same flat cadence holds through Round 3, but from Round 4 onward, each recruitment window brings in **2 new members instead of 1**.
 
 - The Cult secretly aids whichever public faction is currently behind, each round.
-- If the King/Queen is converted before using their title-transfer ability, that ability auto-fires, and the Prince/Princess is swept into the Cult too. No equivalent cascade applies to the Revolutionary Leader.
+- If the King/Queen is *converted* before using their title-transfer ability, that ability auto-fires, and the Prince/Princess is swept into the Cult too, staying in play as a secret cultist. (A separate cascade applies if the King/Queen is instead *Cast Out* at the Round 3 Denouncement specifically — see §5, where the Prince/Princess is removed from the game rather than converted.) No equivalent cascade applies to the Revolutionary Leader.
 - A converted player keeps their original character and abilities, letting them keep fooling their original side.
 
 ### 3.4 Revolutionary Leader secrecy
@@ -127,10 +127,11 @@ Nothing in the app or rules can actually *prevent* a Leader from telling a trust
 **Time budget:** nomination 2 min, discussion 3-4 min, ballot 90 sec, resolution 90 sec — roughly 8 minutes of vote-phase on top of the task phase, landing the whole round around 18-20 minutes.
 
 ### Contest rounds (2, 4)
-Split into 3 zones — Strength, Creativity, Intelligence — roughly 7-10 people per zone. Staff each zone's scoring with an already-Cast-Out player from an earlier round.
+- **Round 2:** the whole room plays together as one group, moving through Strength, Creativity, and Intelligence in sequence — this is everyone's first look at all 3 categories.
+- **Round 4:** the room splits into 3 sub-groups, one per category (Strength, Creativity, Intelligence), each player choosing which zone to join. Staff each zone's scoring with an already-Cast-Out player from an earlier round.
 
 ### Intermission
-"Who is Lorel's number one love?" — anyone Cast Out earlier is ineligible to enter. Entrants are capped at 4-5 (first come via the app, or a quick random draw) so the bit doesn't consume the whole break.
+"Who is Lorel's number one love?" — anyone Cast Out earlier is ineligible to enter. Everyone who wants to take part opts in via the app; **5 entrants are then selected at random** from that pool.
 
 ### The Last Round — "The Last Denouncement"
 One final nomination → discussion → vote, with a longer discussion window than the mid-game rounds. This time, **whoever is Cast Out has their full character and faction revealed publicly** on a shared screen. Immediately after, Dalton walks through all three win conditions and reveals everything that happened privately all game — conversions, successions, any martyrdom trigger.
@@ -144,7 +145,7 @@ In-fiction, this mechanic is never called an "execution" or a "vote" — to play
 - **Nomination:** silent app-based pre-nomination surfaces the top 2-3 candidates.
 - **Discussion:** a shared window covering all surfaced candidates together, hard-capped.
 - **The ballot:** cast privately via app (a "calling card" laid against a name) — secret ballot, public tally only.
-- **Ties:** only nominees tied *at* the last available slot trigger a runoff (30-second final statement each, then a re-vote among just those tied). Anyone clearly above the cutoff is already locked in. A repeat tie leaves that specific slot unfilled.
+- **Ties:** only nominees tied *at* the last available slot trigger a runoff (30-second final statement each, then a re-vote among just those tied). Anyone clearly above the cutoff is already locked in. **A repeat tie means no one is Denounced for that slot** — it doesn't cancel any other slot's already-decided result.
 - **Abstaining** is allowed and doesn't count toward the tally.
 - **How many are Cast Out per round:** 1 execution at ≤20 players remaining; 2 simultaneous executions at 21-30 players remaining (`ceil(players ÷ 15)` beyond that). The Grand Inquisitor can override this once per game, forcing a 2-for-1 Denouncement regardless of headcount.
 - **The Magistrate/Firebrand double-vote**, in a multi-slot round, adds one extra vote to whichever single nominee that player supported — it doesn't split across multiple nominees.
@@ -152,12 +153,13 @@ In-fiction, this mechanic is never called an "execution" or a "vote" — to play
 ### Resolution by target
 
 - **The Revolutionary Leader, correctly identified:** the title passes immediately and privately to a successor. Never announced — the room only ever learns "someone was Cast Out."
-- **The King/Queen, Cast Out (not converted):** allowed, no immunity. Permanently closes off Cult Path A, and permanently disables the Oracle for the rest of the game — a real cost, but not a loss condition; the Ton can still win.
+- **The King/Queen, Cast Out (not converted):** allowed, no immunity. Permanently disables the Oracle for the rest of the game — a real cost, but not a loss condition; the Ton can still win. Note this no longer closes off Cult Path A on its own (§2) — the Cult can still win Path A through the Revolutionary Leader alone.
+  - **If this happens at the Round 3 Denouncement specifically** (i.e., before Round 4 — the earliest the King/Queen can fall), the **Prince/Princess is Cast Out in the same moment**, removed from the game alongside the King/Queen. The title then passes to a random remaining Ton player, the same way it would if the King/Queen had used their own transfer ability. No new Prince/Princess is assigned — that role is simply gone for the rest of the game. This doesn't apply if the King/Queen falls later, at Round 5 or the finale.
 - **The Cult Leader, Cast Out:** if a royal conversion had already landed, this triggers Cult Path B — the martyrdom path — resolved privately and immediately, revealed publicly only at the finale. *(Because nobody outside the Cult can ever be sure a conversion has already happened, Casting Out a suspected Cult Leader always carries real risk — the "safe" choice and the "correct" choice aren't always the same thing.)*
 - **A regular Cultist, an innocent bystander, or anyone else:** simply removed. No faction or role is ever confirmed publicly for any Cast-Out player, including a correctly-caught Cultist — every result gets the same deliberately uninformative public treatment (§6). Full transparency is saved entirely for the Last Denouncement.
 
 ### What happens to a Cast Out player
-They fold into the **Servant track**: their app reveals their own full role and history for closure, they're locked out of future nominations/votes/abilities, but they can keep playing contest rounds — as a participant or as a zone scorekeeper — and get the **Gallery** role for the finale (§7).
+**They remain a member of their faction** — if that faction goes on to win the game, they win too, even though they can no longer act. Operationally, for the rest of the game they participate alongside the Servants: their app reveals their own full role and history for closure, they're locked out of future nominations/votes/abilities, but they can keep playing contest rounds — as a participant or as a zone scorekeeper — and get the **Gallery** role for the finale (§7).
 
 ---
 
