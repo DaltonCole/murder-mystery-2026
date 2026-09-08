@@ -55,6 +55,7 @@ The roster below is expanded from the original design specifically to give more 
 | **The Magistrate** *(NEW)* | Ensure the Denouncement lands correctly | None | Once per game, their ballot counts as two votes when the tally is taken |
 | **The Duelist** *(NEW)* | Force a suspect to face judgment | None | Once per game, before nomination closes, may "challenge" one player — that player is guaranteed a spot on the ballot regardless of how much verbal support they got |
 | **The Almanac** *(NEW)* | Narrow the field by elimination | None | Once per game, privately learns 3 players who are **definitely not** the Revolutionary Leader — a breadth clue, distinct from Oracle's single-target depth clue, that gets more useful as the suspect pool grows |
+| **The Grand Inquisitor** *(NEW — added per §11 item 1)* | Press the Ton's advantage at a critical Denouncement | None | Once per game, before a ballot closes, may invoke their office: **both** of the top two vote-getters are Cast Out that round, not just one — regardless of what the standard headcount-based execution count (§6) would otherwise call for. Doesn't cost a separate action elsewhere; this is a one-time override of a single Denouncement's outcome |
 | **Defector** | Starts Aristocrat, flips at intermission | — | Starts as a different Aristocrat character; after intermission, becomes Revolutionary and loses the Aristocrat role. Can never be King/Queen, Prince/Princess, **or the Revolutionary Leader** |
 | **Normal Aristocrat** | Catch-all | None | Auto-succeeds one failed social task, once per game |
 
@@ -71,27 +72,40 @@ The roster below is expanded from the original design specifically to give more 
 | **The Cell Leader** *(NEW)* | Coordinate the rank-and-file without exposing the true Leader | Knows 2 other Revolutionaries' identities (**never** the Leader themselves) | None beyond that knowledge — cheap social glue that reinforces the "secret cells" fiction behind the Leader's isolation, without ever compromising it |
 | **Normal Revolutionary** | Catch-all | None | Once per game, ignore one vote cast against you |
 
-**Poison is cut entirely** (it existed only to serve the old "kill the King/Queen" win condition). Round-outcome rewards are repurposed instead: **winning** a round grants a one-time protective/disruptive action benefiting the Leader (vote-immunity for the next Denouncement, or a forced re-vote if the Leader is nominated); **losing** a round grants a chosen-target yes/no query, **"is this person the Revolutionary Leader?"**
+**Poison is cut entirely** (it existed only to serve the old "kill the King/Queen" win condition). **Round-outcome rewards were retargeted per §11 item 1** — they now trigger off *Denouncement* results specifically, not contest-round wins/losses, since contests have nothing to do with the Leader hunt and Dalton asked for rewards tied more directly to the Denouncement itself:
+- **The Leader isn't among the surfaced nominees at all** (the cleanest outcome for the Uprising): a one-time protective/disruptive action benefiting the Leader (vote-immunity for the next Denouncement, or a forced re-vote if the Leader is nominated later).
+- **The Leader is surfaced but survives the vote** (a close call): the chosen-target yes/no query, **"is this person the Revolutionary Leader?"** — framed in-fiction as a lesson learned from the near miss.
+- **The Leader is correctly Cast Out:** no reward — this is the real loss condition, and succession proceeds as normal (§6).
+
+**A mirrored reward exists for the Ton**, addressing the same request: if a Denouncement correctly Cast Out the real Revolutionary Leader *or* an actual Cultist (i.e., the vote hit a real hidden target, not an innocent bystander), the Ton receives a bonus Almanac-style clue (3 more confirmed non-Leaders) usable before the next Denouncement — stacking with any player's own Almanac use.
 
 ### 4.3 The Cult (secret faction)
 
 | Character | Goal | Starting Knowledge | Ability |
 |---|---|---|---|
-| **Cult Leader** | Achieve Path A or Path B (§3) | None | Before each recruitment window, may query one candidate with a choice of **either** "is this person Aristocrat-aligned?" **or** "is this person the Revolutionary Leader?" |
+| **Cult Leader** | Achieve Path A or Path B (§3) | None | Before each recruitment window, may query one candidate with a choice of **either** "is this person Aristocrat-aligned?" **or** "is this person the Revolutionary Leader?" May also designate which recruited Cultist holds the Deceiver and Whisperer titles below — see below |
 | **Cultist** | Support the Cult Leader | Knows fellow cultists | — |
+| **The Deceiver** *(NEW — adopted per §11 item 3)* | Protect the Cult's cover under scrutiny | Knows fellow cultists | Once per game, if targeted by another player's info-check ability (Oracle, Almanac, Spymaster, the Cult Leader's own query, the Uprising's intel query), may force that check to return a false result |
+| **The Whisperer** *(NEW — adopted per §11 item 3)* | Shield a fellow cultist from exposure | Knows fellow cultists | Once per game, may shield one named fellow Cultist from being a valid nomination target for one round |
 
-- Recruitment stays on a fixed schedule (~1 new cultist per 2 rounds), decoupled from round outcomes. **§10 flags this fixed schedule as a real problem at 20-30 players — the Cult doesn't grow or search any faster in a bigger room, so its relative strength shrinks. See §11.**
+**How Deceiver and Whisperer get assigned:** only the Cult Leader exists at game start — there's no one to hold these titles until recruitment produces someone. **Per Dalton's decision (§11 item 3), the Cult Leader personally designates which recruited Cultist holds each title**, at the moment of recruitment or at any later point. A title, once assigned, stays with that Cultist for the rest of the game (no reassigning mid-game — keeps this simple to track). Each title can only be held by one Cultist at a time; with only ~4 Cultists expected by game's end (§2), the Cult Leader is effectively choosing 2 of their eventual ~3 recruits to specialize, which is itself a real strategic decision worth having them make deliberately rather than assigning at random.
+
+- **Recruitment now scales with headcount and ramps up over the course of the game — a direct change per §11 item 2** (previously a flat ~1 new cultist per 2 rounds regardless of N, which §10 found made the Cult proportionally weaker at bigger events, not stronger). New schedule: at 21-30 players, the Cult still recruits on the original cadence through the first Denouncement (Round 3), but from Round 4 onward, each subsequent recruitment window brings in **2 new members instead of 1**. This both scales the Cult's endgame size to the room and gives it a rising, back-loaded momentum — narratively fitting (a movement gaining converts as the night's tensions escalate) and mechanically useful (it directly counters the "Cult goes quiet" endgame-fizzle risk flagged in §7.4/§9, since the Cult is now doing more, not less, as the game closes). At ≤20 players, the original flat cadence is retained — the under-tuning problem was specifically a 21-30-player issue.
 - The cult secretly aids whichever public faction is currently behind, each round.
 - The King/Queen-conversion cascade is unchanged: if King/Queen is converted before using their title-transfer ability, it auto-fires, and the Prince/Princess is swept into the cult too. No equivalent cascade applies if the Revolutionary Leader is converted.
 - A converted player keeps their original character and abilities, fooling their original side exactly as before.
 
-**Two more Cult roles were designed but are deliberately NOT adopted here — see §11:** a "Deceiver" (can force one info-check targeting them to return a false result) and a "Whisperer" (can shield a fellow Cultist from nomination for a round). Both are plausible at a bigger endgame Cult (4+ members), but the Deceiver specifically would degrade the reliability of *every* info-check in the game (Oracle, Spymaster, the Cult Leader's own query, the Uprising's intel query) — that's a big enough ripple effect to need Dalton's explicit sign-off, not a default inclusion.
 
 ### 4.4 Why the Revolutionary Leader's identity is secret from their own team
 
 Narratively, it's well-motivated for free (real underground movements organize in cells for exactly this reason). For mystery symmetry, it gives the Uprising's own rank-and-file a real "who is it?" question too, not just the Ton. For balance, it's close to load-bearing: if Revolutionary teammates knew their Leader, they could coordinate votes to shield them, worsening an already-favorable Revolutionary survival rate (§10).
 
-**Important caveat:** nothing in the app or rules actually *enforces* this secrecy — a Leader could simply tell a trusted friend out loud at the party. The design leans on this isolation holding by social convention, not by a mechanic. This isn't something to "fix" so much as something to be aware of: Dalton should understand that some real-world leakage is likely, and the balance numbers in §10 represent a best case, not a guarantee.
+**Important caveat, expanded per §11 item 5:** nothing in the app or rules actually *enforces* this secrecy — a Leader could simply tell a trusted friend out loud at the party. Why this specifically matters, in more detail:
+
+- **The mechanism is trivially available.** Unlike the Cult, whose coordination happens through an app-mediated group chat that at least nominally exists inside the game's systems, Revolutionary teammates are standing in the same room all night with no barrier to just talking. A nervous Leader, once they sense they're under suspicion, has every incentive to quietly recruit protectors — and nothing stops them.
+- **It's a more dangerous leak than ordinary hidden-role "meta-gaming."** In most social deduction games, a bit of informal signaling between teammates is a minor edge. Here, it directly attacks the specific mechanism §10's balance math already flags as the game's single biggest risk: if even 2-3 informed Revolutionaries deliberately steer nominations and discussion away from their Leader and toward decoys, that's a *deliberate, coordinated* version of the "wasted execution" dilution already baked into the naive survival numbers — meaning real-world play could land even further above the already-too-high 85-93% survival baseline in §10, not below it.
+- **It can't be monitored or policed the way other hidden information is.** Phones-hidden-from-everyone-but-Dalton (§2) is enforceable because it's a physical, observable rule. A private conversation between two guests at a party is not something the game — or Dalton — can ever verify or prevent.
+- **A partial, non-mechanical mitigation is available and worth adopting anyway:** state it as an explicit table rule at the top of the night, the same way "never show your phone" already is — something like *"the Revolutionary Leader may never voluntarily disclose their identity to anyone, including fellow Revolutionaries, for any reason."* This won't be enforceable any more than any other honor-system rule in a hidden-role game (nothing stops someone from peeking at a neighbor's cards in any card game either), but naming the expectation explicitly, out loud, at the table measurably reduces how often groups actually break it in practice, compared to leaving it as an unstated assumption. Recommend Dalton add this to the Round 1 rules speech alongside the phone-privacy rule it's modeled on.
 
 ---
 
@@ -137,12 +151,12 @@ In-fiction, this is never called an "execution" or a "vote" — to players, it's
 - **The ballot:** cast privately via app (a "calling card" laid against a name) — secret ballot, public tally only.
 - **Ties:** only nominees tied *at* the last available slot trigger a runoff (30-second final statement each, then a re-vote among just those tied); anyone clearly above the cutoff is already locked in. A repeat tie means that specific slot simply goes unfilled — it doesn't cancel the rest of the round's result.
 - **Abstaining** is allowed and doesn't count toward the tally.
-- **How many Cast Out per round — concrete scaling rule** (replaces the old placeholder): **1 execution at ≤20 players remaining; 2 simultaneous executions at 21-30 players remaining.** (For groups that ever exceed 30, the general rule is `ceil(players ÷ 15)`.) This keeps the removal rate proportional across the target range rather than jumping all at once at an arbitrary threshold.
+- **How many Cast Out per round — concrete scaling rule** (replaces the old placeholder): **1 execution at ≤20 players remaining; 2 simultaneous executions at 21-30 players remaining.** (For groups that ever exceed 30, the general rule is `ceil(players ÷ 15)`.) This keeps the removal rate proportional across the target range rather than jumping all at once at an arbitrary threshold. **The Grand Inquisitor (§4.1) can override this rule once per game, forcing a 2-for-1 Denouncement even in a round that would otherwise only take one — added specifically to give the Ton more Denouncement pressure, per §11 item 1.**
 - **The Magistrate/Firebrand double-vote**, in a multi-slot round: the ability adds one extra vote to whichever single nominee that player supported — it doesn't split across multiple nominees and doesn't affect other slots.
 
 ### What happens when different people are Cast Out
 - **The Revolutionary Leader, correctly identified:** the title passes immediately and privately to a successor. **Never announced.** The room only ever learns "someone was Cast Out."
-- **The King/Queen, Cast Out (not converted):** allowed, no immunity. Closes off Cult Path A. Doesn't cost the Ton their win on its own — see §11 for the option to change that.
+- **The King/Queen, Cast Out (not converted):** allowed, no immunity, and **now carries a real cost to the Ton — resolved per §11 item 2.** Losing the King/Queen this way permanently disables the Oracle's ability for the rest of the game (in-fiction: high society loses its nerve, and the Oracle's sources stop confiding in her without a monarch to protect). This is deliberately a single, clean, memorable penalty rather than a game-ending one — the Ton can still win by correctly denouncing the Revolutionary Leader, just with one fewer hunting tool for however much of the game remains. Losing the King/Queen this way still closes off Cult Path A permanently, same as before.
 - **The Cult Leader, Cast Out:** if a royal conversion had already landed, this is the martyrdom trigger (§3 Path B) — resolved privately and immediately (§8.2), revealed publicly only at the finale.
 - **A regular Cultist, an innocent bystander, or anyone else:** simply removed. **No faction or role is ever confirmed publicly for any Cast-Out player, including a correctly-caught Cultist** — every result gets the same deliberately uninformative public treatment (§8.1). This was a deliberate fix made during this pass: the original design implied a "was this someone important?" tell might leak through which Whistledown template got used, which would work against the game's own stated goal of keeping every Denouncement outcome equally ambiguous to the room. Full transparency is saved entirely for the Last Denouncement's public reveal.
 
@@ -157,9 +171,9 @@ Folds into the existing **Servant track**: their app reveals their own full role
 The Ton hides a King/Queen the Cult wants to corrupt, and hunts a Revolutionary Leader they need to expose. The Uprising hides its Leader from everyone, including itself, and quietly protects them. The Cult sits underneath both, feeding on whichever side is losing. Every faction has something to protect and something to hunt.
 
 ### 7.2 The information economy
-- **The Ton** now has three lead-generation tools: Oracle (depth — one player's full history), the new Almanac (breadth — 3 confirmed non-Leaders), and whatever surfaces in open debate.
-- **The Uprising** has the Spymaster (once per game) and the round-loss intel query, both aimed at a mystery even they don't have the answer to.
-- **The Cult** still has the sharpest single tool — a repeatable, choose-your-question scouting ability — but **§10 shows this doesn't scale with player count the way the other two factions' hunting does**, since it's tied to round count, not headcount.
+- **The Ton** now has four lead-generation tools: Oracle (depth — one player's full history, though it goes dark permanently if King/Queen is Cast Out, §6), the Almanac (breadth — 3 confirmed non-Leaders), a bonus Almanac-style clue on a correct Denouncement (§4.2), and whatever surfaces in open debate — backed by the Grand Inquisitor's ability to force a bigger Denouncement when the moment calls for it.
+- **The Uprising** has the Spymaster (once per game) and a Denouncement-triggered intel query (§4.2, retargeted this round from contest outcomes), both aimed at a mystery even they don't have the answer to.
+- **The Cult now scales with the room** (§4.3, §11 item 2) — recruitment ramps up from Round 4 onward at 21-30 players instead of staying flat regardless of headcount, and the Deceiver (§4.3) means every one of the above tools carries a real, if rare, risk of returning a deliberately false result once the Cult has grown large enough to have someone holding that title.
 
 ### 7.3 The martyrdom paradox — the game's best moment
 Once the table suspects someone might be the Cult Leader, denouncing them can backfire — if a royal target's already converted, executing the Cult Leader is exactly what hands the Cult the game. Nobody outside the Cult can ever be sure a conversion has landed, so the "correct" play and the "safe" play are genuinely in tension. This should be preserved deliberately — no public warning system, no safety valve.
@@ -233,25 +247,47 @@ Both Cult win paths are budgeted by **round count**, not headcount — recruitme
 
 ### Net verdict at 20-30 players
 
-**Revolutionary ≫ The Ton > The Cult** — a more lopsided picture than the original 16-player analysis, and now the Cult specifically undershoots 30% rather than just Revolutionary overshooting it. This needs deliberate compensation beyond what the prior pass already called for. See §11 for the concrete open decisions this creates.
+**Revolutionary ≫ The Ton > The Cult** — a more lopsided picture than the original 16-player analysis, and now the Cult specifically undershoots 30% rather than just Revolutionary overshooting it. This needed deliberate compensation beyond what the prior pass already called for.
+
+### Compensating changes adopted in response (§11)
+
+Dalton reviewed this verdict and made four decisions that directly target it — implemented throughout §4 and §6, summarized here:
+- **The Grand Inquisitor** (§4.1) gives the Ton a one-time way to force a bigger Denouncement, adding real pressure beyond the fixed M=3 baseline above without adding a whole new round.
+- **Denouncement-tied round rewards** (§4.2) give both sides a tighter, more frequent feedback loop specifically around the Leader hunt, rather than rewards tied to unrelated contest outcomes.
+- **Scaled, ramping Cult recruitment** (§4.3) directly targets the "Cult gets weaker at scale" finding above — the Cult should end the game meaningfully larger at 21-30 players than the fixed old schedule produced, especially in the back half.
+- **The Deceiver and Whisperer** (§4.3) give the now-bigger endgame Cult real defensive tools it didn't have before, making its two win paths less purely a numbers game.
+- **A real King/Queen-death penalty for the Ton** (§6 — Oracle goes permanently dark) — this doesn't directly touch the Revolutionary-survival numbers above, but it closes a separate asymmetry Dalton flagged: previously King/Queen dying cost the Ton nothing at all.
+
+**This report has not re-run the survival/win-rate math against these specific changes** — that would require a further modeling pass (the Grand Inquisitor and the ramping recruitment schedule both need real assumptions about *when* and *how often* they fire in practice, which is better informed by an actual playtest than by more speculative math on top of already-speculative math). Recommend treating the table above as the "before" picture, these five changes as a good-faith attempt at the "after," and validating with a real playtest before doing another full numeric pass.
 
 ---
 
-## 11. Open Decisions for Dalton
+## 11. Decisions
 
-### Adopted this pass (flagging for awareness, not asking permission)
+### Adopted in the scaling pass (flagging for awareness, not asking permission)
 - The roster expansion in §4 (Magistrate, Duelist, Almanac, Firebrand, Agitator, Cell Leader).
 - The 5-round structure (§5) — cutting one contest round, keeping all 3 Denouncements.
 - The scaled multi-execution rule (§6): 1 execution ≤20 players, 2 at 21-30.
 - Uniform, non-leaking Whistledown templates (§8.1) and no mid-game faction confirmation on any Cast-Out (§6).
 - The Gallery mechanic (§9) and every-round Whistledown cadence (§7.4/§8.1).
 
-### Still genuinely open — need your call
-1. **Denouncement frequency/strength vs. balance (sharper now than before).** Even 3 votes across the game leaves Revolutionary heavily favored at 20-30 players (§10). Options: (a) accept it for a first playtest and lean hard on Oracle/Almanac/debate quality; (b) add a 4th Denouncement (e.g., attach one to Round 1 or Round 2 instead of keeping it purely an intro/contest round); (c) strengthen Aristocrat's hunting tools further before touching vote frequency at all.
-2. **Should the Cult's recruitment/scouting pace scale with headcount** rather than staying fixed at ~1-per-2-rounds regardless of N? This is the most direct fix for the Cult's under-tuning at scale (§10). Options: (a) scale recruitment rate with player count (e.g., recruit every round instead of every 2 rounds above some N threshold); (b) give the Cult Leader more scouting queries at higher N instead of faster recruitment; (c) leave it as-is and accept the Cult is a minor faction at this scale.
-3. **Should the Deceiver/Whisperer Cult roles (§4.3) be adopted?** They'd help address finding #2 above (a stronger endgame Cult), but the Deceiver specifically undermines every info-check in the game — a bigger ripple effect than any other single addition in this report.
-4. **Does King/Queen's survival matter to the Ton's win**, or only their conversion status (§6)? Unchanged open question from the prior pass.
-5. **Revolutionary Leader secrecy has no real enforcement mechanism** (§4.4) — worth knowing going in, not something with clean options to choose between.
+### Resolved by Dalton — his decisions, as given, with where each landed in the doc
+
+1. **Denouncement frequency/strength vs. balance.**
+    > *"Possibly add an Ton role that allows the top two voted on people to be denounced? I do believe we need more denouncements. Possibly make the round rewards more tied to denouncements."*
+    * **Implemented:** the Grand Inquisitor (§4.1, §6) — a one-time Ton ability that forces a 2-for-1 Denouncement. Round-outcome rewards for both Revolutionary and the Ton were retargeted to trigger off Denouncement results instead of contest outcomes (§4.2).
+2. **Cult recruitment/scouting pace.**
+    > *"I believe it should scale with headcount, ramping up in later rounds."*
+    * **Implemented:** at 21-30 players, recruitment stays on the original cadence through Round 3, then brings in 2 new members per window from Round 4 onward (§4.3).
+3. **Deceiver/Whisperer Cult roles.**
+    > *"Let us add these roles for now. Only the cult leader starts the game, but the cult leader may give these titles to cultists."*
+    * **Implemented:** both roles adopted (§4.3). The Cult Leader personally designates which recruited Cultist holds each title, permanently once assigned.
+4. **Does King/Queen's death matter to the Ton's win?**
+    > *"Having the king/queen die should heavily matter to the Ton. Some type of extreme drawback, but not too extreme, the Ton should still be able to somehow win."*
+    * **Implemented:** if King/Queen is Cast Out (not converted), the Ton's Oracle permanently stops working for the rest of the game — a real, memorable cost, but not a loss condition (§6). **Flagging for Dalton:** this is this report's own specific choice of *which* drawback to use — "heavily matter, but not too extreme" had several possible implementations (a stricter win-margin requirement, losing a different tool, etc.). If disabling the Oracle specifically isn't the penalty you had in mind, this is an easy one-line swap; the important thing was landing on *some* real, single, clearly-stated cost, which this does.
+5. **Revolutionary Leader secrecy risk.**
+    > *"Expand on why this is an issue."*
+    * **Done:** §4.4 now explains the mechanism (no barrier to verbal collusion, unlike the Cult's app-mediated chat), why it specifically compounds the survival-math risk in §10, why it can't be policed the way other hidden information can, and proposes a non-mechanical mitigation (an explicit spoken table rule, modeled on the existing phone-privacy rule) worth adding to the Round 1 intro speech.
 
 ---
 
@@ -267,10 +303,22 @@ Both Cult win paths are budgeted by **round count**, not headcount — recruitme
 
 ## 13. What Changed This Pass (20-30 Player Scaling)
 
-- **6 new named characters** added across Aristocrat and Revolutionary (§4.1, §4.2); two more designed but deliberately not adopted (§4.3, §11).
+- **6 new named characters** added across Aristocrat and Revolutionary (§4.1, §4.2); two more (Deceiver, Whisperer) initially held back pending Dalton's sign-off — see §14 for their subsequent adoption.
 - **Round count cut from 6 to 5** core rounds (§5) — removed one contest round, kept all 3 Denouncements intact.
 - **Concrete multi-execution scaling rule** replacing the old placeholder (§6).
 - **Open-floor nomination replaced** with a silent app-based pre-nomination step at this headcount (§5, §6, §9).
 - **Uniform Whistledown treatment** for every Cast-Out — closes an information leak identified this pass (§6, §8.1).
 - **The Gallery mechanic** — gives potentially-large groups of eliminated players a real stake in the finale (§9).
 - **Balance math corrected and rerun** at N=20/25/30 — surfaced a new finding (the Cult gets weaker, not stronger, at scale) on top of the existing Revolutionary-survival risk (§10).
+
+## 14. What Changed From Dalton's §11 Review
+
+Dalton reviewed the open decisions from the scaling pass and answered all five directly in §11. Implemented as a result:
+
+- **The Grand Inquisitor** (§4.1) — a new Ton character who can force a 2-for-1 Denouncement once per game.
+- **Denouncement-tied round rewards** (§4.2) for both Revolutionary and the Ton, replacing the old contest-tied trigger.
+- **Scaled, ramping Cult recruitment** at 21-30 players (§4.3) — flat through Round 3, then 2 new members per window from Round 4 on.
+- **The Deceiver and Whisperer** (§4.3) fully adopted, with the Cult Leader personally designating which recruit holds each title.
+- **A real King/Queen-death penalty for the Ton** (§6) — the Oracle permanently stops working if King/Queen is Cast Out (not converted).
+- **§4.4 expanded** with a fuller explanation of the Revolutionary Leader secrecy risk and a proposed (non-mechanical) mitigation.
+- **§10 updated** with a "compensating changes" note tying these five decisions back to the balance verdict that prompted them, and an explicit flag that the numbers haven't been re-modeled against these specific changes yet — that's a job for a real playtest, not more speculative math.
