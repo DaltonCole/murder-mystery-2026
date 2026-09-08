@@ -79,6 +79,13 @@ The roster below is expanded from the original design specifically to give more 
 
 **A mirrored reward exists for the Ton**, addressing the same request: if a Denouncement correctly Cast Out the real Revolutionary Leader *or* an actual Cultist (i.e., the vote hit a real hidden target, not an innocent bystander), the Ton receives a bonus Almanac-style clue (3 more confirmed non-Leaders) usable before the next Denouncement — stacking with any player's own Almanac use.
 
+**The Leader's Confidants (new mechanic — Dalton's decision):** separate from the Denouncement-tied rewards above, the Revolutionary Leader slowly builds a real network over the course of the game, triggered by the Ton's *task and contest* performance specifically:
+- **Trigger, task rounds (3 & 5):** if the Ton fails to hit that round's talking-task completion threshold (§6.1) — i.e., they don't get enough of their people talking to N others with the right characteristics — this fires once for the round.
+- **Trigger, contest rounds (2 & 4):** this fires once for **each individual category** (Strength, Creativity, Intelligence) the Ton loses that round, not once per round — a Ton that loses all 3 categories in a single contest round triggers this 3 times.
+- **What happens:** the app randomly selects one Revolutionary the Leader doesn't already know (never the Leader themselves) and reveals identities **bi-directionally** — the Leader learns who that Revolutionary is, *and* that Revolutionary learns the Leader is their Leader. This is a deliberate, one-way-only-getting-bigger erosion of the Leader's anonymity (§4.4), unlike the unintended verbal-leakage risk described there — it's designed to happen, just gated behind the Ton actually underperforming.
+- **Self-limiting:** once every Revolutionary already knows the Leader, further triggers have nothing left to reveal.
+- **Balance note, stated plainly rather than left implicit:** this stacks directly on top of the Revolutionary-favored risk already flagged in §10 — the worse the Ton does at tasks/contests, the more Revolutionaries get let in on their Leader's identity, which (per §4.4) makes coordinated shielding easier right when the Ton can least afford it. That's a real rubber-band effect, not a flaw exactly — it mirrors how the Cult already reinforces whichever side is behind (§4.3) — but it means a struggling Ton could compound its own trouble. Worth watching for in a playtest rather than something this report is second-guessing on Dalton's behalf.
+
 ### 4.3 The Cult (secret faction)
 
 | Character | Goal | Starting Knowledge | Ability |
@@ -99,6 +106,8 @@ The roster below is expanded from the original design specifically to give more 
 ### 4.4 Why the Revolutionary Leader's identity is secret from their own team
 
 Narratively, it's well-motivated for free (real underground movements organize in cells for exactly this reason). For mystery symmetry, it gives the Uprising's own rank-and-file a real "who is it?" question too, not just the Ton. For balance, it's close to load-bearing: if Revolutionary teammates knew their Leader, they could coordinate votes to shield them, worsening an already-favorable Revolutionary survival rate (§10).
+
+**This secrecy is a starting state, not a permanent one — by design.** The Leader's Confidants mechanic (§4.2) deliberately erodes it over the course of the game as a reward for the Ton's own poor task/contest performance. That's an intentional, gated erosion path, distinct from the *unintended* leakage risk below — the difference matters: one only grows when the Ton is already struggling (a rubber-band the game controls), the other can happen at any time regardless of how anyone's actually playing (a hole the game can't control at all).
 
 **Important caveat, expanded per §11 item 5:** nothing in the app or rules actually *enforces* this secrecy — a Leader could simply tell a trusted friend out loud at the party. Why this specifically matters, in more detail:
 
@@ -172,7 +181,7 @@ The Ton hides a King/Queen the Cult wants to corrupt, and hunts a Revolutionary 
 
 ### 7.2 The information economy
 - **The Ton** now has four lead-generation tools: Oracle (depth — one player's full history, though it goes dark permanently if King/Queen is Cast Out, §6), the Almanac (breadth — 3 confirmed non-Leaders), a bonus Almanac-style clue on a correct Denouncement (§4.2), and whatever surfaces in open debate — backed by the Grand Inquisitor's ability to force a bigger Denouncement when the moment calls for it.
-- **The Uprising** has the Spymaster (once per game) and a Denouncement-triggered intel query (§4.2, retargeted this round from contest outcomes), both aimed at a mystery even they don't have the answer to.
+- **The Uprising** has the Spymaster (once per game), a Denouncement-triggered intel query (§4.2), and — growing only when the Ton stumbles — the Leader's Confidants network (§4.2), which slowly turns "a mystery even they don't have the answer to" into a small, real circle the Leader can actually trust.
 - **The Cult now scales with the room** (§4.3, §11 item 2) — recruitment ramps up from Round 4 onward at 21-30 players instead of staying flat regardless of headcount, and the Deceiver (§4.3) means every one of the above tools carries a real, if rare, risk of returning a deliberately false result once the Cult has grown large enough to have someone holding that title.
 
 ### 7.3 The martyrdom paradox — the game's best moment
@@ -322,3 +331,9 @@ Dalton reviewed the open decisions from the scaling pass and answered all five d
 - **A real King/Queen-death penalty for the Ton** (§6) — the Oracle permanently stops working if King/Queen is Cast Out (not converted).
 - **§4.4 expanded** with a fuller explanation of the Revolutionary Leader secrecy risk and a proposed (non-mechanical) mitigation.
 - **§10 updated** with a "compensating changes" note tying these five decisions back to the balance verdict that prompted them, and an explicit flag that the numbers haven't been re-modeled against these specific changes yet — that's a job for a real playtest, not more speculative math.
+
+### 14.1 Addendum — The Leader's Confidants
+
+A follow-up conversation refined how the Revolutionary Leader's isolation (§4.4) should erode over the game: rather than the whole faction gradually learning about each other, **only the Leader** builds a growing, trusted network — one revealed ally at a time, and the reveal is **bi-directional** (both learn who the other is). This was deliberately narrowed from an earlier, broader "everyone learns about everyone" idea specifically because faction-wide coordination would have compounded Revolutionary's existing survival advantage (§10); a Leader-only network is a smaller, more contained risk.
+
+**Trigger, per Dalton's decision:** tied to Ton underperformance on tasks and contests specifically — a failed task-round threshold, or each individual contest category lost — not to Denouncement outcomes. Implemented in §4.2, with a cross-reference added to §4.4 distinguishing this *designed* erosion path from the *unintended* verbal-leakage risk already documented there, and a plain flag that this does stack on top of §10's existing balance concern (a struggling Ton faces a more coordinated Revolutionary) rather than being a hidden cost.
