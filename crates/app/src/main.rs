@@ -4,7 +4,7 @@
 //! replaced by real game-state broadcasting in later phases -- see
 //! `/home/drc/.claude/plans/piped-crunching-lighthouse.md`.
 
-use dioxus::fullstack::{use_websocket, Websocket, WebSocketOptions};
+use dioxus::fullstack::{use_websocket, WebSocketOptions, Websocket};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 

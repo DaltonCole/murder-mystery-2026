@@ -85,13 +85,7 @@ mod tests {
             }]
         );
 
-        let events = apply_command(
-            &mut state,
-            Command::AddPlayer {
-                name: "Bob".into(),
-            },
-        )
-        .unwrap();
+        let events = apply_command(&mut state, Command::AddPlayer { name: "Bob".into() }).unwrap();
         assert_eq!(
             events,
             vec![DomainEvent::PlayerAdded {

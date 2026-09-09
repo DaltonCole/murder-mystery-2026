@@ -81,13 +81,7 @@ mod tests {
             },
         )
         .unwrap();
-        apply_command(
-            &mut state,
-            Command::AddPlayer {
-                name: "Bob".into(),
-            },
-        )
-        .unwrap();
+        apply_command(&mut state, Command::AddPlayer { name: "Bob".into() }).unwrap();
         apply_command(
             &mut state,
             Command::AssignFaction {
@@ -146,11 +140,7 @@ mod tests {
     #[test]
     fn roster_is_visible_to_every_viewer_kind() {
         let state = two_player_state();
-        for viewer in [
-            Viewer::Player(PlayerId(0)),
-            Viewer::Host,
-            Viewer::Display,
-        ] {
+        for viewer in [Viewer::Player(PlayerId(0)), Viewer::Host, Viewer::Display] {
             let view = view_for(&state, viewer);
             assert_eq!(view.roster.len(), 2);
             assert!(view.roster.iter().any(|r| r.name == "Alice"));
