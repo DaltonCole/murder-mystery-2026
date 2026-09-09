@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/app", "crates/sim"]
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[profile.dev]
+# Dioxus recommends higher opt-level for dependencies in dev to keep
+# hot-reload/build times reasonable once the WASM frontend grows.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,18 @@
+# Rust / Cargo
+/target/
+
+# Dioxus build output
+/crates/app/target/
+/crates/app/dist/
+
+# Coverage reports
+/target/llvm-cov/
+lcov.info
+
+# Editor/OS
+.DS_Store
+
+# Node (e2e tests, if a package.json/node_modules ends up under tests/e2e)
+/tests/e2e/node_modules/
+/tests/e2e/test-results/
+/tests/e2e/playwright-report/

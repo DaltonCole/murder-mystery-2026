@@ -1,0 +1,19 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately minimal dependency footprint: this crate must stay free of any
+# I/O, async runtime, or networking dependency so it remains a pure,
+# synchronously-testable domain model. See the "Core Domain Model" section of
+# the implementation plan for why this boundary matters for test coverage.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+# json only, so the leak-detection test in view.rs can serialize a
+# PlayerView and grep it -- not used anywhere in non-test code.
+serde_json = "1"

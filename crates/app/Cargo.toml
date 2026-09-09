@@ -1,0 +1,18 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Pinned exactly (not "0.7") to match the installed `dx` CLI (0.7.9) --
+# `dx serve` errors loudly on a CLI/crate version mismatch otherwise.
+dioxus = { version = "=0.7.9", features = ["router", "fullstack"] }
+serde = { version = "1", features = ["derive"] }
+engine = { path = "../engine" }
+
+[features]
+default = ["web"]
+web = ["dioxus/web"]
+server = ["dioxus/server"]
