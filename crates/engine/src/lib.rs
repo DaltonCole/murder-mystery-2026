@@ -9,16 +9,22 @@
 //! (`/home/drc/.claude/plans/piped-crunching-lighthouse.md`) for the
 //! rationale behind this boundary.
 
+mod character;
 mod command;
 mod error;
 mod event;
 mod player;
+mod round;
 mod state;
 mod view;
+mod win_condition;
 
+pub use character::{Character, PlayerStatus};
 pub use command::Command;
 pub use error::GameError;
 pub use event::DomainEvent;
 pub use player::{Faction, Player, PlayerId};
+pub use round::Round;
 pub use state::{apply_command, GameState};
 pub use view::{view_for, PlayerView, RosterEntry, Viewer};
+pub use win_condition::{evaluate as evaluate_win_conditions, CultPath, GameOutcome};
