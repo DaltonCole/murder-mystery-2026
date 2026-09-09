@@ -40,7 +40,7 @@ fn server() -> &'static GameServer {
 /// funnels through here.
 pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
     let result = {
-        let mut state = server().state.lock().unwrap();
+        let mut state = lock_state();
         apply_command(&mut state, cmd)
     };
     if result.is_ok() {
@@ -55,8 +55,24 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
 /// `GameState`. See `engine::view_for`'s own doc comment for why that
 /// matters.
 pub fn view(viewer: Viewer) -> PlayerView {
-    let state = server().state.lock().unwrap();
+    let state = lock_state();
     view_for(&state, viewer)
+}
+
+/// Locks the game state, recovering from mutex poisoning instead of
+/// panicking. A panic anywhere inside `apply_command`/`view_for` (a bug,
+/// not something expected to happen) would otherwise poison the mutex
+/// permanently -- since `SERVER` is a process-wide singleton, that turns
+/// one panic into every future request from every connection panicking
+/// too, bricking the whole live event until someone restarts the process.
+/// For a one-shot, unattended party game, staying up with whatever state
+/// existed at the moment of the panic is a better failure mode than a
+/// total, permanent outage.
+fn lock_state() -> std::sync::MutexGuard<'static, GameState> {
+    server()
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Subscribes to "something changed" notifications. Callers re-fetch their

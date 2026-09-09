@@ -80,4 +80,16 @@ pub enum GameError {
 
     #[error("a task attempt must name 3 distinct players")]
     DuplicateNamedPlayerForTask,
+
+    #[error(
+        "player {player:?} already has character {existing:?}, cannot also assign {requested:?}"
+    )]
+    AlreadyHasCharacter {
+        player: PlayerId,
+        existing: Character,
+        requested: Character,
+    },
+
+    #[error("player {0:?} is already converted")]
+    AlreadyConverted(PlayerId),
 }

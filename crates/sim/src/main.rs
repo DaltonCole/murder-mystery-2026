@@ -18,6 +18,19 @@
 //! realistic scale without panicking or producing a malformed outcome.
 //!
 //! Usage: `cargo run -p sim -- --players 20-30 --games 25 --seed 1`
+//!
+//! KNOWN BLIND SPOT: `ton_wins` is essentially never observed across large
+//! runs of this harness (0/1920 across two independent 960-game sweeps in
+//! review). It requires the *entire* eligible Uprising successor pool to
+//! be exhausted (state.rs's `resolve_cast_out`), and with fully
+//! uninformed uniform-random nomination/ballot targeting, no virtual
+//! player ever specifically hunts the real Revolutionary Leader -- so
+//! that branch is realistically only exercised by `win_condition.rs`'s
+//! own isolated hand-built-state unit tests, not by this harness. A
+//! regression specific to the Ton-win path could pass thousands of sim
+//! games silently. Worth a targeted virtual-player strategy (or a
+//! scripted scenario) if this path ever needs integration-level coverage,
+//! not just unit coverage.
 
 use engine::{
     apply_command, evaluate_win_conditions, Ballot, Character, Command, DenouncementPhase,

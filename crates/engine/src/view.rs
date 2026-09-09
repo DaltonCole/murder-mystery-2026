@@ -285,10 +285,24 @@ mod tests {
 
     #[test]
     fn a_player_sees_only_their_own_character_never_anyone_elses() {
-        let mut state = three_player_state();
-        // Give Alice a distinct character from Bob's so this test can't
-        // pass vacuously -- everyone gets the same generic NormalTon from
-        // FinalizeSetup otherwise.
+        let mut state = GameState::new();
+        for name in ["Alice", "Bob", "Carol"] {
+            apply_command(&mut state, Command::AddPlayer { name: name.into() }).unwrap();
+        }
+        for id in [PlayerId(0), PlayerId(1), PlayerId(2)] {
+            apply_command(
+                &mut state,
+                Command::AssignFaction {
+                    player: id,
+                    faction: Faction::Ton,
+                },
+            )
+            .unwrap();
+        }
+        // Give Alice a distinct character from Bob's (assigned before
+        // FinalizeSetup, which only fills in a *missing* character) so
+        // this test can't pass vacuously -- everyone gets the same generic
+        // NormalTon otherwise.
         apply_command(
             &mut state,
             Command::AssignCharacter {
@@ -297,6 +311,7 @@ mod tests {
             },
         )
         .unwrap();
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
 
         let alice = view_for(&state, Viewer::Player(PlayerId(0)));
         assert_eq!(

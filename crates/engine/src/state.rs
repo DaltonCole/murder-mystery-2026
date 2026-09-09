@@ -211,21 +211,27 @@ impl GameState {
     }
 
     /// The lowest-`PlayerId` active, *untitled* player of `faction`,
-    /// excluding `exclude` -- the deterministic fallback used when no
-    /// explicit replacement is supplied or the supplied one isn't eligible.
-    /// "Untitled" (a `Normal*`/`Cultist`/no character yet) matters: without
-    /// it, this could hand the King/Queen's crown to whoever's currently
-    /// the Prince/Princess, since they're Ton-faction too -- double-titling
-    /// someone was never intended. Lowest ID (rather than e.g. highest, or
-    /// first-inserted) is an arbitrary but fixed choice, picked so tests
-    /// are reproducible without needing to inject a fake RNG.
-    fn first_eligible(&self, faction: Faction, exclude: PlayerId) -> Option<PlayerId> {
+    /// excluding anyone in `exclude` -- the deterministic fallback used
+    /// when no explicit replacement is supplied or the supplied one isn't
+    /// eligible. "Untitled" (a `Normal*`/`Cultist`/no character yet)
+    /// matters: without it, this could hand the King/Queen's crown to
+    /// whoever's currently the Prince/Princess, since they're Ton-faction
+    /// too -- double-titling someone was never intended. `exclude` takes a
+    /// slice (not a single `PlayerId`) so a caller resolving several
+    /// Cast-Outs from the same Denouncement batch can exclude everyone in
+    /// that batch, not just the one player currently being processed --
+    /// see the doc comment on `resolve_cast_out`'s `also_departing`
+    /// parameter for why that matters. Lowest ID (rather than e.g.
+    /// highest, or first-inserted) is an arbitrary but fixed choice,
+    /// picked so tests are reproducible without needing to inject a fake
+    /// RNG.
+    fn first_eligible(&self, faction: Faction, exclude: &[PlayerId]) -> Option<PlayerId> {
         self.players
             .values()
             .find(|p| {
                 p.faction == faction
                     && p.status == PlayerStatus::Active
-                    && p.id != exclude
+                    && !exclude.contains(&p.id)
                     && self.is_untitled(p.id)
             })
             .map(|p| p.id)
@@ -298,7 +304,7 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
         Command::CastOut {
             player,
             fallback_replacement,
-        } => resolve_cast_out(state, player, fallback_replacement)?,
+        } => resolve_cast_out(state, player, fallback_replacement, &[player])?,
 
         Command::AdvanceRound => {
             let next = state
@@ -374,6 +380,22 @@ fn assign_character(
             });
         }
     }
+    // Re-assigning a player's *current* character to them is an idempotent
+    // no-op (see the title_slot handling below), but assigning a
+    // *different* character to a player who already has one is always a
+    // mistake -- without this check, a player could pick up a second
+    // title (e.g. King/Queen after already being Prince/Princess) with the
+    // old title slot (`state.prince_princess` here) left dangling, pointing
+    // at someone who no longer holds it.
+    if let Some(existing) = p.character {
+        if existing != character {
+            return Err(GameError::AlreadyHasCharacter {
+                player,
+                existing,
+                requested: character,
+            });
+        }
+    }
 
     let title_slot = match character {
         Character::KingQueen => Some(&mut state.king_queen),
@@ -437,6 +459,9 @@ fn convert(
     if target_player.status != PlayerStatus::Active {
         return Err(GameError::NotActive(target));
     }
+    if target_player.converted {
+        return Err(GameError::AlreadyConverted(target));
+    }
     if !matches!(target_player.faction, Faction::Ton | Faction::Uprising) {
         return Err(GameError::WrongFactionForCharacter {
             player: target,
@@ -465,7 +490,7 @@ fn convert(
         state.king_queen_ever_converted = true;
         if !state.king_queen_transfer_used {
             state.king_queen_transfer_used = true;
-            let replacement = state.first_eligible(Faction::Ton, target);
+            let replacement = state.first_eligible(Faction::Ton, &[target]);
             // If nobody else is available, the crown has nowhere to go --
             // the now-converted King/Queen simply keeps it (they're still
             // physically, publicly the King/Queen; conversion doesn't
@@ -568,10 +593,28 @@ fn transfer_king_queen(
 /// Resolves a Denouncement's outcome for one player: removes them from
 /// active play, then dispatches to whichever cascade applies depending on
 /// which title (if any) they held. See rules.md §5, "Resolution by target."
+///
+/// `also_departing` lists everyone being Cast Out in this same batch
+/// (`player` included) -- a multi-slot Denouncement (21+ competing
+/// players) resolves several Cast-Outs from one Ballot/Runoff, one at a
+/// time, via a caller loop. Without excluding the rest of the batch from
+/// replacement/successor eligibility here, an earlier iteration's cascade
+/// could crown or elect someone who is *also* independently on the same
+/// batch's list -- e.g. the King/Queen and player Z both get a slot; Z
+/// gets crowned mid-loop as the King/Queen's replacement; then Z's own,
+/// separately-earned Cast-Out is processed and immediately re-triggers the
+/// cascade a second time, handing the crown to a third player who was
+/// never nominated or voted for at all. Passing the whole batch here means
+/// `first_eligible`/the eligibility filters simply never consider anyone
+/// who's leaving the game this round, so a replacement only ever comes
+/// from outside the batch (or the throne/leadership goes vacant, same as
+/// when no one at all is eligible). A direct `Command::CastOut` (not part
+/// of a Denouncement) just passes `&[player]`.
 fn resolve_cast_out(
     state: &mut GameState,
     player: PlayerId,
     fallback_replacement: Option<PlayerId>,
+    also_departing: &[PlayerId],
 ) -> Result<Vec<DomainEvent>, GameError> {
     let p = state
         .players
@@ -610,11 +653,12 @@ fn resolve_cast_out(
                 let replacement = fallback_replacement
                     .filter(|&c| {
                         c != player
+                            && !also_departing.contains(&c)
                             && state.is_active(c)
                             && state.player(c).unwrap().faction == Faction::Ton
                             && state.is_untitled(c)
                     })
-                    .or_else(|| state.first_eligible(Faction::Ton, player));
+                    .or_else(|| state.first_eligible(Faction::Ton, also_departing));
                 if let Some(new_holder) = replacement {
                     state.players.get_mut(&new_holder).unwrap().character =
                         Some(Character::KingQueen);
@@ -637,6 +681,7 @@ fn resolve_cast_out(
 
         let eligible_uprising = |id: PlayerId| {
             id != player
+                && !also_departing.contains(&id)
                 && state.is_active(id)
                 && state.player(id).unwrap().faction == Faction::Uprising
                 && state.is_untitled(id)
@@ -647,7 +692,7 @@ fn resolve_cast_out(
         let fallback = fallback_replacement.filter(|&c| eligible_uprising(c));
         let replacement = designated
             .or(fallback)
-            .or_else(|| state.first_eligible(Faction::Uprising, player));
+            .or_else(|| state.first_eligible(Faction::Uprising, also_departing));
 
         state.revolutionary_leader_successor = None;
         if let Some(new_leader) = replacement {
@@ -741,29 +786,32 @@ fn cast_ballot(
     if !state.is_active(voter) {
         return Err(GameError::NotActive(voter));
     }
-    // Validate a `For` target against whichever phase we're actually in
-    // *before* taking a mutable borrow, so an invalid target is rejected
-    // without recording anything.
+    // Determine the phase (and thus its candidate list) *before* taking a
+    // mutable borrow, so an invalid target is rejected without recording
+    // anything. Checking the phase first -- rather than validating a
+    // `For` target against "whatever phase happens to be active, if any"
+    // -- means a ballot cast at the wrong phase reports the actually
+    // correct `NoDenouncementOpen`/`BallotNotOpen`, not a misleading
+    // `InvalidBallotTarget` for a candidate that was never the real
+    // problem.
+    let candidates: &[PlayerId] = match state.denouncement.as_ref().map(|d| &d.phase) {
+        Some(DenouncementPhase::Ballot { surfaced, .. }) => surfaced,
+        Some(DenouncementPhase::Runoff { candidates, .. }) => candidates,
+        Some(_) => return Err(GameError::BallotNotOpen),
+        None => return Err(GameError::NoDenouncementOpen),
+    };
     if let Ballot::For(candidate) = ballot {
-        let valid = match state.denouncement.as_ref().map(|d| &d.phase) {
-            Some(DenouncementPhase::Ballot { surfaced, .. }) => surfaced.contains(&candidate),
-            Some(DenouncementPhase::Runoff { candidates, .. }) => candidates.contains(&candidate),
-            _ => false,
-        };
-        if !valid {
+        if !candidates.contains(&candidate) {
             return Err(GameError::InvalidBallotTarget(candidate));
         }
     }
 
-    let denouncement = state
-        .denouncement
-        .as_mut()
-        .ok_or(GameError::NoDenouncementOpen)?;
+    let denouncement = state.denouncement.as_mut().unwrap();
     match &mut denouncement.phase {
         DenouncementPhase::Ballot { ballots, .. } | DenouncementPhase::Runoff { ballots, .. } => {
             ballots.insert(voter, ballot);
         }
-        _ => return Err(GameError::BallotNotOpen),
+        _ => unreachable!("phase was already confirmed to be Ballot or Runoff above"),
     }
     Ok(vec![DomainEvent::BallotCast { voter, ballot }])
 }
@@ -813,7 +861,7 @@ fn close_ballot(
         events.push(DomainEvent::BallotClosed {
             cast_out: cast_out.clone(),
         });
-        for player in cast_out {
+        for &player in &cast_out {
             // A player who was voted out independently can *also* be swept
             // by another cast-out's own cascade within this same batch --
             // e.g. the King/Queen and Prince/Princess both surfacing and
@@ -825,11 +873,19 @@ fn close_ballot(
             // target, and letting that rejection propagate here would
             // abort the whole command partway through, leaving `state`
             // mutated despite returning `Err` (violating this function's
-            // own "no mutation on error" contract).
+            // own "no mutation on error" contract). Passing `&cast_out` as
+            // `also_departing` additionally keeps a title cascade from
+            // crowning/electing someone else *also* in this same batch --
+            // see `resolve_cast_out`'s doc comment.
             if !state.is_active(player) {
                 continue;
             }
-            events.extend(resolve_cast_out(state, player, fallback_replacement)?);
+            events.extend(resolve_cast_out(
+                state,
+                player,
+                fallback_replacement,
+                &cast_out,
+            )?);
         }
         state.denouncement = None;
     } else {
@@ -885,14 +941,21 @@ fn close_runoff(
         cast_out: cast_out.clone(),
         unfilled_slot,
     }];
-    for player in cast_out {
-        // See the identical guard in `close_ballot` -- a player already
-        // swept by another cast-out's own cascade earlier in this same
-        // batch must be skipped, not re-resolved.
+    for &player in &cast_out {
+        // See the identical guard + `also_departing` argument in
+        // `close_ballot` -- a player already swept by another cast-out's
+        // own cascade earlier in this same batch must be skipped, not
+        // re-resolved, and no cascade in this batch may crown/elect anyone
+        // else who's also in it.
         if !state.is_active(player) {
             continue;
         }
-        events.extend(resolve_cast_out(state, player, fallback_replacement)?);
+        events.extend(resolve_cast_out(
+            state,
+            player,
+            fallback_replacement,
+            &cast_out,
+        )?);
     }
     state.denouncement = None;
     Ok(events)
@@ -947,6 +1010,11 @@ fn attempt_task(
     let mut distinct = BTreeSet::new();
     if named.iter().any(|id| !distinct.insert(*id)) {
         return Err(GameError::DuplicateNamedPlayerForTask);
+    }
+    for &id in &named {
+        if !state.is_active(id) {
+            return Err(GameError::NotActive(id));
+        }
     }
 
     let credited = named.iter().any(|id| def.qualifying_players.contains(id));
@@ -2139,11 +2207,97 @@ mod tests {
     }
 
     #[test]
+    fn nominate_rejects_outside_the_nomination_phase() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: everyone[0],
+                nominee: everyone[1],
+            },
+        );
+        assert_eq!(result, Err(GameError::NominationNotOpen));
+    }
+
+    #[test]
     fn open_ballot_rejects_outside_the_discussion_phase() {
         let (mut state, ..) = setup_game_with_extra_voters(2);
         apply_command(&mut state, Command::OpenDenouncement).unwrap();
         let result = apply_command(&mut state, Command::OpenBallot);
         assert_eq!(result, Err(GameError::DiscussionNotOpen));
+    }
+
+    #[test]
+    fn cast_ballot_rejects_when_no_denouncement_is_open() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let result = apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: everyone[0],
+                ballot: Ballot::Abstain,
+            },
+        );
+        assert_eq!(result, Err(GameError::NoDenouncementOpen));
+    }
+
+    #[test]
+    fn cast_ballot_rejects_during_nomination_or_discussion() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: everyone[0],
+                ballot: Ballot::Abstain,
+            },
+        );
+        assert_eq!(result, Err(GameError::BallotNotOpen));
+
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: everyone[0],
+                nominee: everyone[0],
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: everyone[0],
+                ballot: Ballot::Abstain,
+            },
+        );
+        assert_eq!(result, Err(GameError::BallotNotOpen));
+    }
+
+    #[test]
+    fn close_ballot_rejects_outside_the_ballot_phase() {
+        let (mut state, ..) = setup_game_with_extra_voters(2);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        );
+        assert_eq!(result, Err(GameError::BallotNotOpen));
+    }
+
+    #[test]
+    fn close_runoff_rejects_outside_the_runoff_phase() {
+        let (mut state, ..) = setup_game_with_extra_voters(2);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::CloseRunoff {
+                fallback_replacement: None,
+            },
+        );
+        assert_eq!(result, Err(GameError::RunoffNotOpen));
     }
 
     #[test]
@@ -3172,5 +3326,398 @@ mod tests {
             },
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn attempt_task_rejects_naming_an_inactive_player() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: everyone[3],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named: [everyone[1], everyone[2], everyone[3]],
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(everyone[3])));
+    }
+
+    // --- Regression: a batch cast-out cascade must never crown/elect
+    // someone else who is *also* independently in the same batch. ---
+
+    #[test]
+    fn a_batch_cast_out_never_crowns_a_fellow_batch_member_as_king_queen() {
+        // 21 competing players -> execution_count() == 2. The King/Queen
+        // and an ordinary Ton player (Z) are both voted out in the same
+        // Denouncement, with Z explicitly passed as the King/Queen's
+        // fallback_replacement -- before the fix, resolving the King/Queen
+        // first would crown Z, and then Z's own (independent) cast-out
+        // would immediately re-trigger the cascade a second time, handing
+        // the crown to a completely uninvolved third player.
+        let (mut state, everyone) = setup_game_with_extra_voters(17); // 4 + 17 = 21
+        let king_queen = everyone[0];
+        let z = everyone[4];
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: king_queen,
+                nominee: king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: z,
+                nominee: z,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        for &voter in &everyone[0..4] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(king_queen),
+                },
+            )
+            .unwrap();
+        }
+        for &voter in &everyone[4..8] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(z),
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: Some(z),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.player(king_queen).unwrap().status,
+            PlayerStatus::CastOut
+        );
+        assert_eq!(state.player(z).unwrap().status, PlayerStatus::CastOut);
+        // Exactly one cascade -- the double-crowning bug produced two.
+        let cascades = events
+            .iter()
+            .filter(|e| matches!(e, DomainEvent::KingQueenCastOutCascade { .. }))
+            .count();
+        assert_eq!(cascades, 1, "expected exactly one cascade, got: {events:?}");
+
+        let new_king_queen = state.king_queen();
+        assert!(
+            new_king_queen.is_some(),
+            "the throne should have a new holder"
+        );
+        assert_ne!(new_king_queen, Some(king_queen));
+        assert_ne!(
+            new_king_queen,
+            Some(z),
+            "Z was also cast out this batch and must never end up crowned"
+        );
+    }
+
+    #[test]
+    fn a_batch_cast_out_never_elects_a_fellow_batch_member_as_revolutionary_leader() {
+        // Same scenario as the King/Queen version above, for the
+        // Revolutionary Leader's succession cascade (which, unlike the
+        // King/Queen's, applies at every round, not just Round 3). Z is a
+        // second Uprising player -- a plausible, eligible successor --
+        // who is *also* independently cast out in the same 2-slot batch.
+        let (mut state, king_queen, prince, leader, cult_leader) = setup_full_game();
+        let z = add_player(&mut state, "Z", Faction::Uprising);
+        let mut everyone = vec![king_queen, prince, leader, cult_leader, z];
+        for i in 0..16 {
+            everyone.push(add_player(&mut state, &format!("Extra{i}"), Faction::Ton));
+        }
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        assert_eq!(state.competing_player_count(), 21);
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: leader,
+                nominee: leader,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: z,
+                nominee: z,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        for &voter in &everyone[0..4] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(leader),
+                },
+            )
+            .unwrap();
+        }
+        for &voter in &everyone[4..8] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(z),
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: Some(z),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.player(leader).unwrap().status, PlayerStatus::CastOut);
+        assert_eq!(state.player(z).unwrap().status, PlayerStatus::CastOut);
+        let successions = events
+            .iter()
+            .filter(|e| matches!(e, DomainEvent::RevolutionaryLeaderSucceeded { .. }))
+            .count();
+        assert_eq!(
+            successions, 1,
+            "expected exactly one succession, got: {events:?}"
+        );
+        assert_ne!(state.revolutionary_leader(), Some(leader));
+        assert_ne!(
+            state.revolutionary_leader(),
+            Some(z),
+            "Z was also cast out this batch and must never end up as the new Leader"
+        );
+    }
+
+    #[test]
+    fn assign_character_rejects_giving_a_player_a_second_different_character() {
+        let (mut state, ..) = setup_game_with_extra_voters(0);
+        let extra = add_player(&mut state, "Extra", Faction::Ton);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: extra,
+                character: Character::NormalTon,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: extra,
+                character: Character::KingQueen,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AlreadyHasCharacter {
+                player: extra,
+                existing: Character::NormalTon,
+                requested: Character::KingQueen,
+            })
+        );
+        // The old title slot must not have been touched by the rejected
+        // attempt.
+        assert_ne!(state.king_queen(), Some(extra));
+    }
+
+    #[test]
+    fn convert_rejects_a_target_who_is_already_converted() {
+        let (mut state, king_queen, ..) = setup_full_game();
+        let cult_leader = state.cult_leader().unwrap();
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: king_queen,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: king_queen,
+            },
+        );
+        assert_eq!(result, Err(GameError::AlreadyConverted(king_queen)));
+    }
+
+    #[test]
+    fn close_runoff_also_guards_against_a_cascade_collision_from_the_original_ballot() {
+        // The King/Queen locks in cleanly from the *original* ballot
+        // (`already_locked_in`), while the Prince/Princess separately wins
+        // the runoff for the tied last slot. Closing the runoff resolves
+        // the King/Queen first, whose own Round-3 cascade already casts
+        // out the Prince/Princess directly -- so by the time the loop
+        // reaches the Prince/Princess as their own, independently-won
+        // runoff slot, they're already inactive. This is the same
+        // "already resolved by another cascade in this batch" collision
+        // as `close_ballot`'s version, just reached via the runoff path
+        // instead -- exercising `close_runoff`'s own `is_active` guard,
+        // not just `close_ballot`'s.
+        let (mut state, everyone) = setup_game_with_extra_voters(17); // 4 + 17 = 21
+        assert_eq!(state.competing_player_count(), 21);
+        let king_queen = everyone[0];
+        let prince_princess = everyone[1];
+        let y = everyone[17];
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        for &voter in &everyone[4..14] {
+            apply_command(
+                &mut state,
+                Command::Nominate {
+                    voter,
+                    nominee: king_queen,
+                },
+            )
+            .unwrap();
+        }
+        for &voter in &everyone[14..17] {
+            apply_command(
+                &mut state,
+                Command::Nominate {
+                    voter,
+                    nominee: prince_princess,
+                },
+            )
+            .unwrap();
+        }
+        for &voter in &everyone[17..20] {
+            apply_command(&mut state, Command::Nominate { voter, nominee: y }).unwrap();
+        }
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        for &voter in &everyone[4..14] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(king_queen),
+                },
+            )
+            .unwrap();
+        }
+        for &voter in &everyone[14..17] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(prince_princess),
+                },
+            )
+            .unwrap();
+        }
+        for &voter in &everyone[17..20] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(y),
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        match state.denouncement_phase() {
+            Some(DenouncementPhase::Runoff {
+                already_locked_in,
+                candidates,
+                ..
+            }) => {
+                assert_eq!(already_locked_in, &vec![king_queen]);
+                let mut sorted = candidates.clone();
+                sorted.sort();
+                let mut expected = vec![prince_princess, y];
+                expected.sort();
+                assert_eq!(sorted, expected);
+            }
+            other => panic!("expected Runoff phase, got {other:?}: {events:?}"),
+        }
+
+        // Everyone breaks for the Prince/Princess in the runoff.
+        for &voter in &everyone {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(prince_princess),
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseRunoff {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.player(king_queen).unwrap().status,
+            PlayerStatus::CastOut
+        );
+        assert_eq!(
+            state.player(prince_princess).unwrap().status,
+            PlayerStatus::CastOut
+        );
+        assert_eq!(state.player(y).unwrap().status, PlayerStatus::Active);
+        let cascades = events
+            .iter()
+            .filter(|e| matches!(e, DomainEvent::KingQueenCastOutCascade { .. }))
+            .count();
+        assert_eq!(cascades, 1, "expected exactly one cascade, got: {events:?}");
+        assert!(state.king_queen().is_some());
+        assert_ne!(state.king_queen(), Some(king_queen));
+        assert_ne!(state.king_queen(), Some(prince_princess));
     }
 }

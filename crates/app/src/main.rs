@@ -7,14 +7,42 @@
 //! a real LAN playtest, not the final visual design (that's Phase 4). See
 //! `/home/drc/.claude/plans/piped-crunching-lighthouse.md`.
 //!
-//! KNOWN GAP, not an oversight: there is no session/auth layer yet. Any
-//! client can open `/play` and claim to be any `PlayerId` by sending
-//! `ClientMsg::Watch(Viewer::Player(id))` directly over the websocket --
-//! this UI never does that itself (a fresh `/play` connection only ever
-//! watches the id its own `Join` call just received), but nothing stops a
-//! deliberately crafted client from doing so. Real per-player join tokens
-//! (see the plan's "Session" section) must land before this runs at a real
-//! event over shared WiFi.
+//! KNOWN GAP, not an oversight: there is no session/auth layer yet, and
+//! it's broader than just view privacy. `game_ws` accepts any `ClientMsg`
+//! from any connection with no identity check at all:
+//! - `Watch(Viewer::Player(id))` lets a crafted client read any player's
+//!   private view. This UI never sends that itself -- a fresh `/play`
+//!   connection only ever watches the id its own `Join` call just
+//!   received -- but nothing stops a deliberately crafted client from
+//!   doing so.
+//! - `Do(Command)` goes further: since commands like `CastBallot`,
+//!   `Nominate`, and `AttemptTask` carry the acting player's id as a plain
+//!   field with nothing tying it to the sending connection, any client can
+//!   impersonate *any* player's writes, not just reads -- vote as someone
+//!   else, submit fake task attempts.
+//! - Every host-only command (`AddPlayer`, `FinalizeSetup`,
+//!   `AdvanceRound`, `OpenDenouncement`, `CloseNomination`, `OpenBallot`,
+//!   `CloseBallot`, `CloseRunoff`, `PushTask`, `CloseTasks`) can be issued
+//!   from a raw connection to `/api/ws` regardless of which route it came
+//!   through -- nothing distinguishes a Host console's socket from a
+//!   Player's.
+//!
+//! Real per-player join tokens and a real Host credential (see the plan's
+//! "Session" section) must land before this runs at a real event over
+//! shared WiFi.
+//!
+//! SECOND KNOWN GAP: no reconnect story. Every route's `use_websocket` call
+//! uses a plain `WebSocketOptions::new()`, not
+//! `.with_automatic_reconnect()`; once a connection drops (a WiFi hiccup,
+//! laptop sleep, a `dx serve` restart), that tab just goes quiet with no
+//! user-visible indicator -- the only recovery is a manual page reload.
+//! Deliberately not wiring up automatic reconnect in this pass: doing so
+//! safely also requires re-verifying the receive-loop's error handling
+//! (see the `Err(_) => break` comments in `Play`/`Host`/`Display` below)
+//! against real reconnect behavior in an actual browser, which this
+//! environment can't do -- see the session summary for why. Over a
+//! multi-hour live event on venue WiFi, this is worth fixing for real
+//! before Phase 5, with a real browser available to verify it.
 
 #[cfg(feature = "server")]
 mod game_server;
@@ -243,6 +271,7 @@ fn Play() -> Element {
         }
         for task in v.open_tasks.clone() {
             TaskAttemptForm {
+                key: "{task.id.0}",
                 my_id: id,
                 task,
                 roster: v.roster.clone(),
@@ -441,7 +470,15 @@ fn Host() -> Element {
                     error.set(None);
                 }
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
-                Ok(ServerMsg::Joined { .. }) | Err(_) => {}
+                Ok(ServerMsg::Joined { .. }) => {}
+                // The connection is gone -- stop polling it. Without this,
+                // a closed socket makes `recv()` return `Err` immediately
+                // on every call forever, spinning this loop with no yield
+                // point and pegging the tab's CPU instead of just going
+                // idle. There's no reconnect story yet either way (see the
+                // module doc comment), so a closed connection just stays
+                // closed until the page is reloaded.
+                Err(_) => break,
             }
         }
     });
@@ -530,7 +567,10 @@ fn Display() -> Element {
         loop {
             match socket.recv().await {
                 Ok(ServerMsg::View(v)) => view.set(Some(v)),
-                Ok(ServerMsg::Failed { .. } | ServerMsg::Joined { .. }) | Err(_) => {}
+                Ok(ServerMsg::Failed { .. } | ServerMsg::Joined { .. }) => {}
+                // See the identical comment in `Host` -- without this, a
+                // closed connection spins this loop forever with no yield.
+                Err(_) => break,
             }
         }
     });
