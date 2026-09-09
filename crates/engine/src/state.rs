@@ -1,10 +1,14 @@
 use crate::character::{Character, PlayerStatus};
 use crate::command::Command;
+use crate::denouncement::{
+    execution_count, resolve_ballot, surfaced_nominees, Ballot, Denouncement, DenouncementPhase,
+};
 use crate::error::GameError;
 use crate::event::DomainEvent;
 use crate::player::{Faction, Player, PlayerId};
 use crate::round::Round;
-use std::collections::BTreeMap;
+use crate::task::{TaskDef, TaskId, TaskTier};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The single canonical game state. Owned exclusively by the actor task in
 /// the `app` crate at runtime (see the plan's Networking section); never
@@ -48,6 +52,23 @@ pub struct GameState {
     /// module doc comment on `win_condition::evaluate` for why this can't
     /// be a live-recomputed check.
     martyrdom_triggered: bool,
+
+    /// At most one Denouncement runs at a time -- `Command::OpenDenouncement`
+    /// is rejected while this is `Some`. See `denouncement.rs`.
+    denouncement: Option<Denouncement>,
+
+    /// Every task ever pushed, across every round -- kept even after a
+    /// task closes so `task_attempt` can still answer "did this player
+    /// complete this task" for round-recap/Whistledown purposes later.
+    tasks: BTreeMap<TaskId, TaskDef>,
+    next_task_id: u32,
+    /// Currently attemptable tasks. `CloseTasks` clears this without
+    /// removing anything from `tasks`.
+    open_tasks: BTreeSet<TaskId>,
+    /// `credited` outcome per (player, task) attempt. Deliberately does not
+    /// store the `named` claim itself -- see the doc comment on
+    /// `DomainEvent::TaskAttempted` for why.
+    task_attempts: BTreeMap<(PlayerId, TaskId), bool>,
 }
 
 impl Default for GameState {
@@ -69,6 +90,11 @@ impl Default for GameState {
             cult_leader: None,
             oracle_disabled: false,
             martyrdom_triggered: false,
+            denouncement: None,
+            tasks: BTreeMap::new(),
+            next_task_id: 0,
+            open_tasks: BTreeSet::new(),
+            task_attempts: BTreeMap::new(),
         }
     }
 }
@@ -129,6 +155,46 @@ impl GameState {
 
     pub fn martyrdom_triggered(&self) -> bool {
         self.martyrdom_triggered
+    }
+
+    /// The active Denouncement's current phase, if one is in progress.
+    pub fn denouncement_phase(&self) -> Option<&DenouncementPhase> {
+        self.denouncement.as_ref().map(|d| &d.phase)
+    }
+
+    /// How many Active players belong to one of the three competing
+    /// factions (Ton/Uprising/Cult) -- Servants and still-`Unassigned`
+    /// players are excluded. This is what the execution-count scaling
+    /// formula (rules.md §5) actually scales against, per Dalton's
+    /// resolution of that ambiguity during planning: the formula's
+    /// "players remaining" means competing players specifically, not
+    /// everyone still physically in the game.
+    pub fn competing_player_count(&self) -> usize {
+        self.players
+            .values()
+            .filter(|p| {
+                p.status == PlayerStatus::Active
+                    && matches!(p.faction, Faction::Ton | Faction::Uprising | Faction::Cult)
+            })
+            .count()
+    }
+
+    pub fn task(&self, id: TaskId) -> Option<&TaskDef> {
+        self.tasks.get(&id)
+    }
+
+    pub fn is_task_open(&self, id: TaskId) -> bool {
+        self.open_tasks.contains(&id)
+    }
+
+    pub fn open_task_ids(&self) -> impl Iterator<Item = &TaskId> {
+        self.open_tasks.iter()
+    }
+
+    /// `Some(credited)` if `player` has already attempted `task`, `None` if
+    /// they haven't yet.
+    pub fn task_attempt(&self, player: PlayerId, task: TaskId) -> Option<bool> {
+        self.task_attempts.get(&(player, task)).copied()
     }
 
     /// The faction a title's holder must belong to. Used to validate
@@ -242,6 +308,48 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             state.current_round = next;
             vec![DomainEvent::RoundAdvanced { round: next }]
         }
+
+        Command::OpenDenouncement => {
+            if state.denouncement.is_some() {
+                return Err(GameError::DenouncementAlreadyOpen);
+            }
+            state.denouncement = Some(Denouncement {
+                phase: DenouncementPhase::Nomination {
+                    submitted: BTreeMap::new(),
+                },
+            });
+            vec![DomainEvent::DenouncementOpened]
+        }
+
+        Command::Nominate { voter, nominee } => nominate(state, voter, nominee)?,
+
+        Command::CloseNomination => close_nomination(state)?,
+
+        Command::OpenBallot => open_ballot(state)?,
+
+        Command::CastBallot { voter, ballot } => cast_ballot(state, voter, ballot)?,
+
+        Command::CloseBallot {
+            fallback_replacement,
+        } => close_ballot(state, fallback_replacement)?,
+
+        Command::CloseRunoff {
+            fallback_replacement,
+        } => close_runoff(state, fallback_replacement)?,
+
+        Command::PushTask {
+            prompt,
+            tier,
+            qualifying_players,
+        } => push_task(state, prompt, tier, qualifying_players),
+
+        Command::CloseTasks => close_tasks(state),
+
+        Command::AttemptTask {
+            player,
+            task,
+            named,
+        } => attempt_task(state, player, task, named)?,
     };
 
     state.event_log.extend(events.clone());
@@ -562,6 +670,292 @@ fn resolve_cast_out(
     }
 
     Ok(events)
+}
+
+fn nominate(
+    state: &mut GameState,
+    voter: PlayerId,
+    nominee: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if state.denouncement.is_none() {
+        return Err(GameError::NoDenouncementOpen);
+    }
+    if !state.is_active(voter) {
+        return Err(GameError::NotActive(voter));
+    }
+    if !state.is_active(nominee) {
+        return Err(GameError::NotActive(nominee));
+    }
+    let denouncement = state.denouncement.as_mut().unwrap();
+    let DenouncementPhase::Nomination { submitted } = &mut denouncement.phase else {
+        return Err(GameError::NominationNotOpen);
+    };
+    submitted.insert(voter, nominee);
+    Ok(vec![DomainEvent::NominationCast { voter, nominee }])
+}
+
+fn close_nomination(state: &mut GameState) -> Result<Vec<DomainEvent>, GameError> {
+    let denouncement = state
+        .denouncement
+        .as_mut()
+        .ok_or(GameError::NoDenouncementOpen)?;
+    let DenouncementPhase::Nomination { submitted } = &denouncement.phase else {
+        return Err(GameError::NominationNotOpen);
+    };
+
+    let mut tally: BTreeMap<PlayerId, u32> = BTreeMap::new();
+    for &nominee in submitted.values() {
+        *tally.entry(nominee).or_insert(0) += 1;
+    }
+    // Top 3, with everyone tied for the last spot surfacing too -- see
+    // `denouncement::surfaced_nominees`.
+    let surfaced = surfaced_nominees(&tally, 3);
+
+    denouncement.phase = DenouncementPhase::Discussion {
+        surfaced: surfaced.clone(),
+    };
+    Ok(vec![DomainEvent::NominationClosed { surfaced }])
+}
+
+fn open_ballot(state: &mut GameState) -> Result<Vec<DomainEvent>, GameError> {
+    let denouncement = state
+        .denouncement
+        .as_mut()
+        .ok_or(GameError::NoDenouncementOpen)?;
+    let DenouncementPhase::Discussion { surfaced } = &denouncement.phase else {
+        return Err(GameError::DiscussionNotOpen);
+    };
+    let candidates = surfaced.clone();
+    denouncement.phase = DenouncementPhase::Ballot {
+        surfaced: candidates.clone(),
+        ballots: BTreeMap::new(),
+    };
+    Ok(vec![DomainEvent::BallotOpened { candidates }])
+}
+
+fn cast_ballot(
+    state: &mut GameState,
+    voter: PlayerId,
+    ballot: Ballot,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(voter) {
+        return Err(GameError::NotActive(voter));
+    }
+    // Validate a `For` target against whichever phase we're actually in
+    // *before* taking a mutable borrow, so an invalid target is rejected
+    // without recording anything.
+    if let Ballot::For(candidate) = ballot {
+        let valid = match state.denouncement.as_ref().map(|d| &d.phase) {
+            Some(DenouncementPhase::Ballot { surfaced, .. }) => surfaced.contains(&candidate),
+            Some(DenouncementPhase::Runoff { candidates, .. }) => candidates.contains(&candidate),
+            _ => false,
+        };
+        if !valid {
+            return Err(GameError::InvalidBallotTarget(candidate));
+        }
+    }
+
+    let denouncement = state
+        .denouncement
+        .as_mut()
+        .ok_or(GameError::NoDenouncementOpen)?;
+    match &mut denouncement.phase {
+        DenouncementPhase::Ballot { ballots, .. } | DenouncementPhase::Runoff { ballots, .. } => {
+            ballots.insert(voter, ballot);
+        }
+        _ => return Err(GameError::BallotNotOpen),
+    }
+    Ok(vec![DomainEvent::BallotCast { voter, ballot }])
+}
+
+/// Tallies `ballots` against `candidates`, counting only `Ballot::For`
+/// votes -- `Abstain` (and any stray vote for a non-candidate, which
+/// `cast_ballot` should already have rejected) simply don't add to anyone's
+/// count. Every candidate gets an entry, including 0, so
+/// `denouncement::resolve_ballot` can distinguish "nobody voted for them"
+/// from "they were never a candidate at all."
+fn tally_ballots(
+    candidates: &[PlayerId],
+    ballots: &BTreeMap<PlayerId, Ballot>,
+) -> BTreeMap<PlayerId, u32> {
+    let mut tally: BTreeMap<PlayerId, u32> = candidates.iter().map(|&id| (id, 0)).collect();
+    for b in ballots.values() {
+        if let Ballot::For(candidate) = b {
+            if let Some(count) = tally.get_mut(candidate) {
+                *count += 1;
+            }
+        }
+    }
+    tally
+}
+
+fn close_ballot(
+    state: &mut GameState,
+    fallback_replacement: Option<PlayerId>,
+) -> Result<Vec<DomainEvent>, GameError> {
+    // Clone what's needed out of the borrowed phase and release it
+    // immediately -- `resolve_cast_out` below needs `&mut GameState`, which
+    // can't coexist with a live borrow into `state.denouncement`.
+    let (surfaced, ballots) = match state.denouncement.as_ref().map(|d| &d.phase) {
+        Some(DenouncementPhase::Ballot { surfaced, ballots }) => {
+            (surfaced.clone(), ballots.clone())
+        }
+        _ => return Err(GameError::BallotNotOpen),
+    };
+
+    let tally = tally_ballots(&surfaced, &ballots);
+    let slots = execution_count(state.competing_player_count());
+    let resolution = resolve_ballot(&tally, slots);
+
+    let mut events = Vec::new();
+    if resolution.tied_for_last_slot.is_empty() {
+        let cast_out = resolution.locked_in;
+        events.push(DomainEvent::BallotClosed {
+            cast_out: cast_out.clone(),
+        });
+        for player in cast_out {
+            // A player who was voted out independently can *also* be swept
+            // by another cast-out's own cascade within this same batch --
+            // e.g. the King/Queen and Prince/Princess both surfacing and
+            // both getting a slot in the same multi-slot Round 3
+            // Denouncement: casting out the King/Queen already casts out
+            // the Prince/Princess too (rules.md §5). Skip anyone the loop
+            // has already resolved this way instead of re-resolving them --
+            // `resolve_cast_out` correctly rejects an already-inactive
+            // target, and letting that rejection propagate here would
+            // abort the whole command partway through, leaving `state`
+            // mutated despite returning `Err` (violating this function's
+            // own "no mutation on error" contract).
+            if !state.is_active(player) {
+                continue;
+            }
+            events.extend(resolve_cast_out(state, player, fallback_replacement)?);
+        }
+        state.denouncement = None;
+    } else {
+        let slots_remaining = slots - resolution.locked_in.len();
+        let candidates = resolution.tied_for_last_slot;
+        let already_locked_in = resolution.locked_in;
+        state.denouncement.as_mut().unwrap().phase = DenouncementPhase::Runoff {
+            candidates: candidates.clone(),
+            slots_remaining,
+            already_locked_in,
+            ballots: BTreeMap::new(),
+        };
+        events.push(DomainEvent::RunoffOpened {
+            candidates,
+            slots_remaining,
+        });
+    }
+    Ok(events)
+}
+
+fn close_runoff(
+    state: &mut GameState,
+    fallback_replacement: Option<PlayerId>,
+) -> Result<Vec<DomainEvent>, GameError> {
+    let (candidates, slots_remaining, already_locked_in, ballots) =
+        match state.denouncement.as_ref().map(|d| &d.phase) {
+            Some(DenouncementPhase::Runoff {
+                candidates,
+                slots_remaining,
+                already_locked_in,
+                ballots,
+            }) => (
+                candidates.clone(),
+                *slots_remaining,
+                already_locked_in.clone(),
+                ballots.clone(),
+            ),
+            _ => return Err(GameError::RunoffNotOpen),
+        };
+
+    let tally = tally_ballots(&candidates, &ballots);
+    let resolution = resolve_ballot(&tally, slots_remaining);
+    // A repeat tie -- rules.md: "no one is Denounced for that slot." No
+    // second runoff; whatever's left in `tied_for_last_slot` is simply
+    // dropped, while `already_locked_in` (from the original ballot) and
+    // anything the runoff *did* resolve cleanly still go through.
+    let unfilled_slot = !resolution.tied_for_last_slot.is_empty();
+
+    let mut cast_out = already_locked_in;
+    cast_out.extend(resolution.locked_in);
+
+    let mut events = vec![DomainEvent::RunoffClosed {
+        cast_out: cast_out.clone(),
+        unfilled_slot,
+    }];
+    for player in cast_out {
+        // See the identical guard in `close_ballot` -- a player already
+        // swept by another cast-out's own cascade earlier in this same
+        // batch must be skipped, not re-resolved.
+        if !state.is_active(player) {
+            continue;
+        }
+        events.extend(resolve_cast_out(state, player, fallback_replacement)?);
+    }
+    state.denouncement = None;
+    Ok(events)
+}
+
+fn push_task(
+    state: &mut GameState,
+    prompt: String,
+    tier: TaskTier,
+    qualifying_players: BTreeSet<PlayerId>,
+) -> Vec<DomainEvent> {
+    let id = TaskId(state.next_task_id);
+    state.next_task_id += 1;
+    state.tasks.insert(
+        id,
+        TaskDef {
+            id,
+            prompt: prompt.clone(),
+            tier,
+            qualifying_players,
+        },
+    );
+    state.open_tasks.insert(id);
+    vec![DomainEvent::TaskPushed { id, prompt, tier }]
+}
+
+fn close_tasks(state: &mut GameState) -> Vec<DomainEvent> {
+    let closed: Vec<TaskId> = state.open_tasks.iter().copied().collect();
+    state.open_tasks.clear();
+    vec![DomainEvent::TasksClosed { closed }]
+}
+
+fn attempt_task(
+    state: &mut GameState,
+    player: PlayerId,
+    task: TaskId,
+    named: [PlayerId; 3],
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    let def = state.tasks.get(&task).ok_or(GameError::UnknownTask(task))?;
+    if !state.open_tasks.contains(&task) {
+        return Err(GameError::TaskNotOpen(task));
+    }
+    if state.task_attempts.contains_key(&(player, task)) {
+        return Err(GameError::AlreadyAttemptedTask { player, task });
+    }
+    if named.contains(&player) {
+        return Err(GameError::CannotNameSelfForTask);
+    }
+    let mut distinct = BTreeSet::new();
+    if named.iter().any(|id| !distinct.insert(*id)) {
+        return Err(GameError::DuplicateNamedPlayerForTask);
+    }
+
+    let credited = named.iter().any(|id| def.qualifying_players.contains(id));
+    state.task_attempts.insert((player, task), credited);
+    Ok(vec![DomainEvent::TaskAttempted {
+        player,
+        task,
+        credited,
+    }])
 }
 
 #[cfg(test)]
@@ -1630,5 +2024,1153 @@ mod tests {
         }
         let result = apply_command(&mut state, Command::AdvanceRound);
         assert_eq!(result, Err(GameError::AlreadyAtFinale));
+    }
+
+    // --- The Denouncement procedure ---
+
+    /// `setup_full_game` plus `extra` additional Ton players with no
+    /// title, giving a realistic pool of voters/nominees for exercising
+    /// the Denouncement procedure without every test needing its own
+    /// bespoke roster.
+    fn setup_game_with_extra_voters(extra: usize) -> (GameState, Vec<PlayerId>) {
+        let (mut state, king_queen, prince, leader, cult_leader) = setup_full_game();
+        let mut everyone = vec![king_queen, prince, leader, cult_leader];
+        for i in 0..extra {
+            everyone.push(add_player(&mut state, &format!("Extra{i}"), Faction::Ton));
+        }
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        (state, everyone)
+    }
+
+    #[test]
+    fn open_denouncement_rejects_a_second_one_while_one_is_active() {
+        let (mut state, ..) = setup_game_with_extra_voters(2);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(&mut state, Command::OpenDenouncement);
+        assert_eq!(result, Err(GameError::DenouncementAlreadyOpen));
+    }
+
+    #[test]
+    fn nominate_rejects_when_no_denouncement_is_open() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let result = apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: everyone[0],
+                nominee: everyone[1],
+            },
+        );
+        assert_eq!(result, Err(GameError::NoDenouncementOpen));
+    }
+
+    #[test]
+    fn nominate_rejects_an_inactive_voter_or_nominee() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: everyone[4],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        let result = apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: everyone[4],
+                nominee: everyone[0],
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(everyone[4])));
+
+        let result = apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: everyone[0],
+                nominee: everyone[4],
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(everyone[4])));
+    }
+
+    #[test]
+    fn re_nominating_replaces_the_voters_earlier_choice() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: everyone[0],
+                nominee: everyone[1],
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: everyone[0],
+                nominee: everyone[2],
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        // Only everyone[2] should have a nomination -- everyone[1] never
+        // surfaces since the replaced vote for them was overwritten, not
+        // added to.
+        match state.denouncement_phase() {
+            Some(DenouncementPhase::Discussion { surfaced }) => {
+                assert!(surfaced.contains(&everyone[2]));
+                assert!(!surfaced.contains(&everyone[1]));
+            }
+            other => panic!("expected Discussion phase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_nomination_rejects_outside_the_nomination_phase() {
+        let (mut state, ..) = setup_game_with_extra_voters(2);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        let result = apply_command(&mut state, Command::CloseNomination);
+        assert_eq!(result, Err(GameError::NominationNotOpen));
+    }
+
+    #[test]
+    fn open_ballot_rejects_outside_the_discussion_phase() {
+        let (mut state, ..) = setup_game_with_extra_voters(2);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(&mut state, Command::OpenBallot);
+        assert_eq!(result, Err(GameError::DiscussionNotOpen));
+    }
+
+    #[test]
+    fn cast_ballot_rejects_a_target_who_never_surfaced() {
+        let (mut state, everyone) = setup_game_with_extra_voters(3);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        // Nominate only everyone[0..3] so everyone[3] (a 4th extra) never
+        // surfaces.
+        for voter in &everyone[0..3] {
+            apply_command(
+                &mut state,
+                Command::Nominate {
+                    voter: *voter,
+                    nominee: everyone[0],
+                },
+            )
+            .unwrap();
+        }
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        let never_nominated = everyone[6]; // one of the extras, never nominated
+        let result = apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: everyone[0],
+                ballot: Ballot::For(never_nominated),
+            },
+        );
+        assert_eq!(result, Err(GameError::InvalidBallotTarget(never_nominated)));
+    }
+
+    #[test]
+    fn cast_ballot_rejects_an_inactive_voter() {
+        let (mut state, everyone) = setup_game_with_extra_voters(3);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: everyone[0],
+                nominee: everyone[1],
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: everyone[2],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: everyone[2],
+                ballot: Ballot::Abstain,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(everyone[2])));
+    }
+
+    #[test]
+    fn abstaining_never_counts_toward_any_candidates_tally() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        // 6 players total; ≤20 competing players means 1 slot.
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        for voter in &everyone {
+            apply_command(
+                &mut state,
+                Command::Nominate {
+                    voter: *voter,
+                    nominee: everyone[0],
+                },
+            )
+            .unwrap();
+        }
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        for voter in &everyone {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::Abstain,
+                },
+            )
+            .unwrap();
+        }
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events.first(),
+            Some(&DomainEvent::BallotClosed { cast_out: vec![] }),
+            "an all-abstain ballot must Cast Out no one, not default to the only nominee"
+        );
+        assert_eq!(
+            state.denouncement_phase(),
+            None,
+            "the Denouncement still closes even with no result"
+        );
+    }
+
+    #[test]
+    fn a_full_clean_denouncement_cast_outs_the_clear_winner_and_closes() {
+        let (mut state, everyone) = setup_game_with_extra_voters(3);
+        let target = everyone[1];
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        for voter in &everyone {
+            apply_command(
+                &mut state,
+                Command::Nominate {
+                    voter: *voter,
+                    nominee: target,
+                },
+            )
+            .unwrap();
+        }
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        for voter in &everyone {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(target),
+                },
+            )
+            .unwrap();
+        }
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.first(),
+            Some(&DomainEvent::BallotClosed {
+                cast_out: vec![target]
+            })
+        );
+        assert!(events.contains(&DomainEvent::PlayerCastOut { player: target }));
+        assert_eq!(state.player(target).unwrap().status, PlayerStatus::CastOut);
+        assert_eq!(state.denouncement_phase(), None);
+    }
+
+    #[test]
+    fn a_denouncement_cast_out_still_triggers_the_full_cascade() {
+        // Integration check: the procedure hands off to the *same*
+        // resolve_cast_out cascades Command::CastOut already exercises --
+        // Casting Out the Revolutionary Leader through a real Denouncement
+        // must still trigger succession.
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let leader = state.revolutionary_leader().unwrap();
+        let ally = add_player(&mut state, "Ally", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        for voter in everyone.iter().chain([&ally]) {
+            apply_command(
+                &mut state,
+                Command::Nominate {
+                    voter: *voter,
+                    nominee: leader,
+                },
+            )
+            .unwrap();
+        }
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        for voter in everyone.iter().chain([&ally]) {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(leader),
+                },
+            )
+            .unwrap();
+        }
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: Some(ally),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.player(leader).unwrap().status, PlayerStatus::CastOut);
+        assert_eq!(state.revolutionary_leader(), Some(ally));
+        assert!(state.revolutionary_leader_ever_denounced_unconverted());
+    }
+
+    #[test]
+    fn a_tie_for_the_only_slot_opens_a_runoff_instead_of_resolving() {
+        let (mut state, everyone) = setup_game_with_extra_voters(3);
+        let a = everyone[0];
+        let b = everyone[1];
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: a,
+                nominee: a,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: b,
+                nominee: b,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        // 3 votes each -- an exact tie for the single execution slot.
+        for voter in &everyone[0..3] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(a),
+                },
+            )
+            .unwrap();
+        }
+        for voter in &everyone[3..6] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(b),
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        match state.denouncement_phase() {
+            Some(DenouncementPhase::Runoff {
+                candidates,
+                slots_remaining,
+                already_locked_in,
+                ..
+            }) => {
+                let mut sorted = candidates.clone();
+                sorted.sort();
+                let mut expected = vec![a, b];
+                expected.sort();
+                assert_eq!(sorted, expected);
+                assert_eq!(*slots_remaining, 1);
+                assert!(already_locked_in.is_empty());
+            }
+            other => panic!("expected Runoff phase, got {other:?}"),
+        }
+        assert!(matches!(
+            events.first(),
+            Some(DomainEvent::RunoffOpened { .. })
+        ));
+        // Nobody is Cast Out yet -- the tie is unresolved.
+        assert_eq!(state.player(a).unwrap().status, PlayerStatus::Active);
+        assert_eq!(state.player(b).unwrap().status, PlayerStatus::Active);
+    }
+
+    #[test]
+    fn a_clean_runoff_resolves_and_closes_the_denouncement() {
+        let (mut state, everyone) = setup_game_with_extra_voters(3);
+        let a = everyone[0];
+        let b = everyone[1];
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: a,
+                nominee: a,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: b,
+                nominee: b,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        for voter in &everyone[0..3] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(a),
+                },
+            )
+            .unwrap();
+        }
+        for voter in &everyone[3..6] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(b),
+                },
+            )
+            .unwrap();
+        }
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        // Runoff: everyone breaks for `a`.
+        for voter in &everyone {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(a),
+                },
+            )
+            .unwrap();
+        }
+        let events = apply_command(
+            &mut state,
+            Command::CloseRunoff {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.first(),
+            Some(&DomainEvent::RunoffClosed {
+                cast_out: vec![a],
+                unfilled_slot: false,
+            })
+        );
+        assert_eq!(state.player(a).unwrap().status, PlayerStatus::CastOut);
+        assert_eq!(state.player(b).unwrap().status, PlayerStatus::Active);
+        assert_eq!(state.denouncement_phase(), None);
+    }
+
+    #[test]
+    fn a_repeat_tie_in_the_runoff_leaves_the_slot_unfilled_but_still_closes() {
+        let (mut state, everyone) = setup_game_with_extra_voters(3);
+        let a = everyone[0];
+        let b = everyone[1];
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: a,
+                nominee: a,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: b,
+                nominee: b,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        for voter in &everyone[0..3] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(a),
+                },
+            )
+            .unwrap();
+        }
+        for voter in &everyone[3..6] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(b),
+                },
+            )
+            .unwrap();
+        }
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        // Runoff ties again: 3 votes each.
+        for voter in &everyone[0..3] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(a),
+                },
+            )
+            .unwrap();
+        }
+        for voter in &everyone[3..6] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(b),
+                },
+            )
+            .unwrap();
+        }
+        let events = apply_command(
+            &mut state,
+            Command::CloseRunoff {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.first(),
+            Some(&DomainEvent::RunoffClosed {
+                cast_out: vec![],
+                unfilled_slot: true,
+            })
+        );
+        assert_eq!(state.player(a).unwrap().status, PlayerStatus::Active);
+        assert_eq!(state.player(b).unwrap().status, PlayerStatus::Active);
+        assert_eq!(
+            state.denouncement_phase(),
+            None,
+            "a repeat tie still closes the Denouncement -- no second runoff"
+        );
+    }
+
+    #[test]
+    fn a_runoff_still_cast_outs_candidates_already_locked_in_from_the_original_ballot() {
+        // 21 competing players -> execution_count() == 2. A gets a clear
+        // majority (locked in immediately); B and C tie for the second
+        // slot and go to a runoff. Closing the runoff must still Cast Out
+        // A even though A was never part of the runoff ballot itself.
+        let (mut state, everyone) = setup_game_with_extra_voters(17); // 4 + 17 = 21
+        assert_eq!(state.competing_player_count(), 21);
+        let a = everyone[0];
+        let b = everyone[1];
+        let c = everyone[2];
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: a,
+                nominee: a,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: b,
+                nominee: b,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: c,
+                nominee: c,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        // A: 10 votes (clear majority slot). B and C: 5 votes each (tied
+        // for the remaining slot). 4 players (index 18,19,20 + one more)
+        // abstain to keep totals honest across 21 voters.
+        for voter in &everyone[0..10] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(a),
+                },
+            )
+            .unwrap();
+        }
+        for voter in &everyone[10..15] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(b),
+                },
+            )
+            .unwrap();
+        }
+        for voter in &everyone[15..20] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(c),
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(DomainEvent::RunoffOpened { .. })
+        ));
+        // Cast-Outs are deliberately batched: even though A is already
+        // locked in, A stays Active until the whole Denouncement closes --
+        // everyone Denounced this round is revealed together, not
+        // incrementally as each slot resolves.
+        assert_eq!(state.player(a).unwrap().status, PlayerStatus::Active);
+        match state.denouncement_phase() {
+            Some(DenouncementPhase::Runoff {
+                already_locked_in,
+                slots_remaining,
+                ..
+            }) => {
+                assert_eq!(already_locked_in, &vec![a]);
+                assert_eq!(*slots_remaining, 1);
+            }
+            other => panic!("expected Runoff phase, got {other:?}"),
+        }
+
+        // Runoff breaks for B.
+        for voter in &everyone[0..21] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter: *voter,
+                    ballot: Ballot::For(b),
+                },
+            )
+            .unwrap();
+        }
+        let events = apply_command(
+            &mut state,
+            Command::CloseRunoff {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        let mut cast_out = match &events[0] {
+            DomainEvent::RunoffClosed {
+                cast_out,
+                unfilled_slot,
+            } => {
+                assert!(!unfilled_slot);
+                cast_out.clone()
+            }
+            other => panic!("expected RunoffClosed, got {other:?}"),
+        };
+        cast_out.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(cast_out, expected);
+        assert_eq!(state.player(a).unwrap().status, PlayerStatus::CastOut);
+        assert_eq!(state.player(b).unwrap().status, PlayerStatus::CastOut);
+        assert_eq!(state.player(c).unwrap().status, PlayerStatus::Active);
+        assert_eq!(state.denouncement_phase(), None);
+    }
+
+    #[test]
+    fn a_multi_slot_round_three_denouncement_can_cast_out_the_king_queen_and_prince_princess_together(
+    ) {
+        // Regression test: at 21+ competing players, execution_count() is
+        // 2. If the King/Queen AND the Prince/Princess both surface and
+        // both win a slot in the *same* Round 3 Denouncement, resolving
+        // the King/Queen's own Cast-Out cascade (rules.md §5) already
+        // Casts Out the Prince/Princess directly -- so by the time the
+        // batch loop in `close_ballot` reaches the Prince/Princess as its
+        // own, independently-voted-out slot, they're already inactive.
+        // Before the fix, `resolve_cast_out` correctly rejected that as
+        // `NotActive`, but that error propagated out of `close_ballot`
+        // *after* the King/Queen's cascade had already mutated `state` --
+        // silently violating `apply_command`'s "on error, state is left
+        // unchanged" contract. This must now resolve cleanly instead.
+        let (mut state, everyone) = setup_game_with_extra_voters(17); // 4 + 17 = 21
+        assert_eq!(state.competing_player_count(), 21);
+        let king_queen = everyone[0];
+        let prince_princess = everyone[1];
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        for &voter in &everyone[4..14] {
+            apply_command(
+                &mut state,
+                Command::Nominate {
+                    voter,
+                    nominee: king_queen,
+                },
+            )
+            .unwrap();
+        }
+        for &voter in &everyone[14..21] {
+            apply_command(
+                &mut state,
+                Command::Nominate {
+                    voter,
+                    nominee: prince_princess,
+                },
+            )
+            .unwrap();
+        }
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        match state.denouncement_phase() {
+            Some(DenouncementPhase::Discussion { surfaced }) => {
+                let mut sorted = surfaced.clone();
+                sorted.sort();
+                let mut expected = vec![king_queen, prince_princess];
+                expected.sort();
+                assert_eq!(sorted, expected);
+            }
+            other => panic!("expected Discussion phase, got {other:?}"),
+        }
+
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        for &voter in &everyone[4..14] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(king_queen),
+                },
+            )
+            .unwrap();
+        }
+        for &voter in &everyone[14..21] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(prince_princess),
+                },
+            )
+            .unwrap();
+        }
+
+        let result = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "closing a multi-slot Denouncement that catches both the King/Queen and Prince/Princess \
+             must not error: {result:?}"
+        );
+        assert_eq!(
+            state.player(king_queen).unwrap().status,
+            PlayerStatus::CastOut
+        );
+        assert_eq!(
+            state.player(prince_princess).unwrap().status,
+            PlayerStatus::CastOut
+        );
+        // The Round-3 cascade still installs a new King/Queen from the
+        // remaining untitled Ton pool.
+        assert!(state.king_queen().is_some());
+        assert_ne!(state.king_queen(), Some(king_queen));
+    }
+
+    #[test]
+    fn servants_can_nominate_and_vote_despite_being_excluded_from_headcount_scaling() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let servant = add_player(&mut state, "Servant", Faction::Servant);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        // Servants never get a competing-faction character, so
+        // competing_player_count must not include them.
+        let with_servant = state.competing_player_count();
+        assert_eq!(with_servant, everyone.len());
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: servant,
+                nominee: everyone[0],
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: everyone[0],
+                nominee: everyone[0],
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        match state.denouncement_phase() {
+            Some(DenouncementPhase::Discussion { surfaced }) => {
+                assert!(surfaced.contains(&everyone[0]));
+            }
+            other => panic!("expected Discussion phase, got {other:?}"),
+        }
+
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: servant,
+                ballot: Ballot::For(everyone[0]),
+            },
+        );
+        assert!(result.is_ok(), "a Servant must be able to vote: {result:?}");
+    }
+
+    // --- The task system ---
+
+    fn push_task(
+        state: &mut GameState,
+        prompt: &str,
+        tier: TaskTier,
+        qualifying: &[PlayerId],
+    ) -> TaskId {
+        let events = apply_command(
+            state,
+            Command::PushTask {
+                prompt: prompt.into(),
+                tier,
+                qualifying_players: qualifying.iter().copied().collect(),
+            },
+        )
+        .unwrap();
+        match events.as_slice() {
+            [DomainEvent::TaskPushed { id, .. }] => *id,
+            other => panic!("expected a single TaskPushed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_task_assigns_sequential_ids_and_opens_it() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let first = push_task(
+            &mut state,
+            "Talk to someone in a mask",
+            TaskTier::Easy,
+            &everyone,
+        );
+        let second = push_task(&mut state, "Talk to a dancer", TaskTier::Medium, &everyone);
+        assert_ne!(first, second);
+        assert!(state.is_task_open(first));
+        assert!(state.is_task_open(second));
+        assert_eq!(state.task(first).unwrap().tier, TaskTier::Easy);
+        assert_eq!(state.task(second).unwrap().tier, TaskTier::Medium);
+    }
+
+    #[test]
+    fn close_tasks_locks_every_open_task_and_is_a_no_op_when_none_are_open() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let a = push_task(&mut state, "A", TaskTier::Easy, &everyone);
+        let b = push_task(&mut state, "B", TaskTier::Medium, &everyone);
+
+        let events = apply_command(&mut state, Command::CloseTasks).unwrap();
+        match events.as_slice() {
+            [DomainEvent::TasksClosed { closed }] => {
+                let mut sorted = closed.clone();
+                sorted.sort_by_key(|t| t.0);
+                let mut expected = vec![a, b];
+                expected.sort_by_key(|t| t.0);
+                assert_eq!(sorted, expected);
+            }
+            other => panic!("expected a single TasksClosed event, got {other:?}"),
+        }
+        assert!(!state.is_task_open(a));
+        assert!(!state.is_task_open(b));
+        // Closed tasks are still known (for later completion-rate lookups)
+        // -- they just aren't attemptable any more.
+        assert!(state.task(a).is_some());
+
+        let events = apply_command(&mut state, Command::CloseTasks).unwrap();
+        assert_eq!(events, vec![DomainEvent::TasksClosed { closed: vec![] }]);
+    }
+
+    #[test]
+    fn attempt_task_credits_when_any_named_player_is_in_the_qualifying_set() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let qualifies = everyone[3]; // one of the extras
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &[qualifies]);
+
+        let attempter = everyone[0];
+        let named = [everyone[1], everyone[2], qualifies];
+        let events = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: attempter,
+                task,
+                named,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![DomainEvent::TaskAttempted {
+                player: attempter,
+                task,
+                credited: true,
+            }]
+        );
+        assert_eq!(state.task_attempt(attempter, task), Some(true));
+    }
+
+    #[test]
+    fn attempt_task_does_not_credit_when_no_named_player_qualifies() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let task = push_task(
+            &mut state,
+            "Talk to someone",
+            TaskTier::Easy,
+            &[everyone[3]],
+        );
+
+        let attempter = everyone[0];
+        let named = [everyone[1], everyone[2], everyone[4]];
+        let events = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: attempter,
+                task,
+                named,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![DomainEvent::TaskAttempted {
+                player: attempter,
+                task,
+                credited: false,
+            }]
+        );
+        assert_eq!(state.task_attempt(attempter, task), Some(false));
+    }
+
+    #[test]
+    fn attempt_task_rejects_an_inactive_player() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: everyone[0],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named: [everyone[1], everyone[2], everyone[3]],
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(everyone[0])));
+    }
+
+    #[test]
+    fn attempt_task_rejects_an_unknown_task() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let bogus = TaskId(9999);
+        let result = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task: bogus,
+                named: [everyone[1], everyone[2], everyone[3]],
+            },
+        );
+        assert_eq!(result, Err(GameError::UnknownTask(bogus)));
+    }
+
+    #[test]
+    fn attempt_task_rejects_a_closed_task() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
+        apply_command(&mut state, Command::CloseTasks).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named: [everyone[1], everyone[2], everyone[3]],
+            },
+        );
+        assert_eq!(result, Err(GameError::TaskNotOpen(task)));
+    }
+
+    #[test]
+    fn attempt_task_rejects_a_second_attempt_at_the_same_task() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
+        let named = [everyone[1], everyone[2], everyone[3]];
+        apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AlreadyAttemptedTask {
+                player: everyone[0],
+                task
+            })
+        );
+    }
+
+    #[test]
+    fn attempt_task_rejects_naming_yourself() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
+        let result = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named: [everyone[0], everyone[1], everyone[2]],
+            },
+        );
+        assert_eq!(result, Err(GameError::CannotNameSelfForTask));
+    }
+
+    #[test]
+    fn attempt_task_rejects_duplicate_named_players() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
+        let result = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named: [everyone[1], everyone[1], everyone[2]],
+            },
+        );
+        assert_eq!(result, Err(GameError::DuplicateNamedPlayerForTask));
+    }
+
+    #[test]
+    fn a_failed_task_attempt_does_not_consume_the_one_attempt_per_task_limit() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
+        // First, a rejected attempt (naming self) -- must not count.
+        apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named: [everyone[0], everyone[1], everyone[2]],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(state.task_attempt(everyone[0], task), None);
+        // A real attempt afterward must still succeed.
+        let result = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named: [everyone[1], everyone[2], everyone[3]],
+            },
+        );
+        assert!(result.is_ok());
     }
 }

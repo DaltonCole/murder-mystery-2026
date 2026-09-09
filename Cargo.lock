@@ -39,6 +39,7 @@ dependencies = [
  "dioxus",
  "engine",
  "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -2931,6 +2932,7 @@ name = "sim"
 version = "0.1.0"
 dependencies = [
  "engine",
+ "rand 0.10.2",
 ]
 
 [[package]]

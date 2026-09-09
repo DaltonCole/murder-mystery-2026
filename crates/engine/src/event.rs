@@ -1,6 +1,8 @@
 use crate::character::Character;
+use crate::denouncement::Ballot;
 use crate::player::{Faction, PlayerId};
 use crate::round::Round;
+use crate::task::{TaskId, TaskTier};
 use crate::win_condition::CultPath;
 use serde::{Deserialize, Serialize};
 
@@ -86,5 +88,63 @@ pub enum DomainEvent {
         uprising_wins: bool,
         cult_wins: bool,
         cult_paths: Vec<CultPath>,
+    },
+
+    DenouncementOpened,
+    NominationCast {
+        voter: PlayerId,
+        nominee: PlayerId,
+    },
+    /// The `surfaced` list can hold more than 3 names -- see the doc
+    /// comment on `denouncement::surfaced_nominees` for why.
+    NominationClosed {
+        surfaced: Vec<PlayerId>,
+    },
+    BallotOpened {
+        candidates: Vec<PlayerId>,
+    },
+    BallotCast {
+        voter: PlayerId,
+        ballot: Ballot,
+    },
+    /// The Denouncement closed with no runoff needed -- `cast_out` lists
+    /// everyone Denounced this round (each also carries its own
+    /// `PlayerCastOut`/cascade events, appended separately).
+    BallotClosed {
+        cast_out: Vec<PlayerId>,
+    },
+    RunoffOpened {
+        candidates: Vec<PlayerId>,
+        slots_remaining: usize,
+    },
+    /// The Denouncement closed after a runoff. `cast_out` covers everyone
+    /// Denounced this round, including anyone already locked in before the
+    /// runoff started. `unfilled_slot` is `true` if the runoff itself tied
+    /// again and rules.md's "no one is Denounced for that slot" applied.
+    RunoffClosed {
+        cast_out: Vec<PlayerId>,
+        unfilled_slot: bool,
+    },
+
+    /// Deliberately omits `qualifying_players` -- that set is the ground
+    /// truth `attempt_task` checks against and must never appear anywhere
+    /// a client-facing consumer of the event log (e.g. a future Whistledown
+    /// generator) could read it back out.
+    TaskPushed {
+        id: TaskId,
+        prompt: String,
+        tier: TaskTier,
+    },
+    TasksClosed {
+        closed: Vec<TaskId>,
+    },
+    /// Never carries `named` -- the whole point of rules.md's "talk to 3,
+    /// credit on 1 match, don't learn which" mechanic is that neither the
+    /// player nor anyone reading the log afterward learns which (if any) of
+    /// their 3 claims actually matched, only whether they were credited.
+    TaskAttempted {
+        player: PlayerId,
+        task: TaskId,
+        credited: bool,
     },
 }

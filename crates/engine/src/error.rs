@@ -1,5 +1,6 @@
 use crate::character::Character;
 use crate::player::{Faction, PlayerId};
+use crate::task::TaskId;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -43,4 +44,40 @@ pub enum GameError {
 
     #[error("the game is already at the Finale")]
     AlreadyAtFinale,
+
+    #[error("a Denouncement is already in progress")]
+    DenouncementAlreadyOpen,
+
+    #[error("no Denouncement is currently in progress")]
+    NoDenouncementOpen,
+
+    #[error("nomination is not currently open")]
+    NominationNotOpen,
+
+    #[error("discussion is not currently open")]
+    DiscussionNotOpen,
+
+    #[error("the ballot is not currently open")]
+    BallotNotOpen,
+
+    #[error("no runoff is currently in progress")]
+    RunoffNotOpen,
+
+    #[error("player {0:?} is not a valid ballot target right now")]
+    InvalidBallotTarget(PlayerId),
+
+    #[error("no task with id {0:?}")]
+    UnknownTask(TaskId),
+
+    #[error("task {0:?} is not currently open")]
+    TaskNotOpen(TaskId),
+
+    #[error("player {player:?} already attempted task {task:?}")]
+    AlreadyAttemptedTask { player: PlayerId, task: TaskId },
+
+    #[error("a task attempt cannot name the attempting player")]
+    CannotNameSelfForTask,
+
+    #[error("a task attempt must name 3 distinct players")]
+    DuplicateNamedPlayerForTask,
 }

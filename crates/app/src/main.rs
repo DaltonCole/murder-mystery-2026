@@ -1,11 +1,32 @@
-//! Phase 0 entry point: the three role-based routes from the implementation
-//! plan (`/`=play, `/host`, `/display`), plus a websocket round-trip
-//! spiking the realtime mechanism the whole app depends on. This gets
-//! replaced by real game-state broadcasting in later phases -- see
+//! The three role-based routes from the implementation plan (`/`=play,
+//! `/host`, `/display`), talking to the single game server over one typed
+//! websocket connection (see `game_server` for the server-side state and
+//! `ClientMsg`/`ServerMsg` below for the wire protocol).
+//!
+//! Phase 1 scope: these are genuinely basic shells -- functional enough for
+//! a real LAN playtest, not the final visual design (that's Phase 4). See
 //! `/home/drc/.claude/plans/piped-crunching-lighthouse.md`.
+//!
+//! KNOWN GAP, not an oversight: there is no session/auth layer yet. Any
+//! client can open `/play` and claim to be any `PlayerId` by sending
+//! `ClientMsg::Watch(Viewer::Player(id))` directly over the websocket --
+//! this UI never does that itself (a fresh `/play` connection only ever
+//! watches the id its own `Join` call just received), but nothing stops a
+//! deliberately crafted client from doing so. Real per-player join tokens
+//! (see the plan's "Session" section) must land before this runs at a real
+//! event over shared WiFi.
+
+#[cfg(feature = "server")]
+mod game_server;
 
 use dioxus::fullstack::{use_websocket, WebSocketOptions, Websocket};
 use dioxus::prelude::*;
+#[cfg(feature = "server")]
+use engine::DomainEvent;
+use engine::{
+    Ballot, Command, DenouncementView, PlayerId, PlayerStatus, PlayerView, RosterEntry, TaskTier,
+    TaskView, Viewer,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Routable, PartialEq)]
@@ -30,97 +51,510 @@ fn App() -> Element {
     }
 }
 
-#[component]
-fn Play() -> Element {
-    rsx! {
-        h1 { "Murder Mystery 2026 -- Play" }
-        WebsocketSpike {}
-    }
-}
-
-#[component]
-fn Host() -> Element {
-    rsx! {
-        h1 { "Murder Mystery 2026 -- Host Console" }
-    }
-}
-
-#[component]
-fn Display() -> Element {
-    rsx! {
-        h1 { "Murder Mystery 2026 -- Display" }
-    }
-}
-
-// --- Phase 0 websocket spike -----------------------------------------
+// --- Wire protocol -------------------------------------------------------
 //
-// Proves the realtime mechanism the "Networking, Realtime, and
-// Authorization" section of the plan is built on: a typed websocket with
-// the server able to push messages the client didn't ask for (not just a
-// request/reply server function). Real usage sends `DomainEvent`s /
-// `PlayerView`s here instead of a plain string echo.
+// Everything any route needs to do -- join, watch, or act -- goes over this
+// one typed websocket, the same mechanism Phase 0 spiked and proved works
+// end to end.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ClientMsg {
-    Ping(String),
+    /// `/play` only: registers a new player and starts watching them.
+    Join { name: String },
+    /// `/host` and `/display`: start watching as that role. `/play` never
+    /// sends this directly with an arbitrary id -- see the module doc
+    /// comment's KNOWN GAP note.
+    Watch(Viewer),
+    /// Any other game command.
+    Do(Command),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ServerMsg {
-    Pong(String),
+    Joined { player: PlayerId },
+    View(PlayerView),
+    Failed { error: String },
 }
 
 #[get("/api/ws")]
 async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, ServerMsg>> {
     Ok(options.on_upgrade(move |mut socket| async move {
-        while let Ok(msg) = socket.recv().await {
-            let ClientMsg::Ping(text) = msg;
-            if socket
-                .send(ServerMsg::Pong(format!("echo: {text}")))
-                .await
-                .is_err()
-            {
-                break;
+        let mut viewer: Option<Viewer> = None;
+        let mut changed = game_server::subscribe();
+
+        // `game_server::apply` broadcasts on every successful mutation, this
+        // connection's own included. The `Join`/`Do` branches below already
+        // send a direct, up-to-date `View` in response to the command that
+        // *caused* the change -- without draining the echo of that same
+        // broadcast here, the next `select!` iteration would immediately
+        // fire the `changed.recv()` arm too and send a second, redundant
+        // `View` for a change this connection already knows about.
+        fn drain_self_echo(changed: &mut tokio::sync::broadcast::Receiver<()>) {
+            while changed.try_recv().is_ok() {}
+        }
+
+        loop {
+            tokio::select! {
+                incoming = socket.recv() => {
+                    let Ok(msg) = incoming else { break };
+                    let sent_ok = match msg {
+                        ClientMsg::Join { name } => {
+                            match game_server::apply(Command::AddPlayer { name }) {
+                                Ok(events) => {
+                                    let Some(DomainEvent::PlayerAdded { id, .. }) =
+                                        events.into_iter().next()
+                                    else {
+                                        continue;
+                                    };
+                                    viewer = Some(Viewer::Player(id));
+                                    drain_self_echo(&mut changed);
+                                    socket.send(ServerMsg::Joined { player: id }).await.is_ok()
+                                        && socket
+                                            .send(ServerMsg::View(game_server::view(Viewer::Player(id))))
+                                            .await
+                                            .is_ok()
+                                }
+                                Err(e) => socket
+                                    .send(ServerMsg::Failed { error: e.to_string() })
+                                    .await
+                                    .is_ok(),
+                            }
+                        }
+                        ClientMsg::Watch(v) => {
+                            viewer = Some(v);
+                            socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
+                        }
+                        ClientMsg::Do(cmd) => match game_server::apply(cmd) {
+                            Ok(_) => {
+                                drain_self_echo(&mut changed);
+                                if let Some(v) = viewer {
+                                    socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
+                                } else {
+                                    true
+                                }
+                            }
+                            Err(e) => socket
+                                .send(ServerMsg::Failed { error: e.to_string() })
+                                .await
+                                .is_ok(),
+                        },
+                    };
+                    if !sent_ok {
+                        break;
+                    }
+                }
+                _ = changed.recv() => {
+                    if let Some(v) = viewer {
+                        if socket.send(ServerMsg::View(game_server::view(v))).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }))
 }
 
+// --- /play -----------------------------------------------------------------
+
 #[component]
-fn WebsocketSpike() -> Element {
-    let mut log = use_signal(Vec::<String>::new);
-    let mut draft = use_signal(String::new);
+fn Play() -> Element {
+    let mut view = use_signal(|| None::<PlayerView>);
+    let mut my_id = use_signal(|| None::<PlayerId>);
+    let mut error = use_signal(|| None::<String>);
+    let mut name_draft = use_signal(String::new);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
-        while let Ok(ServerMsg::Pong(text)) = socket.recv().await {
-            log.write().push(text);
+        loop {
+            match socket.recv().await {
+                Ok(ServerMsg::Joined { player }) => my_id.set(Some(player)),
+                Ok(ServerMsg::View(v)) => {
+                    view.set(Some(v));
+                    error.set(None);
+                }
+                Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
+                Err(_) => break,
+            }
         }
     });
 
-    rsx! {
-        div {
-            id: "ws-spike",
-            h4 { "Websocket spike" }
+    let send_cmd = move |cmd: Command| {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::Do(cmd)).await;
+        });
+    };
+
+    let mut do_join = move || {
+        let name = name_draft.peek().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::Join { name }).await;
+        });
+        name_draft.set(String::new());
+    };
+
+    let Some(id) = my_id() else {
+        return rsx! {
+            h1 { "Murder Mystery 2026" }
+            if let Some(e) = error() {
+                p { style: "color:red", "{e}" }
+            }
             input {
-                placeholder: "Type and press Enter to ping the server...",
-                value: "{draft}",
-                oninput: move |event| draft.set(event.value()),
-                onkeydown: move |event: Event<KeyboardData>| {
-                    if event.key() == Key::Enter {
-                        let value = draft.peek().clone();
-                        spawn(async move {
-                            let _ = socket.send(ClientMsg::Ping(value)).await;
-                        });
-                        draft.set(String::new());
+                placeholder: "Your name",
+                value: "{name_draft}",
+                oninput: move |e| name_draft.set(e.value()),
+                onkeydown: move |e: Event<KeyboardData>| {
+                    if e.key() == Key::Enter {
+                        do_join();
                     }
                 },
             }
-            ul {
-                for (i, line) in log.read().iter().enumerate() {
-                    li { key: "{i}", "{line}" }
+            button { onclick: move |_| do_join(), "Join the game" }
+        };
+    };
+
+    let Some(v) = view() else {
+        return rsx! { p { "Connecting..." } };
+    };
+
+    rsx! {
+        h1 { "Murder Mystery 2026" }
+        if let Some(e) = error() {
+            p { style: "color:red", "{e}" }
+        }
+        p { "Round: {v.current_round:?}" }
+        p {
+            "Your faction: {v.own_faction:?}"
+            if let Some(c) = v.own_character {
+                " -- {c:?}"
+            }
+        }
+        RosterList { roster: v.roster.clone() }
+        DenouncementPanel {
+            my_id: id,
+            denouncement: v.denouncement.clone(),
+            roster: v.roster.clone(),
+            on_command: send_cmd,
+        }
+        for task in v.open_tasks.clone() {
+            TaskAttemptForm {
+                my_id: id,
+                task,
+                roster: v.roster.clone(),
+                on_command: send_cmd,
+            }
+        }
+    }
+}
+
+#[component]
+fn RosterList(roster: Vec<RosterEntry>) -> Element {
+    rsx! {
+        h3 { "Roster" }
+        ul {
+            for entry in roster {
+                li { key: "{entry.id.0}", "{entry.name} ({entry.status:?})" }
+            }
+        }
+    }
+}
+
+#[component]
+fn DenouncementPanel(
+    my_id: PlayerId,
+    denouncement: Option<DenouncementView>,
+    roster: Vec<RosterEntry>,
+    on_command: EventHandler<Command>,
+) -> Element {
+    let Some(phase) = denouncement else {
+        return rsx! { p { "No Denouncement in progress." } };
+    };
+
+    let active_others: Vec<RosterEntry> = roster
+        .into_iter()
+        .filter(|r| r.status == PlayerStatus::Active && r.id != my_id)
+        .collect();
+
+    match phase {
+        DenouncementView::Nomination { i_have_acted } => {
+            let mut pick = use_signal(|| None::<u32>);
+            let options = active_others.clone();
+            rsx! {
+                h3 { "Nomination" }
+                p { if i_have_acted { "You've nominated someone." } else { "Choose who to nominate." } }
+                select {
+                    onchange: move |e| pick.set(e.value().parse().ok()),
+                    option { value: "", "-- choose --" }
+                    for r in options {
+                        option { value: "{r.id.0}", "{r.name}" }
+                    }
+                }
+                button {
+                    disabled: pick().is_none(),
+                    onclick: move |_| {
+                        let Some(raw) = pick() else { return };
+                        let nominee = PlayerId(raw);
+                        on_command.call(Command::Nominate { voter: my_id, nominee });
+                    },
+                    "Nominate"
                 }
             }
+        }
+        DenouncementView::Discussion { surfaced } => rsx! {
+            h3 { "Discussion" }
+            p { "Up for the Denouncement: {names(&surfaced, &active_others)}" }
+        },
+        DenouncementView::Ballot {
+            candidates,
+            i_have_acted,
+        }
+        | DenouncementView::Runoff {
+            candidates,
+            i_have_acted,
+        } => {
+            let mut pick = use_signal(|| None::<u32>);
+            let options: Vec<RosterEntry> = active_others
+                .iter()
+                .filter(|r| candidates.contains(&r.id))
+                .cloned()
+                .collect();
+            rsx! {
+                h3 { "Ballot" }
+                p { if i_have_acted { "You've voted." } else { "Cast your ballot." } }
+                select {
+                    onchange: move |e| pick.set(e.value().parse().ok()),
+                    option { value: "", "-- choose --" }
+                    for r in options {
+                        option { value: "{r.id.0}", "{r.name}" }
+                    }
+                }
+                button {
+                    disabled: pick().is_none(),
+                    onclick: move |_| {
+                        let Some(raw) = pick() else { return };
+                        let ballot = Ballot::For(PlayerId(raw));
+                        on_command.call(Command::CastBallot { voter: my_id, ballot });
+                    },
+                    "Vote"
+                }
+                button {
+                    onclick: move |_| {
+                        on_command.call(Command::CastBallot { voter: my_id, ballot: Ballot::Abstain });
+                    },
+                    "Abstain"
+                }
+            }
+        }
+    }
+}
+
+fn names(ids: &[PlayerId], roster: &[RosterEntry]) -> String {
+    ids.iter()
+        .map(|id| {
+            roster
+                .iter()
+                .find(|r| r.id == *id)
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| format!("#{}", id.0))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[component]
+fn TaskAttemptForm(
+    my_id: PlayerId,
+    task: TaskView,
+    roster: Vec<RosterEntry>,
+    on_command: EventHandler<Command>,
+) -> Element {
+    let options: Vec<RosterEntry> = roster
+        .into_iter()
+        .filter(|r| r.status == PlayerStatus::Active && r.id != my_id)
+        .collect();
+
+    if let Some(credited) = task.my_outcome {
+        return rsx! {
+            div {
+                h4 { "{task.prompt} ({task.tier:?})" }
+                p { if credited { "Completed!" } else { "No match this time." } }
+            }
+        };
+    }
+
+    let first = use_signal(|| None::<u32>);
+    let second = use_signal(|| None::<u32>);
+    let third = use_signal(|| None::<u32>);
+
+    let picks = (first(), second(), third());
+    let all_distinct = match picks {
+        (Some(a), Some(b), Some(c)) => a != b && b != c && a != c,
+        _ => false,
+    };
+    let task_id = task.id;
+
+    rsx! {
+        div {
+            h4 { "{task.prompt} ({task.tier:?})" }
+            p { "Name 3 people you talked to:" }
+            for (slot, mut setter) in [(first(), first), (second(), second), (third(), third)] {
+                select {
+                    onchange: move |e| setter.set(e.value().parse().ok()),
+                    option { value: "", "-- choose --" }
+                    for r in options.clone() {
+                        option { selected: slot == Some(r.id.0), value: "{r.id.0}", "{r.name}" }
+                    }
+                }
+            }
+            button {
+                disabled: !all_distinct,
+                onclick: move |_| {
+                    let (Some(a), Some(b), Some(c)) = (first(), second(), third()) else { return };
+                    let named = [PlayerId(a), PlayerId(b), PlayerId(c)];
+                    on_command.call(Command::AttemptTask { player: my_id, task: task_id, named });
+                },
+                "Submit"
+            }
+        }
+    }
+}
+
+// --- /host -----------------------------------------------------------------
+
+#[component]
+fn Host() -> Element {
+    let mut view = use_signal(|| None::<PlayerView>);
+    let mut error = use_signal(|| None::<String>);
+    let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
+
+    use_future(move || async move {
+        let _ = socket.send(ClientMsg::Watch(Viewer::Host)).await;
+        loop {
+            match socket.recv().await {
+                Ok(ServerMsg::View(v)) => {
+                    view.set(Some(v));
+                    error.set(None);
+                }
+                Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
+                Ok(ServerMsg::Joined { .. }) | Err(_) => {}
+            }
+        }
+    });
+
+    let do_cmd = move |cmd: Command| {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::Do(cmd)).await;
+        });
+    };
+
+    let mut new_name = use_signal(String::new);
+
+    rsx! {
+        h1 { "Host Console" }
+        if let Some(e) = error() {
+            p { style: "color:red", "{e}" }
+        }
+        div {
+            h3 { "Setup" }
+            input {
+                placeholder: "New player name",
+                value: "{new_name}",
+                oninput: move |e| new_name.set(e.value()),
+            }
+            button {
+                onclick: move |_| {
+                    let name = new_name.peek().trim().to_string();
+                    if !name.is_empty() {
+                        do_cmd(Command::AddPlayer { name });
+                        new_name.set(String::new());
+                    }
+                },
+                "Add player"
+            }
+            button { onclick: move |_| do_cmd(Command::FinalizeSetup), "Finalize setup" }
+        }
+        div {
+            h3 { "Round" }
+            if let Some(v) = view() {
+                p { "Current round: {v.current_round:?}" }
+            }
+            button { onclick: move |_| do_cmd(Command::AdvanceRound), "Advance round" }
+        }
+        div {
+            h3 { "The Denouncement" }
+            button { onclick: move |_| do_cmd(Command::OpenDenouncement), "Open Denouncement" }
+            button { onclick: move |_| do_cmd(Command::CloseNomination), "Close nomination" }
+            button { onclick: move |_| do_cmd(Command::OpenBallot), "Open ballot" }
+            button {
+                onclick: move |_| do_cmd(Command::CloseBallot { fallback_replacement: None }),
+                "Close ballot"
+            }
+            button {
+                onclick: move |_| do_cmd(Command::CloseRunoff { fallback_replacement: None }),
+                "Close runoff"
+            }
+        }
+        div {
+            h3 { "Tasks" }
+            button {
+                onclick: move |_| do_cmd(Command::PushTask {
+                    prompt: "Talk to someone new".into(),
+                    tier: TaskTier::Easy,
+                    qualifying_players: Default::default(),
+                }),
+                "Push a placeholder task"
+            }
+            button { onclick: move |_| do_cmd(Command::CloseTasks), "Close tasks" }
+        }
+        if let Some(v) = view() {
+            RosterList { roster: v.roster.clone() }
+        }
+    }
+}
+
+// --- /display ----------------------------------------------------------------
+
+#[component]
+fn Display() -> Element {
+    let mut view = use_signal(|| None::<PlayerView>);
+    let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
+
+    use_future(move || async move {
+        let _ = socket.send(ClientMsg::Watch(Viewer::Display)).await;
+        loop {
+            match socket.recv().await {
+                Ok(ServerMsg::View(v)) => view.set(Some(v)),
+                Ok(ServerMsg::Failed { .. } | ServerMsg::Joined { .. }) | Err(_) => {}
+            }
+        }
+    });
+
+    let Some(v) = view() else {
+        return rsx! { h1 { "Murder Mystery 2026" } };
+    };
+
+    rsx! {
+        h1 { "Murder Mystery 2026" }
+        h2 { "Round: {v.current_round:?}" }
+        RosterList { roster: v.roster.clone() }
+        match &v.denouncement {
+            Some(DenouncementView::Nomination { .. }) => rsx! { p { "Nomination is open." } },
+            Some(DenouncementView::Discussion { surfaced }) => rsx! {
+                p { "Up for the Denouncement: {names(surfaced, &v.roster)}" }
+            },
+            Some(DenouncementView::Ballot { candidates, .. } | DenouncementView::Runoff { candidates, .. }) => rsx! {
+                p { "Ballot open for: {names(candidates, &v.roster)}" }
+            },
+            None => rsx! { p { "No Denouncement in progress." } },
+        }
+        for task in v.open_tasks.iter().cloned() {
+            p { key: "{task.id.0}", "{task.prompt} ({task.tier:?})" }
         }
     }
 }

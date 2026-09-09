@@ -1,6 +1,9 @@
 use crate::character::Character;
+use crate::denouncement::Ballot;
 use crate::player::{Faction, PlayerId};
+use crate::task::{TaskId, TaskTier};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// The write-side API of the engine. Every state mutation in the whole
 /// application — from setup through the finale — is expressed as one of
@@ -87,4 +90,87 @@ pub enum Command {
     /// Moves the game to the next round in sequence (rules.md §4). Rejected
     /// once already at the Finale.
     AdvanceRound,
+
+    /// Opens a new Denouncement (rules.md §5-6), entering its Nomination
+    /// phase. Rejected if one is already in progress -- only one runs at a
+    /// time.
+    OpenDenouncement,
+
+    /// Submits (or silently replaces) `voter`'s nomination during the
+    /// Nomination phase. Both `voter` and `nominee` must currently be
+    /// active players; Servants may nominate and be nominated like anyone
+    /// else -- only the *execution-count scaling formula* excludes them
+    /// (rules.md's own resolution of that ambiguity was scoped to the
+    /// headcount formula specifically, not to participation).
+    Nominate { voter: PlayerId, nominee: PlayerId },
+
+    /// Ends nomination: computes who surfaces for discussion (top 3 by
+    /// nomination count, with ties at the boundary all surfacing -- see
+    /// `denouncement::surfaced_nominees`) and moves to the Discussion
+    /// phase. Rejected outside the Nomination phase.
+    CloseNomination,
+
+    /// Ends the discussion window and opens the Ballot. Rejected outside
+    /// the Discussion phase.
+    OpenBallot,
+
+    /// Casts (or silently replaces) `voter`'s ballot during the Ballot or
+    /// Runoff phase. `Ballot::For` must name one of that phase's current
+    /// candidates; rejected otherwise.
+    CastBallot { voter: PlayerId, ballot: Ballot },
+
+    /// Tallies the ballot against the headcount-scaled execution count
+    /// (rules.md §5). A clean result resolves every Cast-Out player
+    /// immediately (through the same cascades `Command::CastOut` uses) and
+    /// closes the Denouncement. A tie for the last slot(s) instead opens a
+    /// Runoff among just the tied candidates. Rejected outside the Ballot
+    /// phase.
+    CloseBallot {
+        /// Consulted only for any King/Queen/Revolutionary-Leader
+        /// replacement cascades a resulting Cast-Out triggers -- see
+        /// `Command::CastOut`.
+        fallback_replacement: Option<PlayerId>,
+    },
+
+    /// Tallies the runoff ballot. Resolves every already-locked-in
+    /// candidate from the original ballot plus whatever the runoff itself
+    /// resolves cleanly, then closes the Denouncement regardless of
+    /// outcome -- a repeat tie leaves that specific slot unfilled per
+    /// rules.md, rather than triggering a second runoff. Rejected outside
+    /// the Runoff phase.
+    CloseRunoff {
+        fallback_replacement: Option<PlayerId>,
+    },
+
+    /// Opens one new task for attempts (rules.md §4: Round 1's 2 fixed
+    /// tasks, or one of Rounds 3/5's live easy/medium/hard tiers).
+    /// `qualifying_players` is the ground truth for who satisfies the
+    /// prompt -- never sent to any client, only consulted inside
+    /// `attempt_task`. Assigns the next `TaskId` in creation order; the
+    /// caller does not choose the ID.
+    PushTask {
+        prompt: String,
+        tier: TaskTier,
+        qualifying_players: BTreeSet<PlayerId>,
+    },
+
+    /// Locks every currently-open task against further attempts (rules.md
+    /// §4 step 2: "the app locks submissions"). A no-op (empty
+    /// `closed` list) if nothing is open.
+    CloseTasks,
+
+    /// `player`'s claim that they talked to each of `named` -- rules.md
+    /// §4's "talk to 3, credit on 1 match" mechanic: `player` gets credit
+    /// for the task if *any* of `named` is actually in the task's
+    /// qualifying set, but the event this produces never reveals which one
+    /// (if any) it was. `named` must be 3 distinct active players, none of
+    /// them `player` themself. One attempt per player per task -- a second
+    /// attempt at the same task is rejected, not silently replaced (unlike
+    /// `Nominate`/`CastBallot`, this isn't a standing choice that should
+    /// change if the player has second thoughts).
+    AttemptTask {
+        player: PlayerId,
+        task: TaskId,
+        named: [PlayerId; 3],
+    },
 }

@@ -11,6 +11,10 @@ lcov.info
 
 # Editor/OS
 .DS_Store
+tags
+
+# Claude Code local session state
+/.claude/
 
 # Node (e2e tests, if a package.json/node_modules ends up under tests/e2e)
 /tests/e2e/node_modules/

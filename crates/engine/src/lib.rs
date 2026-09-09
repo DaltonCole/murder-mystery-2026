@@ -11,20 +11,24 @@
 
 mod character;
 mod command;
+mod denouncement;
 mod error;
 mod event;
 mod player;
 mod round;
 mod state;
+mod task;
 mod view;
 mod win_condition;
 
 pub use character::{Character, PlayerStatus};
 pub use command::Command;
+pub use denouncement::{Ballot, DenouncementPhase};
 pub use error::GameError;
 pub use event::DomainEvent;
 pub use player::{Faction, Player, PlayerId};
 pub use round::Round;
 pub use state::{apply_command, GameState};
-pub use view::{view_for, PlayerView, RosterEntry, Viewer};
+pub use task::{TaskDef, TaskId, TaskTier};
+pub use view::{view_for, DenouncementView, PlayerView, RosterEntry, TaskView, Viewer};
 pub use win_condition::{evaluate as evaluate_win_conditions, CultPath, GameOutcome};
