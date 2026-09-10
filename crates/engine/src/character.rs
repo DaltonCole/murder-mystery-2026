@@ -22,10 +22,47 @@ pub enum Character {
     PrincePrincess,
     RevolutionaryLeader,
     CultLeader,
-    /// The full 23-character roster (Magistrate, Oracle, Bartender, ...)
-    /// lands in Phase 2/3 per the implementation plan -- everyone on the
-    /// Ton side without one of the named roles above is this catch-all for
-    /// now, matching rules.md's own "Normal Ton member" role.
+
+    // --- Phase 2: simple/independent abilities (rules.md §3.1-3.3) ---
+    /// Ton, info-check family: after every odd round, views a player's full
+    /// history. Permanently disabled if the King/Queen is Cast Out
+    /// unconverted (rules.md §5) -- see `GameState::oracle_disabled`.
+    Oracle,
+    /// Ton, info-check family: once per game, learns 3 players who are
+    /// definitely not the Revolutionary Leader.
+    Almanac,
+    /// Uprising, info-check family: once per game, views one player's
+    /// apparent faction only.
+    Spymaster,
+    /// Ton, protect family: once per Cult recruitment window, protects one
+    /// person from conversion.
+    PriestPriestess,
+    /// Ton, protect family: once per game, grants round-wide
+    /// execution-immunity.
+    PotionMaker,
+    /// Ton, vote-weight: once per game, their ballot counts as two votes.
+    Magistrate,
+    /// Uprising, protect family: once per round, makes a target drunk with
+    /// 50% odds (can't nominate/vote that round if it lands).
+    Bartender,
+    /// Uprising, protect family: once per round, protects one person from
+    /// this round's Cast-Out resolution; can't repeat the same target on
+    /// consecutive rounds.
+    DoctorMedic,
+    /// Uprising, vote-weight: once per game, their ballot counts as two
+    /// votes -- the Magistrate's mirror.
+    Firebrand,
+    /// Uprising, passive-knowledge: knows 2 other Uprising members (never
+    /// the Leader) -- see `GameState::cell_leader_knows`.
+    CellLeader,
+    /// Cult, falsify pipeline: once per game (if armed), forces an
+    /// info-check that targets them to return a false result.
+    Deceiver,
+
+    /// The full 23-character roster lands across Phase 2/3 per the
+    /// implementation plan -- everyone on the Ton side without one of the
+    /// named roles above is this catch-all for now, matching rules.md's own
+    /// "Normal Ton member" role.
     NormalTon,
     NormalUprising,
     /// A secretly-Cult-aligned player who isn't the Cult Leader and doesn't

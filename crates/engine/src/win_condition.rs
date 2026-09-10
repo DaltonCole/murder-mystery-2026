@@ -291,6 +291,8 @@ mod tests {
     #[test]
     fn cult_path_a_both_converted_and_uncaught() {
         let (mut state, king_queen, leader, cult_leader, _prince) = base_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // recruitment slot
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // recruitment slot
         apply_command(
             &mut state,
             Command::Convert {
@@ -355,6 +357,7 @@ mod tests {
     #[test]
     fn cult_path_c_king_queen_converted_leader_denounced() {
         let (mut state, king_queen, leader, cult_leader, _prince) = base_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // recruitment slot
         apply_command(
             &mut state,
             Command::Convert {
@@ -388,6 +391,7 @@ mod tests {
     #[test]
     fn cult_path_d_martyrdom_requires_a_prior_conversion() {
         let (mut state, king_queen, _leader, cult_leader, _prince) = base_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // recruitment slot
         apply_command(
             &mut state,
             Command::Convert {
@@ -518,6 +522,7 @@ mod tests {
         assert!(state.revolutionary_leader_ever_denounced_unconverted());
 
         // The King/Queen is converted and never caught.
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // recruitment slot, -> Two
         apply_command(
             &mut state,
             Command::Convert {
@@ -529,13 +534,7 @@ mod tests {
 
         // Leader2 survives to the end, uncaught and unconverted -- actually
         // reach the Finale, since `uprising_wins` is only meaningful there.
-        for _ in [
-            Round::Two,
-            Round::Three,
-            Round::Four,
-            Round::Five,
-            Round::Finale,
-        ] {
+        for _ in [Round::Three, Round::Four, Round::Five, Round::Finale] {
             apply_command(&mut state, Command::AdvanceRound).unwrap();
         }
         assert_eq!(state.current_round(), Round::Finale);

@@ -1,3 +1,4 @@
+use crate::ability::InfoQueryKind;
 use crate::character::Character;
 use crate::denouncement::Ballot;
 use crate::player::{Faction, PlayerId};
@@ -173,4 +174,92 @@ pub enum Command {
         task: TaskId,
         named: [PlayerId; 3],
     },
+
+    // --- Phase 2: info-check family + the Deceiver's falsify pipeline
+    // (rules.md §3.1-3.3) ---
+    /// Oracle: views `target`'s full history, snapshotted now. `player`
+    /// must currently be the Oracle, with a check available (after every
+    /// odd round) and the Oracle not permanently disabled (rules.md §5:
+    /// tripped if the King/Queen is Cast Out unconverted).
+    UseOracle { player: PlayerId, target: PlayerId },
+
+    /// Almanac: learns 3 players who are definitely not the Revolutionary
+    /// Leader. Once per game; no target -- the 3 names are chosen
+    /// deterministically by the engine (see `state::pick_non_leaders`),
+    /// not something the caller picks.
+    UseAlmanac { player: PlayerId },
+
+    /// Spymaster: views `target`'s apparent faction only (never reveals
+    /// conversion). Once per game.
+    UseSpymaster { player: PlayerId, target: PlayerId },
+
+    /// The Cult Leader's own query (rules.md §3.3): "is this person
+    /// Ton-aligned?" or "is this person the Revolutionary Leader?" --
+    /// `kind` must be `IsTonAligned` or `IsTheLeader`; anything else is
+    /// rejected. One use per open recruitment window (does not itself
+    /// consume a recruitment slot).
+    CultLeaderQuery {
+        player: PlayerId,
+        target: PlayerId,
+        kind: InfoQueryKind,
+    },
+
+    /// The Deceiver arms or disarms their once-per-game falsify power
+    /// (rules.md §3.3) -- a standing choice, changeable at any time, the
+    /// same shape as `DesignateSuccessor`. See `GameState::deceiver_armed`'s
+    /// doc comment for why this replaces a real-time "falsify now?" prompt.
+    SetDeceiverArmed { player: PlayerId, armed: bool },
+
+    // --- Phase 2: protect family (rules.md §3.1/§3.2) ---
+    /// Priest/Priestess: protects `target` from conversion this
+    /// recruitment window (rules.md §3.1). Rejected if `target` has ever
+    /// been protected by this ability before, even in an earlier window.
+    PriestProtect { player: PlayerId, target: PlayerId },
+
+    /// Doctor/Medic: shields `target` from this round's Cast-Out
+    /// resolution (rules.md §3.2) -- if `target` would otherwise be
+    /// Cast Out, their name is removed from the resolved list before slots
+    /// are filled, letting the next-highest vote-getter backfill the freed
+    /// slot (Dalton's resolution of that ambiguity during Phase 2
+    /// planning). Rejected if `target` was also protected last round
+    /// (can't repeat a target on consecutive rounds).
+    MedicProtect { player: PlayerId, target: PlayerId },
+
+    /// Bartender targets `target` with a 50% chance of making them drunk
+    /// this round (rules.md §3.2) -- `lands` is the pre-rolled outcome,
+    /// supplied by the caller rather than rolled inside the engine (see
+    /// the plan's "keep randomness at the boundary" principle, the same
+    /// reasoning behind `CastOut`'s caller-supplied `fallback_replacement`).
+    /// A drunk player can't `Nominate` or `CastBallot` for the rest of the
+    /// round (Dalton's resolution of what "drunk" mechanically restricts).
+    /// Once per round.
+    BartenderTarget {
+        player: PlayerId,
+        target: PlayerId,
+        lands: bool,
+    },
+
+    /// Potion Maker activates round-wide execution-immunity (rules.md
+    /// §3.1) -- whoever the vote selects this Denouncement survives
+    /// instead of being Cast Out (Dalton's resolution of the
+    /// named-target-vs-blanket ambiguity: this is blanket, no target
+    /// choice). Once per game; must be armed before the ballot/runoff
+    /// that it protects actually closes.
+    ActivatePotionImmunity { player: PlayerId },
+
+    // --- Phase 2: vote-weight pair (rules.md §3.1/§3.2) ---
+    /// The Magistrate or the Firebrand arms their once-per-game double
+    /// vote (rules.md §5: "adds one extra vote to whichever single nominee
+    /// that player supported") for the ballot/runoff they're about to
+    /// vote in. `player`'s own character determines which of the two this
+    /// is -- there's only ever one of each.
+    ActivateDoubleVote { player: PlayerId },
+
+    // --- Phase 2: Normal Uprising's reactive safety-net (rules.md §3.2)
+    // ---
+    /// Arms a standing shield negating one vote cast against `player` at
+    /// the current Denouncement (declared proactively, before the ballot
+    /// closes -- Dalton's resolution of that ambiguity during the original
+    /// implementation planning). Once per game.
+    ArmVoteShield { player: PlayerId },
 }

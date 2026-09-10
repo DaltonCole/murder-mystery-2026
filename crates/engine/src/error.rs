@@ -92,4 +92,43 @@ pub enum GameError {
 
     #[error("player {0:?} is already converted")]
     AlreadyConverted(PlayerId),
+
+    // --- Phase 2: shared ability errors, deliberately generic rather than
+    // one bespoke pair per character (11+ named roles would otherwise mean
+    // 20+ near-duplicate variants) ---
+    #[error("player {player:?} is not the {required:?}")]
+    NotCharacter {
+        player: PlayerId,
+        required: Character,
+    },
+
+    #[error("{character:?}'s ability isn't available right now (no uses left, or a precondition isn't met)")]
+    AbilityNotAvailable { character: Character },
+
+    #[error("that info-query kind isn't valid for this ability")]
+    InvalidInfoQueryKind,
+
+    #[error(
+        "player {0:?} has already been protected by the Priest/Priestess and can never be again"
+    )]
+    AlreadyProtectedByPriest(PlayerId),
+
+    #[error("player {0:?} was protected by the Doctor/Medic last round -- can't repeat the same target on consecutive rounds")]
+    CannotProtectSameTargetConsecutively(PlayerId),
+
+    #[error("that player is not currently in a Cast-Out-eligible Denouncement phase to be Medic-protected")]
+    NoActiveBallotToProtectAgainst,
+
+    #[error("no recruitment slot is currently available for the Cult Leader to spend")]
+    NoRecruitmentSlotAvailable,
+
+    #[error("player {0:?} is drunk this round and can't nominate or vote")]
+    PlayerIsDrunk(PlayerId),
+
+    /// Distinct from `AlreadyProtectedByPriest` -- that one blocks the
+    /// Priest/Priestess from *re-choosing* a past target; this one blocks
+    /// the Cult Leader from converting someone currently shielded (rules.md
+    /// §3.1: "the Cult Leader can't target that person that round").
+    #[error("player {0:?} is protected from conversion this round by the Priest/Priestess")]
+    ProtectedFromConversionThisRound(PlayerId),
 }

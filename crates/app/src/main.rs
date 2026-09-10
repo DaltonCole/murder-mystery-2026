@@ -52,8 +52,9 @@ use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use engine::DomainEvent;
 use engine::{
-    Ballot, Character, Command, DenouncementView, Faction, PlayerId, PlayerStatus, PlayerView,
-    RosterEntry, TaskTier, TaskView, Viewer,
+    AbilityStatus, Ballot, Character, Command, DenouncementView, Faction, InfoCheckAnswer,
+    InfoCheckDelivery, InfoQueryKind, PlayerId, PlayerStatus, PlayerView, RosterEntry, TaskTier,
+    TaskView, Viewer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -263,6 +264,16 @@ fn Play() -> Element {
             }
         }
         RosterList { roster: v.roster.clone() }
+        AbilityPanel {
+            my_id: id,
+            own_character: v.own_character,
+            abilities: v.my_abilities.clone(),
+            my_info_checks: v.my_info_checks.clone(),
+            fellow_cultists: v.fellow_cultists.clone(),
+            known_uprising_members: v.known_uprising_members.clone(),
+            roster: v.roster.clone(),
+            on_command: send_cmd,
+        }
         DenouncementPanel {
             my_id: id,
             denouncement: v.denouncement.clone(),
@@ -289,6 +300,239 @@ fn RosterList(roster: Vec<RosterEntry>) -> Element {
             for entry in roster {
                 li { key: "{entry.id.0}", "{entry.name} ({entry.status:?})" }
             }
+        }
+    }
+}
+
+/// Phase 2 scope: one raw-controls panel covering every ability-bearing
+/// character, matching the rest of this Phase 1-era "basic shell" UI --
+/// see the module doc comment. Bartender's "did it land" is a checkbox the
+/// player sets from an actual coin flip at the table rather than the app
+/// rolling it itself, the same "keep randomness at the boundary, let a
+/// human adjudicate it" choice the Host's Convert panel already makes for
+/// `CastOut`'s `fallback_replacement`.
+#[component]
+fn AbilityPanel(
+    my_id: PlayerId,
+    own_character: Option<Character>,
+    abilities: AbilityStatus,
+    my_info_checks: Vec<InfoCheckDelivery>,
+    fellow_cultists: Vec<PlayerId>,
+    known_uprising_members: Vec<PlayerId>,
+    roster: Vec<RosterEntry>,
+    on_command: EventHandler<Command>,
+) -> Element {
+    let Some(character) = own_character else {
+        return rsx! {};
+    };
+
+    let mut target = use_signal(|| None::<u32>);
+    let mut lands = use_signal(|| true);
+    let mut kind = use_signal(|| InfoQueryKind::IsTheLeader);
+
+    let others: Vec<RosterEntry> = roster
+        .iter()
+        .filter(|r| r.id != my_id && r.status == PlayerStatus::Active)
+        .cloned()
+        .collect();
+    let target_picker = rsx! {
+        select {
+            onchange: move |e| target.set(e.value().parse().ok()),
+            option { value: "", "-- choose --" }
+            for r in others.clone() {
+                option { value: "{r.id.0}", "{r.name}" }
+            }
+        }
+    };
+
+    rsx! {
+        div {
+            h3 { "Your ability" }
+            if !fellow_cultists.is_empty() {
+                p { "Fellow Cultists: {names(&fellow_cultists, &roster)}" }
+            }
+            if !known_uprising_members.is_empty() {
+                p { "Uprising members you know: {names(&known_uprising_members, &roster)}" }
+            }
+            if !my_info_checks.is_empty() {
+                h4 { "Your info-check results" }
+                ul {
+                    for (i , check) in my_info_checks.iter().enumerate() {
+                        li { key: "{i}", "{describe_check(check, &roster)}" }
+                    }
+                }
+            }
+            match character {
+                Character::Oracle => rsx! {
+                    p { "Checks available: {abilities.oracle_checks_available.unwrap_or(0)}" }
+                    {target_picker}
+                    button {
+                        disabled: abilities.oracle_checks_available.unwrap_or(0) == 0 || target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command.call(Command::UseOracle { player: my_id, target: PlayerId(t) });
+                        },
+                        "View full history",
+                    }
+                },
+                Character::Almanac => rsx! {
+                    button {
+                        disabled: !abilities.almanac_available.unwrap_or(false),
+                        onclick: move |_| on_command.call(Command::UseAlmanac { player: my_id }),
+                        "Learn 3 non-Leaders",
+                    }
+                },
+                Character::Spymaster => rsx! {
+                    {target_picker}
+                    button {
+                        disabled: !abilities.spymaster_available.unwrap_or(false) || target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command.call(Command::UseSpymaster { player: my_id, target: PlayerId(t) });
+                        },
+                        "View faction color",
+                    }
+                },
+                Character::CultLeader => rsx! {
+                    p { "Queries available: {abilities.cult_leader_queries_available.unwrap_or(0)}" }
+                    {target_picker}
+                    select {
+                        onchange: move |e| kind.set(if e.value() == "IsTonAligned" {
+                            InfoQueryKind::IsTonAligned
+                        } else {
+                            InfoQueryKind::IsTheLeader
+                        }),
+                        option { value: "IsTheLeader", "Is this the Leader?" }
+                        option { value: "IsTonAligned", "Is this Ton-aligned?" }
+                    }
+                    button {
+                        disabled: abilities.cult_leader_queries_available.unwrap_or(0) == 0 || target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command
+                                .call(Command::CultLeaderQuery {
+                                    player: my_id,
+                                    target: PlayerId(t),
+                                    kind: kind(),
+                                });
+                        },
+                        "Query",
+                    }
+                },
+                Character::Deceiver => rsx! {
+                    p {
+                        if abilities.deceiver_falsify_used.unwrap_or(false) {
+                            "Already used your falsify."
+                        } else if abilities.deceiver_armed.unwrap_or(false) {
+                            "Armed -- the next check against you will be falsified."
+                        } else {
+                            "Not armed."
+                        }
+                    }
+                    button {
+                        disabled: abilities.deceiver_falsify_used.unwrap_or(false),
+                        onclick: move |_| {
+                            let armed = !abilities.deceiver_armed.unwrap_or(false);
+                            on_command.call(Command::SetDeceiverArmed { player: my_id, armed });
+                        },
+                        if abilities.deceiver_armed.unwrap_or(false) { "Disarm" } else { "Arm" }
+                    }
+                },
+                Character::PriestPriestess => rsx! {
+                    p { "Protects available: {abilities.priest_protects_available.unwrap_or(0)}" }
+                    {target_picker}
+                    button {
+                        disabled: abilities.priest_protects_available.unwrap_or(0) == 0 || target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command.call(Command::PriestProtect { player: my_id, target: PlayerId(t) });
+                        },
+                        "Protect from conversion",
+                    }
+                },
+                Character::DoctorMedic => rsx! {
+                    {target_picker}
+                    button {
+                        disabled: target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command.call(Command::MedicProtect { player: my_id, target: PlayerId(t) });
+                        },
+                        "Protect from Cast-Out",
+                    }
+                },
+                Character::Bartender => rsx! {
+                    p {
+                        if abilities.bartender_available.unwrap_or(false) {
+                            "Available this round."
+                        } else {
+                            "Already used this round."
+                        }
+                    }
+                    {target_picker}
+                    label {
+                        input {
+                            r#type: "checkbox",
+                            checked: lands(),
+                            onchange: move |e| lands.set(e.checked()),
+                        }
+                        " it lands (flip a coin at the table)"
+                    }
+                    button {
+                        disabled: !abilities.bartender_available.unwrap_or(false) || target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command
+                                .call(Command::BartenderTarget {
+                                    player: my_id,
+                                    target: PlayerId(t),
+                                    lands: lands(),
+                                });
+                        },
+                        "Target",
+                    }
+                },
+                Character::PotionMaker => rsx! {
+                    button {
+                        disabled: !abilities.potion_maker_available.unwrap_or(false),
+                        onclick: move |_| on_command.call(Command::ActivatePotionImmunity { player: my_id }),
+                        "Activate execution immunity",
+                    }
+                },
+                Character::Magistrate | Character::Firebrand => rsx! {
+                    button {
+                        disabled: !abilities.double_vote_available.unwrap_or(false),
+                        onclick: move |_| on_command.call(Command::ActivateDoubleVote { player: my_id }),
+                        "Arm double vote for this ballot",
+                    }
+                },
+                Character::NormalUprising => rsx! {
+                    button {
+                        disabled: !abilities.vote_shield_available.unwrap_or(false),
+                        onclick: move |_| on_command.call(Command::ArmVoteShield { player: my_id }),
+                        "Shield yourself from one vote",
+                    }
+                },
+                _ => rsx! {},
+            }
+        }
+    }
+}
+
+fn describe_check(check: &InfoCheckDelivery, roster: &[RosterEntry]) -> String {
+    let target = check
+        .target
+        .map(|t| names(&[t], roster))
+        .unwrap_or_else(|| "no single target".to_string());
+    match &check.answer {
+        InfoCheckAnswer::Dossier(d) => format!(
+            "{target}: apparent faction {:?}, converted: {}, character: {:?}",
+            d.apparent_faction, d.converted, d.character
+        ),
+        InfoCheckAnswer::Faction(f) => format!("{target}: faction color {f:?}"),
+        InfoCheckAnswer::Bool(b) => format!("{target}: {b}"),
+        InfoCheckAnswer::PlayerSet(set) => {
+            format!("Definitely not the Leader: {}", names(set, roster))
         }
     }
 }

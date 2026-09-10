@@ -1,3 +1,6 @@
+use crate::ability::{
+    resolve_info_check, Dossier, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind,
+};
 use crate::character::{Character, PlayerStatus};
 use crate::command::Command;
 use crate::denouncement::{
@@ -6,6 +9,7 @@ use crate::denouncement::{
 use crate::error::GameError;
 use crate::event::DomainEvent;
 use crate::player::{Faction, Player, PlayerId};
+use crate::recruitment::recruitment_window_size;
 use crate::round::Round;
 use crate::task::{TaskDef, TaskId, TaskTier};
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,6 +73,107 @@ pub struct GameState {
     /// store the `named` claim itself -- see the doc comment on
     /// `DomainEvent::TaskAttempted` for why.
     task_attempts: BTreeMap<(PlayerId, TaskId), bool>,
+    /// Players who have already burned their Normal Ton auto-succeed
+    /// (rules.md §3.1) -- a `BTreeSet` rather than a bool-per-player since
+    /// most players never need an entry at all.
+    normal_ton_auto_succeed_used: BTreeSet<PlayerId>,
+
+    // --- Phase 2: Cult recruitment schedule (rules.md §3.3) ---
+    /// Opened by `AdvanceRound`, consumed by `Convert` -- see
+    /// `recruitment::recruitment_window_size`. A window's slots persist
+    /// until spent; an unused window doesn't expire when the next one
+    /// opens (rules.md doesn't say a missed window is lost, and there's no
+    /// reason to assume so).
+    available_recruitment_slots: usize,
+    /// The Cult Leader's "before each recruitment window" query
+    /// (rules.md §3.3) -- same non-expiring-window reasoning as
+    /// `available_recruitment_slots`.
+    cult_leader_queries_available: usize,
+
+    // --- Phase 2: the Deceiver's falsify pipeline (rules.md §3.3) ---
+    /// A standing choice the Deceiver arms/disarms at will (mirrors
+    /// `revolutionary_leader_successor`'s "standing choice, changeable at
+    /// any time" shape) -- real-time "were you just checked, falsify now?"
+    /// interactivity isn't possible in this engine's synchronous
+    /// command/event model, so "may force a false result" becomes "if
+    /// armed, the next check against them auto-falsifies," consumed once.
+    /// See `ability::resolve_info_check`.
+    deceiver_armed: bool,
+    deceiver_falsify_used: bool,
+
+    // --- Phase 2: protect family (rules.md §3.1/§3.2) ---
+    /// Priest/Priestess: how many protect-from-conversion uses are
+    /// currently available (one per recruitment window, same
+    /// non-expiring-window reasoning as the Cult's own counters above),
+    /// and who they've already protected (can never repeat a target, for
+    /// the whole game).
+    priest_protects_available: usize,
+    priest_protected_ever: BTreeSet<PlayerId>,
+    /// Who's currently shielded from conversion *this round specifically*
+    /// (rules.md: "the Cult Leader can't target that person **that
+    /// round**") -- cleared every `AdvanceRound`, unlike
+    /// `priest_protected_ever`. A target can still be converted in a
+    /// *later* round even though the Priest can never protect them again
+    /// (their one shot at that target has been spent), which is the actual
+    /// balance tradeoff the ability makes.
+    priest_protected_this_round: BTreeSet<PlayerId>,
+    /// Doctor/Medic: who's currently shielded from this round's Cast-Out
+    /// resolution, and who they protected last round (can't repeat a
+    /// target on consecutive rounds). `protected_last_round` is compared
+    /// by identity, not by round number -- it's overwritten every time the
+    /// Medic protects someone new, so two calls within the *same* round
+    /// would incorrectly self-block; callers only get one protect action
+    /// per round in practice (Round 1 has no Denouncement, so this never
+    /// actually collides), but see `medic_protect`'s own guard.
+    medic_protected_this_round: Option<PlayerId>,
+    medic_protected_last_round: Option<PlayerId>,
+    /// Bartender: who's currently drunk (cleared every `AdvanceRound`) and
+    /// whether this round's single use has already been spent.
+    drunk_this_round: BTreeSet<PlayerId>,
+    bartender_used_this_round: bool,
+    /// Potion Maker: armed for the *current* Denouncement, consumed
+    /// (regardless of outcome) the moment a ballot/runoff actually closes
+    /// while armed.
+    potion_immunity_armed: bool,
+    potion_maker_used: bool,
+
+    // --- Phase 2: vote-weight pair (rules.md §3.1/§3.2) ---
+    /// Magistrate/Firebrand: armed for the *current* ballot/runoff,
+    /// consumed the moment a tally that used it actually resolves.
+    magistrate_double_vote_armed: bool,
+    magistrate_double_vote_used: bool,
+    firebrand_double_vote_armed: bool,
+    firebrand_double_vote_used: bool,
+
+    // --- Phase 2: Normal Uprising's reactive safety-net (rules.md §3.2) ---
+    /// Armed for the *current* Denouncement (declared proactively, before
+    /// the ballot closes -- Dalton's resolution of that ambiguity during
+    /// the original implementation planning), consumed the moment a
+    /// tally that used it actually resolves.
+    vote_shield_armed: Option<PlayerId>,
+    vote_shield_used: BTreeSet<PlayerId>,
+
+    // --- Phase 2: Cell Leader passive-knowledge (rules.md §3.2) ---
+    /// Computed once, automatically, at `FinalizeSetup` -- starting
+    /// knowledge, not something anyone activates.
+    cell_leader_knows: Vec<PlayerId>,
+
+    // --- Phase 2: info-check family (rules.md §3.1-3.3) ---
+    /// Oracle: how many checks are currently available (one after every
+    /// odd round -- Rounds 1, 3, 5 -- so usable during Round 2, Round 4,
+    /// and the Finale), separate from `oracle_disabled`, which permanently
+    /// zeroes this out for the rest of the game once tripped.
+    oracle_checks_available: usize,
+    almanac_used: bool,
+    spymaster_used: bool,
+    /// Every info-check ever delivered, across every ability -- the
+    /// privacy-respecting read path `view_for` filters by `querier` (see
+    /// `ability::InfoCheckDelivery`). Kept separate from `event_log`
+    /// because `event_log` is a general audit trail with no privacy
+    /// guarantee of its own; this field exists specifically so `view_for`
+    /// has something to filter that only ever needs one predicate
+    /// (`querier == viewer`).
+    info_check_results: Vec<crate::ability::InfoCheckDelivery>,
 }
 
 impl Default for GameState {
@@ -95,6 +200,31 @@ impl Default for GameState {
             next_task_id: 0,
             open_tasks: BTreeSet::new(),
             task_attempts: BTreeMap::new(),
+            normal_ton_auto_succeed_used: BTreeSet::new(),
+            available_recruitment_slots: 0,
+            cult_leader_queries_available: 0,
+            deceiver_armed: false,
+            deceiver_falsify_used: false,
+            priest_protects_available: 0,
+            priest_protected_ever: BTreeSet::new(),
+            priest_protected_this_round: BTreeSet::new(),
+            medic_protected_this_round: None,
+            medic_protected_last_round: None,
+            drunk_this_round: BTreeSet::new(),
+            bartender_used_this_round: false,
+            potion_immunity_armed: false,
+            potion_maker_used: false,
+            magistrate_double_vote_armed: false,
+            magistrate_double_vote_used: false,
+            firebrand_double_vote_armed: false,
+            firebrand_double_vote_used: false,
+            vote_shield_armed: None,
+            vote_shield_used: BTreeSet::new(),
+            cell_leader_knows: Vec::new(),
+            oracle_checks_available: 0,
+            almanac_used: false,
+            spymaster_used: false,
+            info_check_results: Vec::new(),
         }
     }
 }
@@ -197,16 +327,117 @@ impl GameState {
         self.task_attempts.get(&(player, task)).copied()
     }
 
+    /// `view_for`'s single entry point for "what can this player currently
+    /// do" -- keeps every Phase 2 counter/flag private to this module while
+    /// still letting the view layer render a per-character ability panel.
+    /// See `ability::AbilityStatus`'s doc comment for the field-per-ability
+    /// shape.
+    pub(crate) fn ability_status_for(&self, viewer: PlayerId) -> crate::ability::AbilityStatus {
+        use crate::ability::AbilityStatus;
+        let mut status = AbilityStatus::default();
+        let Some(character) = self.players.get(&viewer).and_then(|p| p.character) else {
+            return status;
+        };
+        match character {
+            Character::Oracle => {
+                status.oracle_checks_available = Some(if self.oracle_disabled {
+                    0
+                } else {
+                    self.oracle_checks_available
+                });
+            }
+            Character::Almanac => status.almanac_available = Some(!self.almanac_used),
+            Character::Spymaster => status.spymaster_available = Some(!self.spymaster_used),
+            Character::CultLeader => {
+                status.cult_leader_queries_available = Some(self.cult_leader_queries_available);
+            }
+            Character::Deceiver => {
+                status.deceiver_armed = Some(self.deceiver_armed);
+                status.deceiver_falsify_used = Some(self.deceiver_falsify_used);
+            }
+            Character::PriestPriestess => {
+                status.priest_protects_available = Some(self.priest_protects_available);
+            }
+            Character::DoctorMedic => status.medic_available = Some(true),
+            Character::Bartender => {
+                status.bartender_available = Some(!self.bartender_used_this_round);
+            }
+            Character::PotionMaker => status.potion_maker_available = Some(!self.potion_maker_used),
+            Character::Magistrate => {
+                status.double_vote_available = Some(!self.magistrate_double_vote_used);
+            }
+            Character::Firebrand => {
+                status.double_vote_available = Some(!self.firebrand_double_vote_used);
+            }
+            Character::NormalUprising => {
+                status.vote_shield_available = Some(!self.vote_shield_used.contains(&viewer));
+            }
+            _ => {}
+        }
+        status
+    }
+
+    /// Every info-check ever delivered to `viewer` specifically -- see
+    /// `info_check_results`'s doc comment.
+    pub(crate) fn info_checks_for(
+        &self,
+        viewer: PlayerId,
+    ) -> Vec<crate::ability::InfoCheckDelivery> {
+        self.info_check_results
+            .iter()
+            .filter(|r| r.querier == viewer)
+            .cloned()
+            .collect()
+    }
+
+    /// `viewer`'s fellow Cultists, if rules.md actually grants them that
+    /// passive knowledge (Cultist and Deceiver both do; the Cult Leader's
+    /// own row in rules.md's ability table lists no passive knowledge --
+    /// they already know who they've personally recruited via their own
+    /// `Convert` commands, so this deliberately isn't duplicated here for
+    /// them). Computed from current true-faction membership rather than a
+    /// stored list, since conversion can add new fellow Cultists mid-game.
+    pub(crate) fn fellow_cultists_for(&self, viewer: PlayerId) -> Vec<PlayerId> {
+        let Some(character) = self.players.get(&viewer).and_then(|p| p.character) else {
+            return Vec::new();
+        };
+        if !matches!(character, Character::Cultist | Character::Deceiver) {
+            return Vec::new();
+        }
+        self.players
+            .values()
+            .filter(|p| p.id != viewer && p.true_faction() == Faction::Cult)
+            .map(|p| p.id)
+            .collect()
+    }
+
+    /// The Cell Leader's starting passive knowledge -- see
+    /// `cell_leader_knows`'s doc comment.
+    pub(crate) fn cell_leader_knows(&self) -> &[PlayerId] {
+        &self.cell_leader_knows
+    }
+
     /// The faction a title's holder must belong to. Used to validate
     /// [`Command::AssignCharacter`] -- e.g. rejects assigning `CultLeader`
     /// to a Ton player.
     fn required_faction(character: Character) -> Option<Faction> {
         match character {
-            Character::KingQueen | Character::PrincePrincess | Character::NormalTon => {
-                Some(Faction::Ton)
-            }
-            Character::RevolutionaryLeader | Character::NormalUprising => Some(Faction::Uprising),
-            Character::CultLeader | Character::Cultist => Some(Faction::Cult),
+            Character::KingQueen
+            | Character::PrincePrincess
+            | Character::NormalTon
+            | Character::Oracle
+            | Character::Almanac
+            | Character::PriestPriestess
+            | Character::PotionMaker
+            | Character::Magistrate => Some(Faction::Ton),
+            Character::RevolutionaryLeader
+            | Character::NormalUprising
+            | Character::Spymaster
+            | Character::Bartender
+            | Character::DoctorMedic
+            | Character::Firebrand
+            | Character::CellLeader => Some(Faction::Uprising),
+            Character::CultLeader | Character::Cultist | Character::Deceiver => Some(Faction::Cult),
         }
     }
 
@@ -251,14 +482,36 @@ impl GameState {
     /// regardless of which path picked the candidate.
     fn is_untitled(&self, id: PlayerId) -> bool {
         self.players.get(&id).is_some_and(|p| {
-            !matches!(
+            matches!(
                 p.character,
-                Some(Character::KingQueen)
-                    | Some(Character::PrincePrincess)
-                    | Some(Character::RevolutionaryLeader)
-                    | Some(Character::CultLeader)
+                None | Some(Character::NormalTon)
+                    | Some(Character::NormalUprising)
+                    | Some(Character::Cultist)
             )
         })
+    }
+
+    /// The current Deceiver, if the Cult has recruited/designated one yet --
+    /// `assign_character`'s uniqueness check guarantees at most one player
+    /// ever holds this character. Used to name the culprit in
+    /// `DomainEvent::CheckFalsifiedByDeceiver` without threading a player id
+    /// through every info-check caller.
+    fn deceiver_id(&self) -> Option<PlayerId> {
+        self.players
+            .values()
+            .find(|p| p.character == Some(Character::Deceiver))
+            .map(|p| p.id)
+    }
+
+    /// A ballot's per-voter weight: 2 for the Magistrate/Firebrand while
+    /// their once-per-game double vote is armed for *this* tally, 1 for
+    /// everyone else. See `tally_ballots`.
+    fn double_vote_weight(&self, voter: PlayerId) -> u32 {
+        match self.players.get(&voter).and_then(|p| p.character) {
+            Some(Character::Magistrate) if self.magistrate_double_vote_armed => 2,
+            Some(Character::Firebrand) if self.firebrand_double_vote_armed => 2,
+            _ => 1,
+        }
     }
 }
 
@@ -312,7 +565,36 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
                 .next()
                 .ok_or(GameError::AlreadyAtFinale)?;
             state.current_round = next;
-            vec![DomainEvent::RoundAdvanced { round: next }]
+
+            // Phase 2: per-round transient ability state resets/rotates.
+            // Must happen before opening the new window below, since that
+            // window's size depends on `competing_player_count`, which
+            // isn't affected by any of this -- ordering here is about
+            // correctness of *these* resets, not the window calculation.
+            state.medic_protected_last_round = state.medic_protected_this_round.take();
+            state.drunk_this_round.clear();
+            state.bartender_used_this_round = false;
+            state.priest_protected_this_round.clear();
+
+            // Every round advance opens a new Cult recruitment window
+            // (rules.md §3.3) -- see `recruitment::recruitment_window_size`
+            // for the exact schedule this implements.
+            let slots = recruitment_window_size(next, state.competing_player_count());
+            state.available_recruitment_slots += slots;
+            state.cult_leader_queries_available += 1;
+            state.priest_protects_available += 1;
+
+            // Oracle: "after every odd round" (rules.md §3.1) -- Rounds 1,
+            // 3, 5 are odd, so a check becomes available arriving at
+            // Round 2, Round 4, or the Finale.
+            if matches!(next, Round::Two | Round::Four | Round::Finale) {
+                state.oracle_checks_available += 1;
+            }
+
+            vec![
+                DomainEvent::RoundAdvanced { round: next },
+                DomainEvent::RecruitmentWindowOpened { round: next, slots },
+            ]
         }
 
         Command::OpenDenouncement => {
@@ -356,6 +638,29 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             task,
             named,
         } => attempt_task(state, player, task, named)?,
+
+        Command::UseOracle { player, target } => use_oracle(state, player, target)?,
+        Command::UseAlmanac { player } => use_almanac(state, player)?,
+        Command::UseSpymaster { player, target } => use_spymaster(state, player, target)?,
+        Command::CultLeaderQuery {
+            player,
+            target,
+            kind,
+        } => cult_leader_query(state, player, target, kind)?,
+        Command::SetDeceiverArmed { player, armed } => set_deceiver_armed(state, player, armed)?,
+
+        Command::PriestProtect { player, target } => priest_protect(state, player, target)?,
+        Command::MedicProtect { player, target } => medic_protect(state, player, target)?,
+        Command::BartenderTarget {
+            player,
+            target,
+            lands,
+        } => bartender_target(state, player, target, lands)?,
+        Command::ActivatePotionImmunity { player } => activate_potion_immunity(state, player)?,
+
+        Command::ActivateDoubleVote { player } => activate_double_vote(state, player)?,
+
+        Command::ArmVoteShield { player } => arm_vote_shield(state, player)?,
     };
 
     state.event_log.extend(events.clone());
@@ -402,7 +707,7 @@ fn assign_character(
         Character::PrincePrincess => Some(&mut state.prince_princess),
         Character::RevolutionaryLeader => Some(&mut state.revolutionary_leader),
         Character::CultLeader => Some(&mut state.cult_leader),
-        Character::NormalTon | Character::NormalUprising | Character::Cultist => None,
+        _ => None,
     };
     if let Some(slot) = title_slot {
         if let Some(holder) = *slot {
@@ -411,6 +716,25 @@ fn assign_character(
             }
         }
         *slot = Some(player);
+    } else if !matches!(
+        character,
+        Character::NormalTon | Character::NormalUprising | Character::Cultist
+    ) {
+        // Every Phase 2 named role (Oracle, Almanac, ...) is meant to be
+        // unique too, same as the four major titles -- just without a
+        // dedicated `GameState` field, since nothing else needs O(1)
+        // lookup for "who currently holds this" the way King/Queen,
+        // Revolutionary Leader, and Cult Leader constantly do elsewhere. A
+        // plain scan is cheap at this player count and keeps `GameState`
+        // from growing a bespoke field per character.
+        if let Some(holder) = state
+            .players
+            .values()
+            .find(|p| p.id != player && p.character == Some(character))
+            .map(|p| p.id)
+        {
+            return Err(GameError::TitleAlreadyHeld { character, holder });
+        }
     }
 
     state.players.get_mut(&player).unwrap().character = Some(character);
@@ -429,6 +753,33 @@ fn finalize_setup(state: &mut GameState) -> Vec<DomainEvent> {
             Faction::Servant | Faction::Unassigned => None,
         };
     }
+
+    // Cell Leader's passive knowledge (rules.md §3.2): computed once, here,
+    // as starting knowledge rather than something activated -- deterministic
+    // lowest-PlayerId selection (the `first_eligible` convention) among
+    // active Uprising members, excluding the Leader (never revealed) and the
+    // Cell Leader themself.
+    if let Some(cell_leader) = state
+        .players
+        .values()
+        .find(|p| p.character == Some(Character::CellLeader))
+        .map(|p| p.id)
+    {
+        let leader = state.revolutionary_leader;
+        state.cell_leader_knows = state
+            .players
+            .values()
+            .filter(|p| {
+                p.faction == Faction::Uprising
+                    && p.status == PlayerStatus::Active
+                    && p.id != cell_leader
+                    && Some(p.id) != leader
+            })
+            .map(|p| p.id)
+            .take(2)
+            .collect();
+    }
+
     vec![DomainEvent::SetupFinalized]
 }
 
@@ -452,6 +803,9 @@ fn convert(
     if !state.is_active(converter) {
         return Err(GameError::NotActive(converter));
     }
+    if state.available_recruitment_slots == 0 {
+        return Err(GameError::NoRecruitmentSlotAvailable);
+    }
     let target_player = state
         .players
         .get(&target)
@@ -469,6 +823,11 @@ fn convert(
             actual: target_player.faction,
         });
     }
+    if state.priest_protected_this_round.contains(&target) {
+        return Err(GameError::ProtectedFromConversionThisRound(target));
+    }
+
+    state.available_recruitment_slots -= 1;
 
     let mut events = Vec::new();
     let is_king_queen = state.king_queen == Some(target);
@@ -731,6 +1090,9 @@ fn nominate(
     if !state.is_active(nominee) {
         return Err(GameError::NotActive(nominee));
     }
+    if state.drunk_this_round.contains(&voter) {
+        return Err(GameError::PlayerIsDrunk(voter));
+    }
     let denouncement = state.denouncement.as_mut().unwrap();
     let DenouncementPhase::Nomination { submitted } = &mut denouncement.phase else {
         return Err(GameError::NominationNotOpen);
@@ -786,6 +1148,9 @@ fn cast_ballot(
     if !state.is_active(voter) {
         return Err(GameError::NotActive(voter));
     }
+    if state.drunk_this_round.contains(&voter) {
+        return Err(GameError::PlayerIsDrunk(voter));
+    }
     // Determine the phase (and thus its candidate list) *before* taking a
     // mutable borrow, so an invalid target is rejected without recording
     // anything. Checking the phase first -- rather than validating a
@@ -822,16 +1187,29 @@ fn cast_ballot(
 /// count. Every candidate gets an entry, including 0, so
 /// `denouncement::resolve_ballot` can distinguish "nobody voted for them"
 /// from "they were never a candidate at all."
+///
+/// Applies the two Phase 2 vote-weight modifiers while counting rather than
+/// as a separate pass: a `Ballot::For` from the Magistrate/Firebrand while
+/// their double vote is armed counts as 2 (rules.md §5: "adds one extra
+/// vote to whichever single nominee that player supported"), and one vote
+/// against `vote_shield_armed`'s holder is negated (`saturating_sub` so a
+/// shield with zero votes against it doesn't underflow).
 fn tally_ballots(
+    state: &GameState,
     candidates: &[PlayerId],
     ballots: &BTreeMap<PlayerId, Ballot>,
 ) -> BTreeMap<PlayerId, u32> {
     let mut tally: BTreeMap<PlayerId, u32> = candidates.iter().map(|&id| (id, 0)).collect();
-    for b in ballots.values() {
+    for (&voter, b) in ballots {
         if let Ballot::For(candidate) = b {
             if let Some(count) = tally.get_mut(candidate) {
-                *count += 1;
+                *count += state.double_vote_weight(voter);
             }
+        }
+    }
+    if let Some(shielded) = state.vote_shield_armed {
+        if let Some(count) = tally.get_mut(&shielded) {
+            *count = count.saturating_sub(1);
         }
     }
     tally
@@ -851,7 +1229,35 @@ fn close_ballot(
         _ => return Err(GameError::BallotNotOpen),
     };
 
-    let tally = tally_ballots(&surfaced, &ballots);
+    // Potion Maker's blanket round-wide execution-immunity (rules.md §3.1,
+    // Dalton's "blanket, no target choice" resolution): whoever the vote
+    // would have selected survives instead, so short-circuit before even
+    // tallying -- nothing about who "won" the vote can matter once nobody
+    // this Denouncement is going to be Cast Out regardless. The double
+    // vote/vote-shield are left un-consumed in this branch (see
+    // `consume_vote_weight_arming`'s doc comment) since a discarded tally
+    // never decided anything.
+    if state.potion_immunity_armed {
+        state.potion_immunity_armed = false;
+        state.potion_maker_used = true;
+        state.denouncement = None;
+        return Ok(vec![DomainEvent::BallotClosed {
+            cast_out: Vec::new(),
+        }]);
+    }
+
+    let mut tally = tally_ballots(state, &surfaced, &ballots);
+    consume_vote_weight_arming(state);
+
+    // Doctor/Medic's protection (rules.md §3.2): the protected player is
+    // pulled out of the tally entirely -- not merely spared -- so the
+    // next-highest vote-getter backfills the freed slot (Dalton's "backfill
+    // from the next candidate" resolution) rather than the slot going
+    // unfilled.
+    if let Some(protected) = state.medic_protected_this_round {
+        tally.remove(&protected);
+    }
+
     let slots = execution_count(state.competing_player_count());
     let resolution = resolve_ballot(&tally, slots);
 
@@ -926,7 +1332,37 @@ fn close_runoff(
             _ => return Err(GameError::RunoffNotOpen),
         };
 
-    let tally = tally_ballots(&candidates, &ballots);
+    // See the identical Potion Maker short-circuit in `close_ballot` -- the
+    // same reasoning applies here: nobody at all is Cast Out from this
+    // Denouncement, including anyone already locked in from the *original*
+    // ballot before the tie -- nothing has actually been removed from the
+    // game yet at this point (see `resolve_cast_out`'s callers), so blanket
+    // immunity covers the whole batch, not just the runoff's own slots.
+    if state.potion_immunity_armed {
+        state.potion_immunity_armed = false;
+        state.potion_maker_used = true;
+        state.denouncement = None;
+        return Ok(vec![DomainEvent::RunoffClosed {
+            cast_out: Vec::new(),
+            unfilled_slot: false,
+        }]);
+    }
+
+    let mut tally = tally_ballots(state, &candidates, &ballots);
+    consume_vote_weight_arming(state);
+
+    if let Some(protected) = state.medic_protected_this_round {
+        tally.remove(&protected);
+    }
+    // The Medic can also target someone already locked in from the
+    // *original* ballot (before the tie) during the runoff window -- no
+    // ranked backfill is possible for an already-decided list like this, so
+    // the protected player is simply saved and that slot goes unfilled.
+    let already_locked_in: Vec<PlayerId> = already_locked_in
+        .into_iter()
+        .filter(|&id| Some(id) != state.medic_protected_this_round)
+        .collect();
+
     let resolution = resolve_ballot(&tally, slots_remaining);
     // A repeat tie -- rules.md: "no one is Denounced for that slot." No
     // second runoff; whatever's left in `tied_for_last_slot` is simply
@@ -1017,13 +1453,409 @@ fn attempt_task(
         }
     }
 
-    let credited = named.iter().any(|id| def.qualifying_players.contains(id));
+    let mut credited = named.iter().any(|id| def.qualifying_players.contains(id));
+
+    // Normal Ton's reactive safety-net (rules.md §3.1): a failed attempt is
+    // silently upgraded to a success once per game, rather than the player
+    // having to invoke a separate command -- there's no "declare I'm using
+    // my auto-succeed" moment in rules.md, just an automatic backstop.
+    if !credited
+        && state.players.get(&player).and_then(|p| p.character) == Some(Character::NormalTon)
+        && !state.normal_ton_auto_succeed_used.contains(&player)
+    {
+        credited = true;
+        state.normal_ton_auto_succeed_used.insert(player);
+    }
+
     state.task_attempts.insert((player, task), credited);
     Ok(vec![DomainEvent::TaskAttempted {
         player,
         task,
         credited,
     }])
+}
+
+/// Shared precondition for every Phase 2 ability command: the actor must be
+/// active and currently hold the specific character the ability belongs to.
+/// See `error::GameError::NotCharacter`'s doc comment for why this is one
+/// generic check rather than a bespoke one per character.
+fn require_character(
+    state: &GameState,
+    player: PlayerId,
+    required: Character,
+) -> Result<(), GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    if state.players.get(&player).and_then(|p| p.character) != Some(required) {
+        return Err(GameError::NotCharacter { player, required });
+    }
+    Ok(())
+}
+
+/// Computes `kind`'s falsify decision, records the delivered result into
+/// `state.info_check_results`, and returns the events -- the one place
+/// `use_oracle`, `use_spymaster`, and `cult_leader_query` all funnel through
+/// (rules.md names these three, plus Almanac, as the set the Deceiver can
+/// target; Almanac is deliberately excluded here -- see
+/// `InfoQueryKind::NotLeaderSet`'s doc comment).
+fn deliver_info_check(
+    state: &mut GameState,
+    querier: PlayerId,
+    target: PlayerId,
+    kind: InfoQueryKind,
+    true_answer: InfoCheckAnswer,
+) -> Vec<DomainEvent> {
+    let should_falsify = state.deceiver_armed && !state.deceiver_falsify_used;
+    let answer = resolve_info_check(true_answer, should_falsify);
+
+    let mut events = Vec::new();
+    if should_falsify {
+        state.deceiver_falsify_used = true;
+        state.deceiver_armed = false;
+        if let Some(deceiver) = state.deceiver_id() {
+            events.push(DomainEvent::CheckFalsifiedByDeceiver { deceiver });
+        }
+    }
+
+    events.push(DomainEvent::InfoCheckDelivered {
+        querier,
+        target: Some(target),
+        kind,
+        answer: answer.clone(),
+    });
+    state.info_check_results.push(InfoCheckDelivery {
+        querier,
+        target: Some(target),
+        kind,
+        answer,
+        round: state.current_round,
+    });
+    events
+}
+
+fn use_oracle(
+    state: &mut GameState,
+    player: PlayerId,
+    target: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::Oracle)?;
+    if state.oracle_disabled || state.oracle_checks_available == 0 {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::Oracle,
+        });
+    }
+    let target_player = state
+        .players
+        .get(&target)
+        .ok_or(GameError::UnknownPlayer(target))?;
+    let true_answer = InfoCheckAnswer::Dossier(Dossier {
+        apparent_faction: target_player.faction,
+        converted: target_player.converted,
+        character: target_player.character,
+    });
+
+    state.oracle_checks_available -= 1;
+    Ok(deliver_info_check(
+        state,
+        player,
+        target,
+        InfoQueryKind::FullHistory,
+        true_answer,
+    ))
+}
+
+/// Almanac: once per game, learns 3 players who are definitely not the
+/// Revolutionary Leader. Deterministic lowest-PlayerId selection (the same
+/// fixed, test-reproducible convention as `first_eligible`) among active
+/// players, excluding the true Leader and the Almanac-holder themself --
+/// rules.md never says the Almanac's own name would appear in their own
+/// result, and excluding it keeps every entry informative.
+fn use_almanac(state: &mut GameState, player: PlayerId) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::Almanac)?;
+    if state.almanac_used {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::Almanac,
+        });
+    }
+    state.almanac_used = true;
+
+    let leader = state.revolutionary_leader;
+    let picks: Vec<PlayerId> = state
+        .players
+        .values()
+        .filter(|p| p.status == PlayerStatus::Active && Some(p.id) != leader && p.id != player)
+        .map(|p| p.id)
+        .take(3)
+        .collect();
+    let answer = InfoCheckAnswer::PlayerSet(picks);
+
+    // Deliberately bypasses `deliver_info_check`/the Deceiver falsify
+    // pipeline -- see `InfoQueryKind::NotLeaderSet`'s doc comment on why
+    // "targeted by Almanac" is undefined for a check with no single target.
+    state.info_check_results.push(InfoCheckDelivery {
+        querier: player,
+        target: None,
+        kind: InfoQueryKind::NotLeaderSet,
+        answer: answer.clone(),
+        round: state.current_round,
+    });
+    Ok(vec![DomainEvent::InfoCheckDelivered {
+        querier: player,
+        target: None,
+        kind: InfoQueryKind::NotLeaderSet,
+        answer,
+    }])
+}
+
+fn use_spymaster(
+    state: &mut GameState,
+    player: PlayerId,
+    target: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::Spymaster)?;
+    if state.spymaster_used {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::Spymaster,
+        });
+    }
+    let target_player = state
+        .players
+        .get(&target)
+        .ok_or(GameError::UnknownPlayer(target))?;
+    let true_answer = InfoCheckAnswer::Faction(target_player.faction);
+
+    state.spymaster_used = true;
+    Ok(deliver_info_check(
+        state,
+        player,
+        target,
+        InfoQueryKind::FactionColorOnly,
+        true_answer,
+    ))
+}
+
+fn cult_leader_query(
+    state: &mut GameState,
+    player: PlayerId,
+    target: PlayerId,
+    kind: InfoQueryKind,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::CultLeader)?;
+    if !matches!(
+        kind,
+        InfoQueryKind::IsTonAligned | InfoQueryKind::IsTheLeader
+    ) {
+        return Err(GameError::InvalidInfoQueryKind);
+    }
+    if state.cult_leader_queries_available == 0 {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::CultLeader,
+        });
+    }
+    let target_player = state
+        .players
+        .get(&target)
+        .ok_or(GameError::UnknownPlayer(target))?;
+    let true_answer = match kind {
+        InfoQueryKind::IsTonAligned => {
+            InfoCheckAnswer::Bool(target_player.true_faction() == Faction::Ton)
+        }
+        InfoQueryKind::IsTheLeader => {
+            InfoCheckAnswer::Bool(state.revolutionary_leader == Some(target))
+        }
+        _ => unreachable!("kind validated above"),
+    };
+
+    state.cult_leader_queries_available -= 1;
+    Ok(deliver_info_check(state, player, target, kind, true_answer))
+}
+
+fn set_deceiver_armed(
+    state: &mut GameState,
+    player: PlayerId,
+    armed: bool,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::Deceiver)?;
+    if state.deceiver_falsify_used {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::Deceiver,
+        });
+    }
+    state.deceiver_armed = armed;
+    Ok(vec![DomainEvent::DeceiverArmedChanged { player, armed }])
+}
+
+fn priest_protect(
+    state: &mut GameState,
+    player: PlayerId,
+    target: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::PriestPriestess)?;
+    if state.priest_protects_available == 0 {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::PriestPriestess,
+        });
+    }
+    if !state.is_active(target) {
+        return Err(GameError::NotActive(target));
+    }
+    if state.priest_protected_ever.contains(&target) {
+        return Err(GameError::AlreadyProtectedByPriest(target));
+    }
+
+    state.priest_protects_available -= 1;
+    state.priest_protected_ever.insert(target);
+    state.priest_protected_this_round.insert(target);
+    Ok(vec![DomainEvent::PriestProtected { player, target }])
+}
+
+/// A standing choice, changeable at any time for the rest of the round
+/// (same shape as `DesignateSuccessor`) rather than a counted one-shot --
+/// rules.md gives the Medic no explicit "how many times per round" cap
+/// beyond "once per round," and re-declaring a new target before any
+/// Cast-Out resolution actually consumes it is indistinguishable from having
+/// only picked once. Requires an open Denouncement since the ability only
+/// means anything relative to one ("if that person is selected for
+/// Cast-Out").
+fn medic_protect(
+    state: &mut GameState,
+    player: PlayerId,
+    target: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::DoctorMedic)?;
+    if state.denouncement.is_none() {
+        return Err(GameError::NoActiveBallotToProtectAgainst);
+    }
+    if !state.is_active(target) {
+        return Err(GameError::NotActive(target));
+    }
+    if state.medic_protected_last_round == Some(target) {
+        return Err(GameError::CannotProtectSameTargetConsecutively(target));
+    }
+
+    state.medic_protected_this_round = Some(target);
+    Ok(vec![DomainEvent::MedicProtected { player, target }])
+}
+
+fn bartender_target(
+    state: &mut GameState,
+    player: PlayerId,
+    target: PlayerId,
+    lands: bool,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::Bartender)?;
+    if state.bartender_used_this_round {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::Bartender,
+        });
+    }
+    if !state.is_active(target) {
+        return Err(GameError::NotActive(target));
+    }
+
+    state.bartender_used_this_round = true;
+    if lands {
+        state.drunk_this_round.insert(target);
+    }
+    Ok(vec![DomainEvent::BartenderTargeted {
+        player,
+        target,
+        landed: lands,
+    }])
+}
+
+/// Arms the Potion Maker's once-per-game blanket execution-immunity.
+/// `potion_maker_used` is deliberately NOT set here -- see its doc comment
+/// on `GameState`: it's consumed only when a ballot/runoff actually closes
+/// while armed (`close_ballot`/`close_runoff`), not at activation, so
+/// re-arming before anything has closed is a harmless no-op rather than a
+/// wasted use.
+fn activate_potion_immunity(
+    state: &mut GameState,
+    player: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::PotionMaker)?;
+    if state.potion_maker_used {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::PotionMaker,
+        });
+    }
+    state.potion_immunity_armed = true;
+    Ok(vec![DomainEvent::PotionImmunityActivated { player }])
+}
+
+/// The Magistrate and Firebrand share one command since `player`'s own
+/// character determines which of the two this is (rules.md: there's only
+/// ever one of each). `_used` is consumed only once a tally that applied the
+/// weight actually runs -- see `consume_vote_weight_arming`.
+fn activate_double_vote(
+    state: &mut GameState,
+    player: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    let character = state.players.get(&player).and_then(|p| p.character);
+    match character {
+        Some(Character::Magistrate) => {
+            if state.magistrate_double_vote_used {
+                return Err(GameError::AbilityNotAvailable {
+                    character: Character::Magistrate,
+                });
+            }
+            state.magistrate_double_vote_armed = true;
+        }
+        Some(Character::Firebrand) => {
+            if state.firebrand_double_vote_used {
+                return Err(GameError::AbilityNotAvailable {
+                    character: Character::Firebrand,
+                });
+            }
+            state.firebrand_double_vote_armed = true;
+        }
+        _ => {
+            return Err(GameError::NotCharacter {
+                player,
+                required: Character::Magistrate,
+            })
+        }
+    }
+    Ok(vec![DomainEvent::DoubleVoteActivated {
+        player,
+        character: character.unwrap(),
+    }])
+}
+
+fn arm_vote_shield(state: &mut GameState, player: PlayerId) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::NormalUprising)?;
+    if state.vote_shield_used.contains(&player) {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::NormalUprising,
+        });
+    }
+    state.vote_shield_armed = Some(player);
+    Ok(vec![DomainEvent::VoteShieldArmed { player }])
+}
+
+/// Consumes whichever vote-weight abilities actually applied to a tally that
+/// just ran -- called once per real tally-and-resolve (both `close_ballot`
+/// and `close_runoff`), but deliberately skipped on the Potion Maker's
+/// blanket-immunity short-circuit in both, since a discarded tally never
+/// really "decided" anything the double vote or shield could be credited
+/// (or charged) for.
+fn consume_vote_weight_arming(state: &mut GameState) {
+    if state.magistrate_double_vote_armed {
+        state.magistrate_double_vote_armed = false;
+        state.magistrate_double_vote_used = true;
+    }
+    if state.firebrand_double_vote_armed {
+        state.firebrand_double_vote_armed = false;
+        state.firebrand_double_vote_used = true;
+    }
+    if let Some(shielded) = state.vote_shield_armed.take() {
+        state.vote_shield_used.insert(shielded);
+    }
 }
 
 #[cfg(test)]
@@ -1046,6 +1878,15 @@ mod tests {
         )
         .unwrap();
         id
+    }
+
+    /// Test-only convenience: directly grants recruitment slots without
+    /// going through `AdvanceRound`, for tests that only care about
+    /// `Convert`'s own behavior, not round progression. Legal since this
+    /// helper lives in `state.rs`'s own test submodule, which has the same
+    /// private-field access as the rest of the file.
+    fn grant_recruitment_slots(state: &mut GameState, slots: usize) {
+        state.available_recruitment_slots += slots;
     }
 
     #[test]
@@ -1386,6 +2227,7 @@ mod tests {
         let cult_leader = state.cult_leader().unwrap();
         let extra = add_player(&mut state, "Extra", Faction::Ton);
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        grant_recruitment_slots(&mut state, 1);
 
         apply_command(
             &mut state,
@@ -1444,6 +2286,7 @@ mod tests {
     #[test]
     fn convert_rejects_an_inactive_target() {
         let (mut state, king_queen, _prince, _leader, cult_leader) = setup_full_game();
+        grant_recruitment_slots(&mut state, 1);
         apply_command(
             &mut state,
             Command::CastOut {
@@ -1466,6 +2309,7 @@ mod tests {
     fn convert_rejects_a_target_who_is_not_ton_or_uprising() {
         let (mut state, .., cult_leader) = setup_full_game();
         let other_cultist = add_player(&mut state, "OtherCultist", Faction::Cult);
+        grant_recruitment_slots(&mut state, 1);
         let result = apply_command(
             &mut state,
             Command::Convert {
@@ -1486,6 +2330,7 @@ mod tests {
     #[test]
     fn converting_king_queen_triggers_the_full_cascade() {
         let (mut state, king_queen, prince, _leader, cult_leader) = setup_full_game();
+        grant_recruitment_slots(&mut state, 1);
 
         let events = apply_command(
             &mut state,
@@ -1521,6 +2366,7 @@ mod tests {
         let (mut state, king_queen, _prince, _leader, cult_leader) = setup_full_game();
         let extra_ton = add_player(&mut state, "ExtraTon", Faction::Ton);
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        grant_recruitment_slots(&mut state, 1);
 
         apply_command(
             &mut state,
@@ -1552,6 +2398,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.king_queen(), Some(extra_ton));
+        grant_recruitment_slots(&mut state, 1);
 
         // Converting the *new* King/Queen should NOT re-trigger the
         // auto-transfer cascade, since the transfer ability is already
@@ -1577,6 +2424,7 @@ mod tests {
     #[test]
     fn converting_revolutionary_leader_sets_the_ever_converted_flag_but_no_cascade() {
         let (mut state, _king_queen, _prince, leader, cult_leader) = setup_full_game();
+        grant_recruitment_slots(&mut state, 1);
         apply_command(
             &mut state,
             Command::Convert {
@@ -1888,6 +2736,7 @@ mod tests {
         )
         .unwrap();
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        grant_recruitment_slots(&mut state, 1);
 
         apply_command(
             &mut state,
@@ -1972,6 +2821,7 @@ mod tests {
     #[test]
     fn leader_cast_out_while_converted_does_not_set_the_unconverted_denounced_flag() {
         let (mut state, _king_queen, _prince, leader, cult_leader) = setup_full_game();
+        grant_recruitment_slots(&mut state, 1);
         apply_command(
             &mut state,
             Command::Convert {
@@ -1996,6 +2846,7 @@ mod tests {
     #[test]
     fn cult_leader_cast_out_with_a_prior_conversion_triggers_martyrdom() {
         let (mut state, king_queen, _prince, _leader, cult_leader) = setup_full_game();
+        grant_recruitment_slots(&mut state, 1);
         apply_command(
             &mut state,
             Command::Convert {
@@ -2087,7 +2938,19 @@ mod tests {
             Round::Finale,
         ] {
             let events = apply_command(&mut state, Command::AdvanceRound).unwrap();
-            assert_eq!(events, vec![DomainEvent::RoundAdvanced { round: expected }]);
+            // A recruitment window opens on every round advance too (rules.md
+            // §3.3) -- with 0 competing players in this fixture, every window
+            // is a flat 1-slot window regardless of round.
+            assert_eq!(
+                events,
+                vec![
+                    DomainEvent::RoundAdvanced { round: expected },
+                    DomainEvent::RecruitmentWindowOpened {
+                        round: expected,
+                        slots: 1
+                    },
+                ]
+            );
             assert_eq!(state.current_round(), expected);
         }
         let result = apply_command(&mut state, Command::AdvanceRound);
@@ -3561,6 +4424,7 @@ mod tests {
     fn convert_rejects_a_target_who_is_already_converted() {
         let (mut state, king_queen, ..) = setup_full_game();
         let cult_leader = state.cult_leader().unwrap();
+        grant_recruitment_slots(&mut state, 2);
         apply_command(
             &mut state,
             Command::Convert {
@@ -3719,5 +4583,1679 @@ mod tests {
         assert!(state.king_queen().is_some());
         assert_ne!(state.king_queen(), Some(king_queen));
         assert_ne!(state.king_queen(), Some(prince_princess));
+    }
+
+    // --- Phase 2 ---
+
+    struct Phase2Players {
+        king_queen: PlayerId,
+        prince_princess: PlayerId,
+        leader: PlayerId,
+        cult_leader: PlayerId,
+        oracle: PlayerId,
+        almanac: PlayerId,
+        priest: PlayerId,
+        potion_maker: PlayerId,
+        magistrate: PlayerId,
+        spymaster: PlayerId,
+        bartender: PlayerId,
+        medic: PlayerId,
+        firebrand: PlayerId,
+        cell_leader: PlayerId,
+        deceiver: PlayerId,
+        normal_ton: PlayerId,
+        normal_uprising: PlayerId,
+    }
+
+    fn assign_new(
+        state: &mut GameState,
+        name: &str,
+        faction: Faction,
+        character: Character,
+    ) -> PlayerId {
+        let id = add_player(state, name, faction);
+        apply_command(
+            state,
+            Command::AssignCharacter {
+                player: id,
+                character,
+            },
+        )
+        .unwrap();
+        id
+    }
+
+    /// A game with one player holding every Phase 2 character, plus one
+    /// spare generic Ton and Uprising member (for abilities like
+    /// `ArmVoteShield` and Normal Ton's auto-succeed, which key off the
+    /// generic catch-all characters `FinalizeSetup` assigns). Every Phase 2
+    /// counter/flag starts at 0/unused -- tests that need an ability
+    /// available seed it directly (same convention as `grant_recruitment_slots`).
+    fn setup_phase2_game() -> (GameState, Phase2Players) {
+        let mut state = GameState::new();
+        let king_queen = assign_new(&mut state, "King", Faction::Ton, Character::KingQueen);
+        let prince_princess = assign_new(
+            &mut state,
+            "Prince",
+            Faction::Ton,
+            Character::PrincePrincess,
+        );
+        let oracle = assign_new(&mut state, "Oracle", Faction::Ton, Character::Oracle);
+        let almanac = assign_new(&mut state, "Almanac", Faction::Ton, Character::Almanac);
+        let priest = assign_new(
+            &mut state,
+            "Priest",
+            Faction::Ton,
+            Character::PriestPriestess,
+        );
+        let potion_maker = assign_new(&mut state, "Potion", Faction::Ton, Character::PotionMaker);
+        let magistrate = assign_new(
+            &mut state,
+            "Magistrate",
+            Faction::Ton,
+            Character::Magistrate,
+        );
+        let normal_ton = add_player(&mut state, "NormalTon", Faction::Ton);
+
+        let leader = assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        let spymaster = assign_new(
+            &mut state,
+            "Spymaster",
+            Faction::Uprising,
+            Character::Spymaster,
+        );
+        let bartender = assign_new(
+            &mut state,
+            "Bartender",
+            Faction::Uprising,
+            Character::Bartender,
+        );
+        let medic = assign_new(
+            &mut state,
+            "Medic",
+            Faction::Uprising,
+            Character::DoctorMedic,
+        );
+        let firebrand = assign_new(
+            &mut state,
+            "Firebrand",
+            Faction::Uprising,
+            Character::Firebrand,
+        );
+        let cell_leader = assign_new(
+            &mut state,
+            "CellLeader",
+            Faction::Uprising,
+            Character::CellLeader,
+        );
+        let normal_uprising = add_player(&mut state, "NormalUprising", Faction::Uprising);
+
+        let cult_leader = assign_new(
+            &mut state,
+            "CultLeader",
+            Faction::Cult,
+            Character::CultLeader,
+        );
+        let deceiver = assign_new(&mut state, "Deceiver", Faction::Cult, Character::Deceiver);
+
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        (
+            state,
+            Phase2Players {
+                king_queen,
+                prince_princess,
+                leader,
+                cult_leader,
+                oracle,
+                almanac,
+                priest,
+                potion_maker,
+                magistrate,
+                spymaster,
+                bartender,
+                medic,
+                firebrand,
+                cell_leader,
+                deceiver,
+                normal_ton,
+                normal_uprising,
+            },
+        )
+    }
+
+    // --- Info-check family ---
+
+    #[test]
+    fn use_oracle_delivers_the_targets_dossier() {
+        let (mut state, p) = setup_phase2_game();
+        state.oracle_checks_available = 1;
+        let events = apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: p.cult_leader,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.oracle_checks_available, 0);
+        match &events[0] {
+            DomainEvent::InfoCheckDelivered {
+                querier,
+                target,
+                kind,
+                answer,
+            } => {
+                assert_eq!(*querier, p.oracle);
+                assert_eq!(*target, Some(p.cult_leader));
+                assert_eq!(*kind, InfoQueryKind::FullHistory);
+                match answer {
+                    InfoCheckAnswer::Dossier(d) => {
+                        assert_eq!(d.apparent_faction, Faction::Cult);
+                        assert!(!d.converted);
+                        assert_eq!(d.character, Some(Character::CultLeader));
+                    }
+                    other => panic!("expected a Dossier, got {other:?}"),
+                }
+            }
+            other => panic!("expected InfoCheckDelivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn use_oracle_rejects_a_non_oracle() {
+        let (mut state, p) = setup_phase2_game();
+        state.oracle_checks_available = 1;
+        let result = apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.almanac,
+                target: p.cult_leader,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::NotCharacter {
+                player: p.almanac,
+                required: Character::Oracle,
+            })
+        );
+    }
+
+    #[test]
+    fn use_oracle_rejects_an_inactive_oracle() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: p.oracle,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        state.oracle_checks_available = 1;
+        let result = apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(p.oracle)));
+    }
+
+    #[test]
+    fn use_oracle_rejects_when_no_checks_are_available() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: p.cult_leader,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Oracle,
+            })
+        );
+    }
+
+    #[test]
+    fn use_oracle_rejects_once_permanently_disabled() {
+        let (mut state, p) = setup_phase2_game();
+        state.oracle_checks_available = 1;
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: p.king_queen,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(state.oracle_disabled());
+        let result = apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: p.cult_leader,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Oracle,
+            })
+        );
+    }
+
+    #[test]
+    fn use_oracle_rejects_an_unknown_target() {
+        let (mut state, p) = setup_phase2_game();
+        state.oracle_checks_available = 1;
+        let bogus = PlayerId(9999);
+        let result = apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: bogus,
+            },
+        );
+        assert_eq!(result, Err(GameError::UnknownPlayer(bogus)));
+    }
+
+    #[test]
+    fn use_almanac_picks_three_non_leader_active_players_excluding_self() {
+        let (mut state, p) = setup_phase2_game();
+        let events = apply_command(&mut state, Command::UseAlmanac { player: p.almanac }).unwrap();
+        match &events[0] {
+            DomainEvent::InfoCheckDelivered {
+                querier,
+                target,
+                kind,
+                answer,
+            } => {
+                assert_eq!(*querier, p.almanac);
+                assert_eq!(*target, None);
+                assert_eq!(*kind, InfoQueryKind::NotLeaderSet);
+                match answer {
+                    InfoCheckAnswer::PlayerSet(set) => {
+                        assert_eq!(set.len(), 3);
+                        assert!(!set.contains(&p.leader));
+                        assert!(!set.contains(&p.almanac));
+                    }
+                    other => panic!("expected a PlayerSet, got {other:?}"),
+                }
+            }
+            other => panic!("expected InfoCheckDelivered, got {other:?}"),
+        }
+        assert!(state.almanac_used);
+    }
+
+    #[test]
+    fn use_almanac_rejects_a_second_use() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::UseAlmanac { player: p.almanac }).unwrap();
+        let result = apply_command(&mut state, Command::UseAlmanac { player: p.almanac });
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Almanac,
+            })
+        );
+    }
+
+    #[test]
+    fn deceiver_armed_does_not_affect_almanac() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::SetDeceiverArmed {
+                player: p.deceiver,
+                armed: true,
+            },
+        )
+        .unwrap();
+        let events = apply_command(&mut state, Command::UseAlmanac { player: p.almanac }).unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::CheckFalsifiedByDeceiver { .. })));
+        assert!(
+            state.deceiver_armed,
+            "Almanac deliberately bypasses the falsify pipeline, so arming stays unconsumed"
+        );
+    }
+
+    #[test]
+    fn use_spymaster_delivers_faction_color_only_once_per_game() {
+        let (mut state, p) = setup_phase2_game();
+        let events = apply_command(
+            &mut state,
+            Command::UseSpymaster {
+                player: p.spymaster,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+        match &events[0] {
+            DomainEvent::InfoCheckDelivered { answer, .. } => {
+                assert_eq!(*answer, InfoCheckAnswer::Faction(Faction::Ton));
+            }
+            other => panic!("expected InfoCheckDelivered, got {other:?}"),
+        }
+        let result = apply_command(
+            &mut state,
+            Command::UseSpymaster {
+                player: p.spymaster,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Spymaster,
+            })
+        );
+    }
+
+    #[test]
+    fn cult_leader_query_is_ton_aligned_reflects_true_faction_not_apparent() {
+        let (mut state, p) = setup_phase2_game();
+        state.cult_leader_queries_available = 1;
+        grant_recruitment_slots(&mut state, 1);
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: p.cult_leader,
+                target: p.leader,
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CultLeaderQuery {
+                player: p.cult_leader,
+                target: p.leader,
+                kind: InfoQueryKind::IsTonAligned,
+            },
+        )
+        .unwrap();
+        match &events[0] {
+            DomainEvent::InfoCheckDelivered { answer, .. } => {
+                assert_eq!(*answer, InfoCheckAnswer::Bool(false));
+            }
+            other => panic!("expected InfoCheckDelivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cult_leader_query_is_the_leader() {
+        let (mut state, p) = setup_phase2_game();
+        state.cult_leader_queries_available = 1;
+        let events = apply_command(
+            &mut state,
+            Command::CultLeaderQuery {
+                player: p.cult_leader,
+                target: p.leader,
+                kind: InfoQueryKind::IsTheLeader,
+            },
+        )
+        .unwrap();
+        match &events[0] {
+            DomainEvent::InfoCheckDelivered { answer, .. } => {
+                assert_eq!(*answer, InfoCheckAnswer::Bool(true));
+            }
+            other => panic!("expected InfoCheckDelivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cult_leader_query_rejects_an_invalid_kind() {
+        let (mut state, p) = setup_phase2_game();
+        state.cult_leader_queries_available = 1;
+        let result = apply_command(
+            &mut state,
+            Command::CultLeaderQuery {
+                player: p.cult_leader,
+                target: p.leader,
+                kind: InfoQueryKind::FullHistory,
+            },
+        );
+        assert_eq!(result, Err(GameError::InvalidInfoQueryKind));
+    }
+
+    #[test]
+    fn cult_leader_query_rejects_when_none_is_available() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::CultLeaderQuery {
+                player: p.cult_leader,
+                target: p.leader,
+                kind: InfoQueryKind::IsTheLeader,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::CultLeader,
+            })
+        );
+    }
+
+    #[test]
+    fn deceiver_falsifies_the_next_info_check_once_armed_then_stops() {
+        let (mut state, p) = setup_phase2_game();
+        state.oracle_checks_available = 1;
+        apply_command(
+            &mut state,
+            Command::SetDeceiverArmed {
+                player: p.deceiver,
+                armed: true,
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+
+        assert!(events.iter().any(
+            |e| matches!(e, DomainEvent::CheckFalsifiedByDeceiver { deceiver } if *deceiver == p.deceiver)
+        ));
+        let answer = events
+            .iter()
+            .find_map(|e| match e {
+                DomainEvent::InfoCheckDelivered { answer, .. } => Some(answer),
+                _ => None,
+            })
+            .unwrap();
+        match answer {
+            InfoCheckAnswer::Dossier(d) => {
+                assert!(d.converted, "falsified dossier should lie about conversion")
+            }
+            other => panic!("expected a Dossier, got {other:?}"),
+        }
+        assert!(!state.deceiver_armed);
+        assert!(state.deceiver_falsify_used);
+
+        state.oracle_checks_available = 1;
+        let events2 = apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+        assert!(!events2
+            .iter()
+            .any(|e| matches!(e, DomainEvent::CheckFalsifiedByDeceiver { .. })));
+    }
+
+    #[test]
+    fn set_deceiver_armed_rejects_a_non_deceiver() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::SetDeceiverArmed {
+                player: p.cult_leader,
+                armed: true,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::NotCharacter {
+                player: p.cult_leader,
+                required: Character::Deceiver,
+            })
+        );
+    }
+
+    #[test]
+    fn set_deceiver_armed_rejects_reuse_after_a_falsify_fires() {
+        let (mut state, p) = setup_phase2_game();
+        state.oracle_checks_available = 1;
+        apply_command(
+            &mut state,
+            Command::SetDeceiverArmed {
+                player: p.deceiver,
+                armed: true,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::SetDeceiverArmed {
+                player: p.deceiver,
+                armed: true,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Deceiver,
+            })
+        );
+    }
+
+    // --- Protect family ---
+
+    #[test]
+    fn priest_protect_succeeds_and_blocks_conversion_this_round() {
+        let (mut state, p) = setup_phase2_game();
+        state.priest_protects_available = 1;
+        grant_recruitment_slots(&mut state, 1);
+
+        apply_command(
+            &mut state,
+            Command::PriestProtect {
+                player: p.priest,
+                target: p.leader,
+            },
+        )
+        .unwrap();
+
+        let result = apply_command(
+            &mut state,
+            Command::Convert {
+                converter: p.cult_leader,
+                target: p.leader,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::ProtectedFromConversionThisRound(p.leader))
+        );
+    }
+
+    #[test]
+    fn priest_protection_expires_after_the_round_advances() {
+        let (mut state, p) = setup_phase2_game();
+        state.priest_protects_available = 1;
+        apply_command(
+            &mut state,
+            Command::PriestProtect {
+                player: p.priest,
+                target: p.leader,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: p.cult_leader,
+                target: p.leader,
+            },
+        )
+        .unwrap();
+        assert!(state.player(p.leader).unwrap().converted);
+    }
+
+    #[test]
+    fn priest_protect_rejects_repeating_a_past_target() {
+        let (mut state, p) = setup_phase2_game();
+        state.priest_protects_available = 2;
+        apply_command(
+            &mut state,
+            Command::PriestProtect {
+                player: p.priest,
+                target: p.leader,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::PriestProtect {
+                player: p.priest,
+                target: p.leader,
+            },
+        );
+        assert_eq!(result, Err(GameError::AlreadyProtectedByPriest(p.leader)));
+    }
+
+    #[test]
+    fn priest_protect_rejects_when_none_are_available() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::PriestProtect {
+                player: p.priest,
+                target: p.leader,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::PriestPriestess,
+            })
+        );
+    }
+
+    #[test]
+    fn priest_protect_rejects_an_inactive_target() {
+        let (mut state, p) = setup_phase2_game();
+        state.priest_protects_available = 1;
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: p.leader,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::PriestProtect {
+                player: p.priest,
+                target: p.leader,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(p.leader)));
+    }
+
+    #[test]
+    fn medic_protect_requires_an_open_denouncement() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::MedicProtect {
+                player: p.medic,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(result, Err(GameError::NoActiveBallotToProtectAgainst));
+    }
+
+    #[test]
+    fn medic_protect_rejects_repeating_last_rounds_target() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        state.medic_protected_last_round = Some(p.king_queen);
+        let result = apply_command(
+            &mut state,
+            Command::MedicProtect {
+                player: p.medic,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::CannotProtectSameTargetConsecutively(
+                p.king_queen
+            ))
+        );
+    }
+
+    #[test]
+    fn medic_protect_rejects_an_inactive_target() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: p.leader,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::MedicProtect {
+                player: p.medic,
+                target: p.leader,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(p.leader)));
+    }
+
+    #[test]
+    fn medic_protect_is_a_standing_choice_changeable_within_the_round() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::MedicProtect {
+                player: p.medic,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::MedicProtect {
+                player: p.medic,
+                target: p.prince_princess,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.medic_protected_this_round, Some(p.prince_princess));
+    }
+
+    #[test]
+    fn medic_protection_backfills_from_the_next_candidate_in_close_ballot() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: p.prince_princess,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        apply_command(
+            &mut state,
+            Command::MedicProtect {
+                player: p.medic,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+
+        for voter in [p.oracle, p.almanac, p.priest] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.king_queen),
+                },
+            )
+            .unwrap();
+        }
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.potion_maker,
+                ballot: Ballot::For(p.prince_princess),
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.player(p.king_queen).unwrap().status,
+            PlayerStatus::Active,
+            "medic-protected target should survive"
+        );
+        assert_eq!(
+            state.player(p.prince_princess).unwrap().status,
+            PlayerStatus::CastOut,
+            "the next-highest candidate should backfill the freed slot"
+        );
+        assert!(events.iter().any(
+            |e| matches!(e, DomainEvent::BallotClosed { cast_out } if cast_out == &vec![p.prince_princess])
+        ));
+    }
+
+    #[test]
+    fn medic_protection_saves_an_already_locked_in_candidate_during_a_runoff_with_no_backfill() {
+        let (mut state, p) = setup_phase2_game();
+        for i in 0..4 {
+            add_player(&mut state, &format!("Extra{i}"), Faction::Ton);
+        }
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        assert_eq!(state.competing_player_count(), 21);
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: p.prince_princess,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.priest,
+                nominee: p.spymaster,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        for voter in [p.oracle, p.almanac, p.priest, p.potion_maker, p.magistrate] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.king_queen),
+                },
+            )
+            .unwrap();
+        }
+        for voter in [p.spymaster, p.bartender, p.medic] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.prince_princess),
+                },
+            )
+            .unwrap();
+        }
+        for voter in [p.firebrand, p.cell_leader, p.leader] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.spymaster),
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DomainEvent::RunoffOpened { .. })),
+            "expected a runoff for the tied 2nd slot: {events:?}"
+        );
+
+        apply_command(
+            &mut state,
+            Command::MedicProtect {
+                player: p.medic,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.prince_princess),
+            },
+        )
+        .unwrap();
+        let runoff_events = apply_command(
+            &mut state,
+            Command::CloseRunoff {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.player(p.king_queen).unwrap().status,
+            PlayerStatus::Active,
+            "the medic-protected already-locked-in candidate should survive"
+        );
+        assert_eq!(
+            state.player(p.prince_princess).unwrap().status,
+            PlayerStatus::CastOut
+        );
+        match &runoff_events[0] {
+            DomainEvent::RunoffClosed { cast_out, .. } => {
+                assert!(!cast_out.contains(&p.king_queen));
+                assert!(cast_out.contains(&p.prince_princess));
+            }
+            other => panic!("expected RunoffClosed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bartender_makes_the_target_drunk_when_it_lands() {
+        let (mut state, p) = setup_phase2_game();
+        let events = apply_command(
+            &mut state,
+            Command::BartenderTarget {
+                player: p.bartender,
+                target: p.king_queen,
+                lands: true,
+            },
+        )
+        .unwrap();
+        assert!(state.drunk_this_round.contains(&p.king_queen));
+        assert!(matches!(
+            events[0],
+            DomainEvent::BartenderTargeted { landed: true, .. }
+        ));
+    }
+
+    #[test]
+    fn bartender_ability_fails_silently_when_it_does_not_land() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::BartenderTarget {
+                player: p.bartender,
+                target: p.king_queen,
+                lands: false,
+            },
+        )
+        .unwrap();
+        assert!(!state.drunk_this_round.contains(&p.king_queen));
+    }
+
+    #[test]
+    fn bartender_target_rejects_a_second_use_this_round() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::BartenderTarget {
+                player: p.bartender,
+                target: p.king_queen,
+                lands: false,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::BartenderTarget {
+                player: p.bartender,
+                target: p.prince_princess,
+                lands: true,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Bartender,
+            })
+        );
+    }
+
+    #[test]
+    fn bartender_target_rejects_an_inactive_target() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: p.leader,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::BartenderTarget {
+                player: p.bartender,
+                target: p.leader,
+                lands: true,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(p.leader)));
+    }
+
+    #[test]
+    fn a_drunk_player_cannot_nominate_or_vote_this_round() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::BartenderTarget {
+                player: p.bartender,
+                target: p.king_queen,
+                lands: true,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.king_queen,
+                nominee: p.leader,
+            },
+        );
+        assert_eq!(result, Err(GameError::PlayerIsDrunk(p.king_queen)));
+
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.leader,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        let result2 = apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.king_queen,
+                ballot: Ballot::For(p.leader),
+            },
+        );
+        assert_eq!(result2, Err(GameError::PlayerIsDrunk(p.king_queen)));
+    }
+
+    #[test]
+    fn drunk_status_and_bartender_use_clear_on_advance_round() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::BartenderTarget {
+                player: p.bartender,
+                target: p.king_queen,
+                lands: true,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+        assert!(!state.drunk_this_round.contains(&p.king_queen));
+        assert!(!state.bartender_used_this_round);
+    }
+
+    #[test]
+    fn activate_potion_immunity_rejects_a_non_potion_maker() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity { player: p.oracle },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::NotCharacter {
+                player: p.oracle,
+                required: Character::PotionMaker,
+            })
+        );
+    }
+
+    #[test]
+    fn potion_immunity_saves_everyone_the_ballot_would_have_cast_out() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity {
+                player: p.potion_maker,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.player(p.king_queen).unwrap().status,
+            PlayerStatus::Active
+        );
+        assert!(
+            matches!(&events[0], DomainEvent::BallotClosed { cast_out } if cast_out.is_empty())
+        );
+        assert!(!state.potion_immunity_armed);
+        assert!(state.potion_maker_used);
+    }
+
+    #[test]
+    fn potion_immunity_cannot_be_activated_a_second_time() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity {
+                player: p.potion_maker,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        let result = apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity {
+                player: p.potion_maker,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::PotionMaker,
+            })
+        );
+    }
+
+    // --- Vote-weight pair ---
+
+    #[test]
+    fn activate_double_vote_rejects_a_non_magistrate_non_firebrand() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(&mut state, Command::ActivateDoubleVote { player: p.oracle });
+        assert_eq!(
+            result,
+            Err(GameError::NotCharacter {
+                player: p.oracle,
+                required: Character::Magistrate,
+            })
+        );
+    }
+
+    #[test]
+    fn magistrates_double_vote_counts_twice_in_the_tally() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ActivateDoubleVote {
+                player: p.magistrate,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: p.prince_princess,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        // Without the double vote this would tie 1-1; the Magistrate's
+        // single ballot should decide it outright.
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.magistrate,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.almanac,
+                ballot: Ballot::For(p.prince_princess),
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&events[0], DomainEvent::BallotClosed { cast_out } if cast_out == &vec![p.king_queen])
+        );
+        assert!(state.magistrate_double_vote_used);
+        assert!(!state.magistrate_double_vote_armed);
+    }
+
+    #[test]
+    fn firebrands_double_vote_counts_twice_in_the_tally() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ActivateDoubleVote {
+                player: p.firebrand,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: p.prince_princess,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.firebrand,
+                ballot: Ballot::For(p.prince_princess),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&events[0], DomainEvent::BallotClosed { cast_out } if cast_out == &vec![p.prince_princess])
+        );
+    }
+
+    #[test]
+    fn activate_double_vote_rejects_reuse() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ActivateDoubleVote {
+                player: p.magistrate,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.magistrate,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        let result = apply_command(
+            &mut state,
+            Command::ActivateDoubleVote {
+                player: p.magistrate,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Magistrate,
+            })
+        );
+    }
+
+    // --- Normal Uprising's reactive vote-shield ---
+
+    #[test]
+    fn arm_vote_shield_rejects_a_non_normal_uprising() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(&mut state, Command::ArmVoteShield { player: p.oracle });
+        assert_eq!(
+            result,
+            Err(GameError::NotCharacter {
+                player: p.oracle,
+                required: Character::NormalUprising,
+            })
+        );
+    }
+
+    #[test]
+    fn vote_shield_negates_one_vote_against_its_holder() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ArmVoteShield {
+                player: p.normal_uprising,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.normal_uprising,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        // Two votes against the shielded player would normally beat one
+        // vote against king_queen; the shield should negate one of them,
+        // tying it instead.
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.normal_uprising),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.almanac,
+                ballot: Ballot::For(p.normal_uprising),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.priest,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&events[0], DomainEvent::RunoffOpened { .. }),
+            "the shield should have reduced the tally to a 1-1 tie: {events:?}"
+        );
+        assert!(state.vote_shield_used.contains(&p.normal_uprising));
+        assert!(state.vote_shield_armed.is_none());
+    }
+
+    #[test]
+    fn arm_vote_shield_rejects_reuse() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ArmVoteShield {
+                player: p.normal_uprising,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.normal_uprising,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.normal_uprising),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        let result = apply_command(
+            &mut state,
+            Command::ArmVoteShield {
+                player: p.normal_uprising,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::NormalUprising,
+            })
+        );
+    }
+
+    // --- Cell Leader passive knowledge ---
+
+    #[test]
+    fn cell_leader_knows_two_other_uprising_members_excluding_the_leader() {
+        let (state, p) = setup_phase2_game();
+        assert_eq!(state.cell_leader_knows.len(), 2);
+        assert!(!state.cell_leader_knows.contains(&p.leader));
+        assert!(!state.cell_leader_knows.contains(&p.cell_leader));
+
+        let mut expected: Vec<PlayerId> = state
+            .players()
+            .filter(|pl| {
+                pl.faction == Faction::Uprising && pl.id != p.cell_leader && pl.id != p.leader
+            })
+            .map(|pl| pl.id)
+            .collect();
+        expected.sort();
+        expected.truncate(2);
+        assert_eq!(state.cell_leader_knows, expected);
+    }
+
+    // --- Normal Ton's reactive safety-net ---
+
+    #[test]
+    fn normal_ton_auto_succeeds_one_failed_task_attempt_once_per_game() {
+        let (mut state, p) = setup_phase2_game();
+        let task_id = match apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "test".into(),
+                tier: TaskTier::Easy,
+                qualifying_players: BTreeSet::new(),
+            },
+        )
+        .unwrap()[0]
+        {
+            DomainEvent::TaskPushed { id, .. } => id,
+            _ => unreachable!(),
+        };
+
+        let events = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: p.normal_ton,
+                task: task_id,
+                named: [p.oracle, p.almanac, p.priest],
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(events[0], DomainEvent::TaskAttempted { credited: true, .. }),
+            "the failed attempt should be auto-upgraded"
+        );
+        assert!(state.normal_ton_auto_succeed_used.contains(&p.normal_ton));
+    }
+
+    #[test]
+    fn normal_ton_auto_succeed_only_triggers_once() {
+        let (mut state, p) = setup_phase2_game();
+        let task1 = match apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "t1".into(),
+                tier: TaskTier::Easy,
+                qualifying_players: BTreeSet::new(),
+            },
+        )
+        .unwrap()[0]
+        {
+            DomainEvent::TaskPushed { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let task2 = match apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "t2".into(),
+                tier: TaskTier::Easy,
+                qualifying_players: BTreeSet::new(),
+            },
+        )
+        .unwrap()[0]
+        {
+            DomainEvent::TaskPushed { id, .. } => id,
+            _ => unreachable!(),
+        };
+        apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: p.normal_ton,
+                task: task1,
+                named: [p.oracle, p.almanac, p.priest],
+            },
+        )
+        .unwrap();
+        let events2 = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: p.normal_ton,
+                task: task2,
+                named: [p.oracle, p.almanac, p.priest],
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                events2[0],
+                DomainEvent::TaskAttempted {
+                    credited: false,
+                    ..
+                }
+            ),
+            "a second failure shouldn't also be auto-upgraded"
+        );
     }
 }

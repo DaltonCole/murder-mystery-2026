@@ -1,3 +1,4 @@
+use crate::ability::{AbilityStatus, InfoCheckDelivery};
 use crate::character::{Character, PlayerStatus};
 use crate::denouncement::DenouncementPhase;
 use crate::player::{Faction, PlayerId};
@@ -98,6 +99,22 @@ pub struct PlayerView {
     /// `None` when no Denouncement is currently running.
     pub denouncement: Option<DenouncementView>,
     pub open_tasks: Vec<TaskView>,
+
+    /// What the viewer's own current character can do right now -- every
+    /// field empty/default for Host/Display and for a player with no
+    /// ability-bearing character. See `ability::AbilityStatus`.
+    pub my_abilities: AbilityStatus,
+    /// Every info-check ever delivered *to this viewer specifically* --
+    /// never another player's results, falsified or not (see
+    /// `state::GameState::info_checks_for`).
+    pub my_info_checks: Vec<InfoCheckDelivery>,
+    /// The Cultist/Deceiver passive-knowledge feed -- empty unless the
+    /// viewer's own character actually grants it (see
+    /// `state::GameState::fellow_cultists_for`'s doc comment on why the
+    /// Cult Leader is deliberately excluded).
+    pub fellow_cultists: Vec<PlayerId>,
+    /// The Cell Leader's passive knowledge -- empty for every other viewer.
+    pub known_uprising_members: Vec<PlayerId>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -164,6 +181,24 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         })
         .collect();
 
+    let my_abilities = viewer_id
+        .map(|id| state.ability_status_for(id))
+        .unwrap_or_default();
+    let my_info_checks = viewer_id
+        .map(|id| state.info_checks_for(id))
+        .unwrap_or_default();
+    let fellow_cultists = viewer_id
+        .map(|id| state.fellow_cultists_for(id))
+        .unwrap_or_default();
+    let known_uprising_members = viewer_id
+        .filter(|&id| {
+            state
+                .player(id)
+                .is_some_and(|p| p.character == Some(Character::CellLeader))
+        })
+        .map(|_| state.cell_leader_knows().to_vec())
+        .unwrap_or_default();
+
     PlayerView {
         roster,
         own_faction,
@@ -171,6 +206,10 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         current_round: state.current_round(),
         denouncement,
         open_tasks,
+        my_abilities,
+        my_info_checks,
+        fellow_cultists,
+        known_uprising_members,
     }
 }
 
@@ -653,5 +692,179 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    // --- Phase 2 ---
+
+    fn phase2_state() -> (GameState, PlayerId, PlayerId, PlayerId, PlayerId, PlayerId) {
+        let mut state = GameState::new();
+        let new_player = |state: &mut GameState, name: &str, faction: Faction| -> PlayerId {
+            let events = apply_command(
+                state,
+                Command::AddPlayer {
+                    name: name.to_string(),
+                },
+            )
+            .unwrap();
+            let id = match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_command(
+                state,
+                Command::AssignFaction {
+                    player: id,
+                    faction,
+                },
+            )
+            .unwrap();
+            id
+        };
+
+        let oracle = new_player(&mut state, "Oracle", Faction::Ton);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: oracle,
+                character: Character::Oracle,
+            },
+        )
+        .unwrap();
+        let king_queen = new_player(&mut state, "King", Faction::Ton);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: king_queen,
+                character: Character::KingQueen,
+            },
+        )
+        .unwrap();
+        let leader = new_player(&mut state, "Leader", Faction::Uprising);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: leader,
+                character: Character::RevolutionaryLeader,
+            },
+        )
+        .unwrap();
+        let cell_leader = new_player(&mut state, "CellLeader", Faction::Uprising);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: cell_leader,
+                character: Character::CellLeader,
+            },
+        )
+        .unwrap();
+        let cult_leader = new_player(&mut state, "CultLeader", Faction::Cult);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: cult_leader,
+                character: Character::CultLeader,
+            },
+        )
+        .unwrap();
+        let cultist = new_player(&mut state, "Cultist", Faction::Cult);
+        // A spare, plain Uprising member with no assigned character so
+        // `cell_leader_knows` has someone besides the Leader (excluded)
+        // and the Cell Leader themself (also excluded) to actually learn.
+        new_player(&mut state, "NormalUprising", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        (state, oracle, king_queen, leader, cell_leader, cultist)
+    }
+
+    #[test]
+    fn own_ability_status_reflects_only_the_viewers_own_character() {
+        let (mut state, oracle, king_queen, ..) = phase2_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+
+        let oracle_view = view_for(&state, Viewer::Player(oracle));
+        assert!(oracle_view.my_abilities.oracle_checks_available.is_some());
+
+        // King/Queen has no ability-bearing character -- every field stays
+        // empty, including `oracle_checks_available`, even though a real
+        // Oracle exists elsewhere in the game.
+        let king_view = view_for(&state, Viewer::Player(king_queen));
+        assert_eq!(king_view.my_abilities, AbilityStatus::default());
+
+        assert_eq!(
+            view_for(&state, Viewer::Host).my_abilities,
+            AbilityStatus::default()
+        );
+        assert_eq!(
+            view_for(&state, Viewer::Display).my_abilities,
+            AbilityStatus::default()
+        );
+    }
+
+    #[test]
+    fn my_info_checks_never_leaks_into_another_players_view() {
+        let (mut state, oracle, king_queen, ..) = phase2_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+        apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: oracle,
+                target: king_queen,
+            },
+        )
+        .unwrap();
+
+        let oracle_view = view_for(&state, Viewer::Player(oracle));
+        assert_eq!(oracle_view.my_info_checks.len(), 1);
+        assert_eq!(oracle_view.my_info_checks[0].querier, oracle);
+
+        // Nobody else -- including the target themself -- ever sees this
+        // result in their own view.
+        let king_view = view_for(&state, Viewer::Player(king_queen));
+        assert!(king_view.my_info_checks.is_empty());
+
+        for viewer in [Viewer::Player(king_queen), Viewer::Host, Viewer::Display] {
+            let serialized = serde_json::to_string(&view_for(&state, viewer)).unwrap();
+            assert!(
+                !serialized.contains("FullHistory"),
+                "a non-querier's view leaked the Oracle's result: {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn fellow_cultists_only_visible_to_cult_members_who_get_that_passive() {
+        let (state, _oracle, king_queen, _leader, _cell_leader, cultist) = phase2_state();
+        let cult_leader = state
+            .players()
+            .find(|p| p.character == Some(Character::CultLeader))
+            .unwrap()
+            .id;
+
+        let cultist_view = view_for(&state, Viewer::Player(cultist));
+        assert!(cultist_view.fellow_cultists.contains(&cult_leader));
+        assert!(!cultist_view.fellow_cultists.contains(&cultist));
+
+        // The Cult Leader's own row in rules.md's ability table lists no
+        // such passive -- see `state::GameState::fellow_cultists_for`.
+        let cult_leader_view = view_for(&state, Viewer::Player(cult_leader));
+        assert!(cult_leader_view.fellow_cultists.is_empty());
+
+        let king_view = view_for(&state, Viewer::Player(king_queen));
+        assert!(king_view.fellow_cultists.is_empty());
+    }
+
+    #[test]
+    fn cell_leader_sees_known_uprising_members_nobody_else_does() {
+        let (state, _oracle, king_queen, leader, cell_leader, _cultist) = phase2_state();
+
+        let cell_leader_view = view_for(&state, Viewer::Player(cell_leader));
+        assert_eq!(cell_leader_view.known_uprising_members.len(), 1);
+        assert!(!cell_leader_view.known_uprising_members.contains(&leader));
+
+        let leader_view = view_for(&state, Viewer::Player(leader));
+        assert!(leader_view.known_uprising_members.is_empty());
+
+        let king_view = view_for(&state, Viewer::Player(king_queen));
+        assert!(king_view.known_uprising_members.is_empty());
     }
 }

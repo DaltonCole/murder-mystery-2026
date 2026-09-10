@@ -9,24 +9,28 @@
 //! (`/home/drc/.claude/plans/piped-crunching-lighthouse.md`) for the
 //! rationale behind this boundary.
 
+mod ability;
 mod character;
 mod command;
 mod denouncement;
 mod error;
 mod event;
 mod player;
+mod recruitment;
 mod round;
 mod state;
 mod task;
 mod view;
 mod win_condition;
 
+pub use ability::{AbilityStatus, Dossier, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind};
 pub use character::{Character, PlayerStatus};
 pub use command::Command;
 pub use denouncement::{Ballot, DenouncementPhase};
 pub use error::GameError;
 pub use event::DomainEvent;
 pub use player::{Faction, Player, PlayerId};
+pub use recruitment::recruitment_window_size;
 pub use round::Round;
 pub use state::{apply_command, GameState};
 pub use task::{TaskDef, TaskId, TaskTier};

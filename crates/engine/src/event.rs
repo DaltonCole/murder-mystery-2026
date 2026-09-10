@@ -1,3 +1,4 @@
+use crate::ability::{InfoCheckAnswer, InfoQueryKind};
 use crate::character::Character;
 use crate::denouncement::Ballot;
 use crate::player::{Faction, PlayerId};
@@ -146,5 +147,75 @@ pub enum DomainEvent {
         player: PlayerId,
         task: TaskId,
         credited: bool,
+    },
+
+    /// Emitted alongside `RoundAdvanced` -- every round advance opens a
+    /// new Cult recruitment window (rules.md §3.3), which also grants the
+    /// Cult Leader's query, the Priest/Priestess's protect, and (on the
+    /// rounds following an odd one) the Oracle's check. `slots` is how
+    /// many recruitment slots this specific window granted (1, or 2 once
+    /// ramped -- see `recruitment::recruitment_window_size`).
+    RecruitmentWindowOpened {
+        round: Round,
+        slots: usize,
+    },
+
+    // --- Phase 2: info-check family + the Deceiver ---
+    /// Carries the *delivered* answer -- already falsified if the Deceiver
+    /// intervened. This engine never separately logs the true answer next
+    /// to a falsified one; from the moment of delivery onward, a lie and
+    /// the truth are the same shape (see `ability::InfoCheckAnswer`).
+    InfoCheckDelivered {
+        querier: PlayerId,
+        /// `None` only for the Almanac -- see `ability::InfoCheckDelivery`.
+        target: Option<PlayerId>,
+        kind: InfoQueryKind,
+        answer: InfoCheckAnswer,
+    },
+    DeceiverArmedChanged {
+        player: PlayerId,
+        armed: bool,
+    },
+    /// Emitted alongside `InfoCheckDelivered` specifically when the
+    /// Deceiver's standing arm fired -- lets a test (or a future
+    /// Whistledown-style narrator) tell "a genuine check" apart from "a
+    /// falsified one" without inspecting the answer's plausibility, same
+    /// reasoning as `KingQueenConversionCascade` being its own event.
+    CheckFalsifiedByDeceiver {
+        deceiver: PlayerId,
+    },
+
+    // --- Phase 2: protect family ---
+    PriestProtected {
+        player: PlayerId,
+        target: PlayerId,
+    },
+    MedicProtected {
+        player: PlayerId,
+        target: PlayerId,
+    },
+    /// `landed` is the same pre-rolled outcome the caller supplied --
+    /// logged so a Whistledown-style narrator or audit trail doesn't need
+    /// to re-derive it from `Player::drunk`-style state this engine
+    /// deliberately doesn't keep as a queryable per-player flag (see
+    /// `GameState::drunk_this_round`).
+    BartenderTargeted {
+        player: PlayerId,
+        target: PlayerId,
+        landed: bool,
+    },
+    PotionImmunityActivated {
+        player: PlayerId,
+    },
+
+    // --- Phase 2: vote-weight pair ---
+    DoubleVoteActivated {
+        player: PlayerId,
+        character: Character,
+    },
+
+    // --- Phase 2: Normal Uprising's reactive safety-net ---
+    VoteShieldArmed {
+        player: PlayerId,
     },
 }
