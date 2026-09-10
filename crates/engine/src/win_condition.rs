@@ -28,17 +28,23 @@ pub enum CultPath {
 }
 
 /// The result of checking every faction's win/loss condition against the
-/// current state. Deliberately independent booleans, not a single
-/// `enum Winner` -- see the module-level doc comment on why more than one
-/// can be true at once, and why that's a real property of the ruleset this
-/// engine faithfully reports rather than silently resolving.
+/// current state. Independent booleans rather than a single `enum Winner`
+/// purely for API convenience (each faction's condition is checked and
+/// reported on its own), but `evaluate` guarantees at most one of
+/// `ton_wins`/`uprising_wins`/`cult_wins` is ever `true` at once -- see the
+/// module-level doc comment for why an overlap is structurally possible and
+/// how it's resolved (Dalton's ruling: the Cult always has priority).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameOutcome {
     pub ton_wins: bool,
     pub uprising_wins: bool,
     pub cult_wins: bool,
-    /// Every Cult path currently satisfied (usually zero or one, but see
-    /// the module doc comment -- A and D, or B and D, etc. can coincide).
+    /// Every Cult path currently satisfied (usually zero or one, but A and
+    /// D, or B and D, etc. can coincide) -- purely diagnostic/narrative
+    /// ("which of the Cult's routes actually fired"), not itself gated by
+    /// the single-winner rule; it's populated whenever `cult_wins` is
+    /// `true` regardless of whether a Ton/Uprising condition was also
+    /// independently satisfied and suppressed.
     pub cult_paths: Vec<CultPath>,
 }
 
@@ -71,21 +77,29 @@ impl GameOutcome {
 /// Round::Finale`. Checking it earlier would report "currently safe" as if
 /// it meant "has won," which isn't the same claim.
 ///
-/// # A known, real overlap in the ruleset (not an engine bug)
+/// # A real overlap in the ruleset, resolved with Cult priority
 ///
 /// Once Revolutionary Leader succession is in play, it's possible for
-/// `uprising_wins` and `cult_wins` (via [`CultPath::C`]) to both be true at
-/// once: if an *earlier* Leader was correctly Denounced while unconverted
-/// (setting the persistent "ever denounced" flag Path C reads) and
-/// succession later installed a *different* Leader who survives to the end
-/// unconverted (satisfying the Uprising's own win condition), both
-/// conditions hold simultaneously. This engine reports it faithfully rather
-/// than silently picking a winner -- it's a genuine open question in the
-/// ruleset (does a successor's safe survival retroactively protect against
-/// Path C, or not?) that needs a ruling from the game's designer, not an
-/// engineering guess. See `win_condition::tests::
+/// `uprising_wins` and a Cult path (via [`CultPath::C`]) to both be
+/// independently satisfied at once: if an *earlier* Leader was correctly
+/// Denounced while unconverted (setting the persistent "ever denounced"
+/// flag Path C reads) and succession later installed a *different* Leader
+/// who survives to the end unconverted (satisfying the Uprising's own win
+/// condition), both hold simultaneously. A second, less obvious overlap
+/// exists between `ton_wins` and Path D (martyrdom): if a royal was
+/// converted (triggering martyrdom when the Cult Leader later falls) but
+/// that same royal is later Cast Out -- no longer counting as
+/// "converted and active" -- Ton's own condition can also independently
+/// read as satisfied.
+///
+/// Dalton's ruling during Phase 3's review: **only one faction ever wins,
+/// and the Cult has priority**. `evaluate` enforces this directly --
+/// whenever `cult_wins` is `true`, `ton_wins` and `uprising_wins` are both
+/// forced `false` regardless of what their own conditions would otherwise
+/// report, rather than leaving the overlap for a caller to resolve. See
+/// `win_condition::tests::
 /// path_c_can_overlap_with_uprising_survival_after_a_succession` for a
-/// worked example, and flag this prominently rather than resolving it here.
+/// worked example of the override actually firing.
 pub fn evaluate(state: &GameState) -> GameOutcome {
     let mut outcome = GameOutcome::none();
 
@@ -133,6 +147,16 @@ pub fn evaluate(state: &GameState) -> GameOutcome {
         outcome.cult_paths.push(CultPath::D);
     }
     outcome.cult_wins = !outcome.cult_paths.is_empty();
+
+    // Only one faction ever wins, and the Cult has priority (Dalton's
+    // ruling) -- see the doc comment above on the two independent overlaps
+    // this resolves. `cult_paths` is left untouched: it's diagnostic
+    // information about *why* the Cult won, not itself part of the
+    // single-winner guarantee.
+    if outcome.cult_wins {
+        outcome.ton_wins = false;
+        outcome.uprising_wins = false;
+    }
 
     outcome
 }
@@ -454,10 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn path_c_can_overlap_with_uprising_survival_after_a_succession() {
+    fn path_c_overlap_with_uprising_survival_is_resolved_in_the_cults_favor() {
         // See the module-level doc comment on `evaluate` for the full
         // explanation -- this is the concrete, worked example of the real
-        // ruleset overlap it describes, not a bug.
+        // ruleset overlap, and of the Cult-priority override actually
+        // suppressing the Uprising's independently-true condition.
         let mut state = GameState::new();
         let mut add = |name: &str, faction: Faction| -> PlayerId {
             let events =
@@ -541,13 +566,72 @@ mod tests {
 
         let outcome = evaluate(&state);
         assert!(
-            outcome.uprising_wins,
-            "the current Leader (Leader2) genuinely satisfies the Uprising's own condition"
-        );
-        assert!(
             outcome.cult_paths.contains(&CultPath::C),
             "Path C's clauses are independently satisfied by King/Queen's conversion \
              and Leader1's earlier, permanent denouncement flag"
+        );
+        assert!(outcome.cult_wins);
+        assert!(
+            !outcome.uprising_wins,
+            "the current Leader (Leader2) genuinely satisfies the Uprising's own condition, \
+             but the Cult's priority ruling must suppress it -- only one faction ever wins"
+        );
+    }
+
+    #[test]
+    fn martyrdom_overlap_with_tons_own_condition_is_also_resolved_in_the_cults_favor() {
+        // A second, less obvious overlap than the Path C one above: once a
+        // converted royal who already triggered martyrdom is later Cast Out
+        // themselves, they stop counting as "converted and active," so
+        // Ton's own condition can independently read as satisfied too. The
+        // same Cult-priority override must suppress it here as well.
+        let (mut state, king_queen, leader, cult_leader, _prince) = base_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // recruitment slot
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: cult_leader,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(state.martyrdom_triggered());
+
+        // The (already-converted) King/Queen is now Cast Out too, and the
+        // Leader's line is exhausted (no successor exists in `base_state`)
+        // -- both of Ton's own conditions independently read as satisfied.
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: king_queen,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: leader,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        let outcome = evaluate(&state);
+        assert!(outcome.cult_paths.contains(&CultPath::D));
+        assert!(outcome.cult_wins);
+        assert!(
+            !outcome.ton_wins,
+            "Ton's line-exhausted-and-loyal-King/Queen condition is independently true here, \
+             but the Cult's martyrdom priority must suppress it"
         );
     }
 }

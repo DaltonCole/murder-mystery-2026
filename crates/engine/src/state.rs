@@ -859,8 +859,8 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
         }
         Command::ResolveGalleryPredictions {
             actual_cast_out,
-            actual_winners,
-        } => resolve_gallery_predictions(state, actual_cast_out, actual_winners)?,
+            actual_winner,
+        } => resolve_gallery_predictions(state, actual_cast_out, actual_winner)?,
     };
 
     state.event_log.extend(events.clone());
@@ -1950,7 +1950,7 @@ fn submit_gallery_prediction(
 fn resolve_gallery_predictions(
     state: &mut GameState,
     actual_cast_out: Vec<PlayerId>,
-    actual_winners: Vec<Faction>,
+    actual_winner: Faction,
 ) -> Result<Vec<DomainEvent>, GameError> {
     if state.gallery_resolved {
         return Err(GameError::GalleryAlreadyResolved);
@@ -1972,7 +1972,7 @@ fn resolve_gallery_predictions(
     for (&player, prediction) in state.gallery_predictions.clone().iter() {
         let correct = match prediction {
             GalleryPrediction::CastOutIs(id) => actual_cast_out.contains(id),
-            GalleryPrediction::FactionWins(f) => actual_winners.contains(f),
+            GalleryPrediction::FactionWins(f) => *f == actual_winner,
         };
         if correct {
             correct_predictions += 1;
@@ -9051,7 +9051,7 @@ mod tests {
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![target],
-                actual_winners: vec![Faction::Ton],
+                actual_winner: Faction::Ton,
             },
         )
         .unwrap();
@@ -9083,7 +9083,7 @@ mod tests {
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![],
-                actual_winners: vec![Faction::Ton],
+                actual_winner: Faction::Ton,
             },
         )
         .unwrap();
@@ -9091,7 +9091,7 @@ mod tests {
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![],
-                actual_winners: vec![Faction::Ton],
+                actual_winner: Faction::Ton,
             },
         );
         assert_eq!(result, Err(GameError::GalleryAlreadyResolved));
@@ -9104,7 +9104,7 @@ mod tests {
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![],
-                actual_winners: vec![Faction::Ton],
+                actual_winner: Faction::Ton,
             },
         );
         assert_eq!(result, Err(GameError::GalleryResolutionTooEarly));
@@ -9120,19 +9120,18 @@ mod tests {
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![],
-                actual_winners: vec![Faction::Ton],
+                actual_winner: Faction::Ton,
             },
         );
         assert_eq!(result, Err(GameError::GalleryResolutionTooEarly));
     }
 
     #[test]
-    fn resolve_gallery_predictions_handles_the_multi_winner_overlap() {
-        // win_condition::evaluate's own doc comment flags a real, known
-        // rules.md overlap: the Uprising and the Cult (via Path C) can both
-        // win the same game. A FactionWins prediction for either actual
-        // winner must score correct, not just whichever one the host lists
-        // first.
+    fn resolve_gallery_predictions_scores_a_correct_faction_prediction() {
+        // Dalton's ruling (Phase 3 review): only one faction ever wins, and
+        // the Cult has priority over any overlap -- win_condition::evaluate
+        // enforces that directly, so this command only ever needs a single
+        // actual_winner, not a set.
         let (mut state, cast_out_player) = setup_at_finale_with_open_denouncement();
         apply_command(
             &mut state,
@@ -9156,7 +9155,7 @@ mod tests {
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![],
-                actual_winners: vec![Faction::Uprising, Faction::Cult],
+                actual_winner: Faction::Uprising,
             },
         )
         .unwrap();
@@ -9185,7 +9184,7 @@ mod tests {
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![],
-                actual_winners: vec![Faction::Ton],
+                actual_winner: Faction::Ton,
             },
         )
         .unwrap();

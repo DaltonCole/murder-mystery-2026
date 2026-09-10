@@ -882,7 +882,7 @@ fn Host() -> Element {
     let mut servant_award_player = use_signal(|| None::<u32>);
     let mut servant_award_points = use_signal(|| 1u32);
     let mut gallery_cast_out = use_signal(String::new);
-    let mut gallery_winners = use_signal(Vec::<Faction>::new);
+    let mut gallery_winner = use_signal(|| Faction::Ton);
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
     let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
@@ -1187,7 +1187,7 @@ fn Host() -> Element {
         }
         div {
             h3 { "Gallery resolution" }
-            p { "Once at the Finale, after the ballot has actually closed: score every submitted Gallery prediction against the real outcome. Check every faction that actually won -- a King/Queen succession can leave the Uprising and the Cult both winning the same game (see win_condition::evaluate's doc comment), so this isn't always exactly one box." }
+            p { "Once at the Finale, after the ballot has actually closed: score every submitted Gallery prediction against the real outcome. Only one faction ever wins -- the Cult has priority over any overlap (see win_condition::evaluate's doc comment) -- so pick the one that actually won." }
             input {
                 placeholder: "actual Cast-Out IDs, e.g. 2,5",
                 value: "{gallery_cast_out}",
@@ -1196,19 +1196,10 @@ fn Host() -> Element {
             for faction in [Faction::Ton, Faction::Uprising, Faction::Cult] {
                 label {
                     input {
-                        r#type: "checkbox",
-                        checked: gallery_winners().contains(&faction),
-                        onchange: move |e| {
-                            let mut current = gallery_winners();
-                            if e.checked() {
-                                if !current.contains(&faction) {
-                                    current.push(faction);
-                                }
-                            } else {
-                                current.retain(|&f| f != faction);
-                            }
-                            gallery_winners.set(current);
-                        },
+                        r#type: "radio",
+                        name: "gallery-winner",
+                        checked: gallery_winner() == faction,
+                        onchange: move |_| gallery_winner.set(faction),
                     }
                     " {faction:?} won"
                 }
@@ -1223,7 +1214,7 @@ fn Host() -> Element {
                         .collect();
                     do_cmd(Command::ResolveGalleryPredictions {
                         actual_cast_out,
-                        actual_winners: gallery_winners(),
+                        actual_winner: gallery_winner(),
                     });
                 },
                 "Resolve Gallery"
