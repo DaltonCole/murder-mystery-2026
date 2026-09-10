@@ -117,14 +117,20 @@ pub struct GameState {
     /// (their one shot at that target has been spent), which is the actual
     /// balance tradeoff the ability makes.
     priest_protected_this_round: BTreeSet<PlayerId>,
-    /// Doctor/Medic: who's currently shielded from this round's Cast-Out
-    /// resolution, and who they protected last round (can't repeat a
-    /// target on consecutive rounds). `protected_last_round` is compared
-    /// by identity, not by round number -- it's overwritten every time the
-    /// Medic protects someone new, so two calls within the *same* round
-    /// would incorrectly self-block; callers only get one protect action
-    /// per round in practice (Round 1 has no Denouncement, so this never
-    /// actually collides), but see `medic_protect`'s own guard.
+    /// Doctor/Medic: who's currently shielded from the open Denouncement's
+    /// Cast-Out resolution, and who they protected at the *last*
+    /// Denouncement (can't repeat a target at two consecutive
+    /// Denouncements). Rotated in `close_denouncement`, not on
+    /// `AdvanceRound` -- see that function's doc comment for why "last
+    /// round" has to mean "last Denouncement" rather than "last calendar
+    /// round" (Round 4 has no Denouncement at all, so tying the rotation to
+    /// round-advancement would let it slip through unblocked between
+    /// Rounds 3 and 5). `medic_protected_last_round` is compared by
+    /// identity, not by round number -- it's overwritten every time the
+    /// Medic protects someone new, so two calls before the *same*
+    /// Denouncement closes would incorrectly self-block; callers only get
+    /// one protect action per Denouncement in practice, but see
+    /// `medic_protect`'s own guard.
     medic_protected_this_round: Option<PlayerId>,
     medic_protected_last_round: Option<PlayerId>,
     /// Bartender: who's currently drunk (cleared every `AdvanceRound`) and
@@ -146,11 +152,15 @@ pub struct GameState {
     firebrand_double_vote_used: bool,
 
     // --- Phase 2: Normal Uprising's reactive safety-net (rules.md §3.2) ---
-    /// Armed for the *current* Denouncement (declared proactively, before
-    /// the ballot closes -- Dalton's resolution of that ambiguity during
-    /// the original implementation planning), consumed the moment a
-    /// tally that used it actually resolves.
-    vote_shield_armed: Option<PlayerId>,
+    /// Everyone currently armed for the *current* Denouncement (declared
+    /// proactively, before the ballot closes -- Dalton's resolution of that
+    /// ambiguity during the original implementation planning), each
+    /// consumed the moment a tally that used it actually resolves. A set,
+    /// not a single slot: `NormalUprising` is deliberately *not*
+    /// unique (unlike every named Phase 2 character) -- a 20-30 player
+    /// game plausibly has several simultaneous holders, and each gets
+    /// their own independent once-per-game shield.
+    vote_shield_armed: BTreeSet<PlayerId>,
     vote_shield_used: BTreeSet<PlayerId>,
 
     // --- Phase 2: Cell Leader passive-knowledge (rules.md §3.2) ---
@@ -218,7 +228,7 @@ impl Default for GameState {
             magistrate_double_vote_used: false,
             firebrand_double_vote_armed: false,
             firebrand_double_vote_used: false,
-            vote_shield_armed: None,
+            vote_shield_armed: BTreeSet::new(),
             vote_shield_used: BTreeSet::new(),
             cell_leader_knows: Vec::new(),
             oracle_checks_available: 0,
@@ -358,7 +368,13 @@ impl GameState {
             Character::PriestPriestess => {
                 status.priest_protects_available = Some(self.priest_protects_available);
             }
-            Character::DoctorMedic => status.medic_available = Some(true),
+            Character::DoctorMedic => {
+                // Mirrors `medic_protect`'s own gate (an open Denouncement
+                // is required -- the ability only means anything relative
+                // to one) so a client's "can I act right now" reads the
+                // same real precondition the command itself enforces.
+                status.medic_available = Some(self.denouncement.is_some());
+            }
             Character::Bartender => {
                 status.bartender_available = Some(!self.bartender_used_this_round);
             }
@@ -391,17 +407,26 @@ impl GameState {
     }
 
     /// `viewer`'s fellow Cultists, if rules.md actually grants them that
-    /// passive knowledge (Cultist and Deceiver both do; the Cult Leader's
-    /// own row in rules.md's ability table lists no passive knowledge --
-    /// they already know who they've personally recruited via their own
-    /// `Convert` commands, so this deliberately isn't duplicated here for
-    /// them). Computed from current true-faction membership rather than a
-    /// stored list, since conversion can add new fellow Cultists mid-game.
+    /// passive knowledge -- every Cult-aligned player except the Cult
+    /// Leader (their own row in rules.md's ability table lists no passive
+    /// knowledge; they already know who they've personally recruited via
+    /// their own `Convert` commands, so this deliberately isn't duplicated
+    /// here for them). Keyed off `true_faction()` rather than `character`:
+    /// a converted player keeps their *original* character (rules.md
+    /// §3.3's "a converted player keeps their original character and
+    /// abilities" -- see `convert`'s doc comment), so a converted Oracle or
+    /// a converted Normal Ton member is just as much a real Cult member as
+    /// someone whose character literally is `Cultist`/`Deceiver`, and
+    /// should learn who their fellow cultists are the same way. Computed
+    /// live rather than a stored list, since conversion can add new fellow
+    /// Cultists mid-game.
     pub(crate) fn fellow_cultists_for(&self, viewer: PlayerId) -> Vec<PlayerId> {
-        let Some(character) = self.players.get(&viewer).and_then(|p| p.character) else {
+        let Some(viewer_player) = self.players.get(&viewer) else {
             return Vec::new();
         };
-        if !matches!(character, Character::Cultist | Character::Deceiver) {
+        if viewer_player.character == Some(Character::CultLeader)
+            || viewer_player.true_faction() != Faction::Cult
+        {
             return Vec::new();
         }
         self.players
@@ -415,6 +440,14 @@ impl GameState {
     /// `cell_leader_knows`'s doc comment.
     pub(crate) fn cell_leader_knows(&self) -> &[PlayerId] {
         &self.cell_leader_knows
+    }
+
+    /// Whether `viewer` is currently drunk (rules.md §3.2: "the target is
+    /// told if drunk" -- the Bartender themself is deliberately never told
+    /// whether it landed, so this is only ever exposed to the drunk player
+    /// about themselves, never to the Bartender or anyone else).
+    pub(crate) fn is_drunk(&self, viewer: PlayerId) -> bool {
+        self.drunk_this_round.contains(&viewer)
     }
 
     /// The faction a title's holder must belong to. Used to validate
@@ -474,12 +507,21 @@ impl GameState {
             .is_some_and(|p| p.status == PlayerStatus::Active)
     }
 
-    /// True if `id` doesn't already hold one of the four special titles.
-    /// Shared by every "is this candidate a legal replacement/successor"
-    /// check -- `first_eligible`'s own search and every caller-supplied
+    /// True if `id` holds only a generic catch-all character
+    /// (`NormalTon`/`NormalUprising`/`Cultist`) or none at all -- i.e. not
+    /// one of the four major titles *and* not any Phase 2 named role
+    /// either (Oracle, Priest/Priestess, Deceiver, ...). Shared by every
+    /// "is this candidate a legal replacement/successor" check --
+    /// `first_eligible`'s own search and every caller-supplied
     /// `fallback_replacement`/successor -- so a host mistake (e.g. handing
-    /// the crown to the sitting Prince/Princess) is rejected the same way
-    /// regardless of which path picked the candidate.
+    /// the crown to the sitting Prince/Princess, or to an Oracle) is
+    /// rejected the same way regardless of which path picked the
+    /// candidate. This deliberately means a King/Queen transfer or
+    /// Leader succession can never silently clobber a named-role holder's
+    /// character, even though rules.md's own transfer wording
+    /// ("overwriting any existing role") reads as if it might -- treated
+    /// as a safety choice worth keeping, not a rule this engine enforces
+    /// literally against its own ability-holders.
     fn is_untitled(&self, id: PlayerId) -> bool {
         self.players.get(&id).is_some_and(|p| {
             matches!(
@@ -571,7 +613,12 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             // window's size depends on `competing_player_count`, which
             // isn't affected by any of this -- ordering here is about
             // correctness of *these* resets, not the window calculation.
-            state.medic_protected_last_round = state.medic_protected_this_round.take();
+            //
+            // The Medic's last-protected-target tracking is deliberately
+            // NOT reset here -- see `close_denouncement`'s doc comment for
+            // why "consecutive rounds" actually means "consecutive
+            // Denouncements," which don't land on every calendar round
+            // (Round 4 is a contest round with no Denouncement at all).
             state.drunk_this_round.clear();
             state.bartender_used_this_round = false;
             state.priest_protected_this_round.clear();
@@ -677,7 +724,22 @@ fn assign_character(
         .get(&player)
         .ok_or(GameError::UnknownPlayer(player))?;
     if let Some(required) = GameState::required_faction(character) {
-        if p.faction != required {
+        // A secretly-recruited Cultist's *apparent* `faction` never changes
+        // (see `Player::true_faction`'s doc comment) -- only `true_faction`
+        // reflects their real Cult membership. Checking apparent faction
+        // for a Cult-required character would make it impossible for the
+        // Cult Leader to ever designate a recruited Cultist as Deceiver
+        // (rules.md §3.3: "as recruitment brings in new Cultists, the Cult
+        // Leader personally designates who holds each title... at the
+        // moment of recruitment or any point after"). Every other
+        // faction's characters are assigned before any conversion could
+        // apply to them, so this only changes behavior for the Cult case.
+        let actual = if required == Faction::Cult {
+            p.true_faction()
+        } else {
+            p.faction
+        };
+        if actual != required {
             return Err(GameError::WrongFactionForCharacter {
                 player,
                 character,
@@ -691,9 +753,19 @@ fn assign_character(
     // mistake -- without this check, a player could pick up a second
     // title (e.g. King/Queen after already being Prince/Princess) with the
     // old title slot (`state.prince_princess` here) left dangling, pointing
-    // at someone who no longer holds it.
+    // at someone who no longer holds it. The one exception: a generic
+    // catch-all (`NormalTon`/`NormalUprising`/`Cultist`) isn't a real title
+    // -- `convert()` stamps `Cultist` on every plain recruit automatically,
+    // and the Cult Leader must still be able to upgrade that recruit to a
+    // specific named role (Deceiver) afterward, the same way `is_untitled`
+    // already treats these three as "no title held" everywhere else.
     if let Some(existing) = p.character {
-        if existing != character {
+        if existing != character
+            && !matches!(
+                existing,
+                Character::NormalTon | Character::NormalUprising | Character::Cultist
+            )
+        {
             return Err(GameError::AlreadyHasCharacter {
                 player,
                 existing,
@@ -785,8 +857,10 @@ fn finalize_setup(state: &mut GameState) -> Vec<DomainEvent> {
 
 /// Converts `target` to secretly serve the Cult. Growing the Cult's ranks
 /// (a generic Ton/Uprising member) and flipping a titled royal are the same
-/// underlying operation -- see the doc comment on `Character::Cultist`.
-/// Converting the current King/Queen before they've used their transfer
+/// underlying operation: both keep their existing `character` (and thus
+/// their existing ability) exactly as rules.md §3.3 requires -- only their
+/// `converted` flag and true faction change. Converting the current
+/// King/Queen before they've used their transfer
 /// ability triggers the auto-cascade from rules.md §4.3: the title
 /// auto-transfers to a random remaining Ton player, and the Prince/Princess
 /// (if any, and still active) is converted too, staying in play as a secret
@@ -836,10 +910,16 @@ fn convert(
     {
         let p = state.players.get_mut(&target).unwrap();
         p.converted = true;
-        if matches!(
-            p.character,
-            None | Some(Character::NormalTon) | Some(Character::NormalUprising)
-        ) {
+        // rules.md §3.3: "a converted player keeps their original
+        // character and abilities" -- Phase 2 gave `NormalTon`/
+        // `NormalUprising` real, tracked abilities of their own (task
+        // auto-succeed, the vote-shield), so relabeling them `Cultist`
+        // here would silently take those away on conversion, exactly the
+        // bug this quote rules out. `Cultist` is now only ever stamped on
+        // a target with no character at all -- not a reachable case in
+        // practice once `FinalizeSetup` has run, but kept as a defensive
+        // fallback rather than leaving `character` as `None`.
+        if p.character.is_none() {
             p.character = Some(Character::Cultist);
         }
     }
@@ -1192,8 +1272,10 @@ fn cast_ballot(
 /// as a separate pass: a `Ballot::For` from the Magistrate/Firebrand while
 /// their double vote is armed counts as 2 (rules.md §5: "adds one extra
 /// vote to whichever single nominee that player supported"), and one vote
-/// against `vote_shield_armed`'s holder is negated (`saturating_sub` so a
-/// shield with zero votes against it doesn't underflow).
+/// against each currently-armed `vote_shield_armed` holder is negated
+/// (`saturating_sub` so a shield with zero votes against it doesn't
+/// underflow) -- every armed shield applies independently, since
+/// `NormalUprising` isn't unique and several players can hold one at once.
 fn tally_ballots(
     state: &GameState,
     candidates: &[PlayerId],
@@ -1207,12 +1289,33 @@ fn tally_ballots(
             }
         }
     }
-    if let Some(shielded) = state.vote_shield_armed {
-        if let Some(count) = tally.get_mut(&shielded) {
+    for shielded in &state.vote_shield_armed {
+        if let Some(count) = tally.get_mut(shielded) {
             *count = count.saturating_sub(1);
         }
     }
     tally
+}
+
+/// Closes out the current Denouncement, whatever its outcome (a clean
+/// resolve, a repeat-tie unfilled slot, or a Potion Maker blanket save) --
+/// the single place `close_ballot`/`close_runoff` clear `state.denouncement`.
+///
+/// Also rotates the Medic's "last protected target" here, at the
+/// Denouncement's actual close, rather than on every `AdvanceRound`.
+/// rules.md: "can't protect the same person in two consecutive rounds" --
+/// but the two mid-game Denouncement rounds (3 and 5) aren't consecutive
+/// *calendar* rounds, since Round 4 is a contest round with no Denouncement
+/// at all. Rotating on `AdvanceRound` would let Round 4's advance wipe
+/// Round 3's protected target before Round 5 ever checks it, silently
+/// defeating the restriction for the one pair of rounds it's actually meant
+/// to cover. Rotating here instead means "last round" really means "the
+/// last Denouncement," which is what the rule is actually protecting
+/// against; `.take()` still correctly clears the memory to `None` when the
+/// Medic didn't act at all this Denouncement.
+fn close_denouncement(state: &mut GameState) {
+    state.denouncement = None;
+    state.medic_protected_last_round = state.medic_protected_this_round.take();
 }
 
 fn close_ballot(
@@ -1240,7 +1343,7 @@ fn close_ballot(
     if state.potion_immunity_armed {
         state.potion_immunity_armed = false;
         state.potion_maker_used = true;
-        state.denouncement = None;
+        close_denouncement(state);
         return Ok(vec![DomainEvent::BallotClosed {
             cast_out: Vec::new(),
         }]);
@@ -1293,7 +1396,7 @@ fn close_ballot(
                 &cast_out,
             )?);
         }
-        state.denouncement = None;
+        close_denouncement(state);
     } else {
         let slots_remaining = slots - resolution.locked_in.len();
         let candidates = resolution.tied_for_last_slot;
@@ -1341,7 +1444,7 @@ fn close_runoff(
     if state.potion_immunity_armed {
         state.potion_immunity_armed = false;
         state.potion_maker_used = true;
-        state.denouncement = None;
+        close_denouncement(state);
         return Ok(vec![DomainEvent::RunoffClosed {
             cast_out: Vec::new(),
             unfilled_slot: false,
@@ -1393,7 +1496,7 @@ fn close_runoff(
             &cast_out,
         )?);
     }
-    state.denouncement = None;
+    close_denouncement(state);
     Ok(events)
 }
 
@@ -1506,7 +1609,13 @@ fn deliver_info_check(
     kind: InfoQueryKind,
     true_answer: InfoCheckAnswer,
 ) -> Vec<DomainEvent> {
-    let should_falsify = state.deceiver_armed && !state.deceiver_falsify_used;
+    // rules.md §3.3: "once per game, if targeted by another player's
+    // info-check ability... may force that check to return a false
+    // result" -- the Deceiver's falsify only fires on a check that
+    // actually targets *them*, not just the next check anyone performs
+    // against anyone.
+    let should_falsify =
+        state.deceiver_armed && !state.deceiver_falsify_used && state.deceiver_id() == Some(target);
     let answer = resolve_info_check(true_answer, should_falsify);
 
     let mut events = Vec::new();
@@ -1815,10 +1924,16 @@ fn activate_double_vote(
             state.firebrand_double_vote_armed = true;
         }
         _ => {
+            // Reports `Magistrate` even for a player who's neither --
+            // `NotCharacter` only carries one `required` character, and
+            // this command legitimately accepts two. Cosmetically
+            // incomplete (doesn't mention Firebrand as the other valid
+            // option) but not misleading: the player genuinely holds
+            // neither.
             return Err(GameError::NotCharacter {
                 player,
                 required: Character::Magistrate,
-            })
+            });
         }
     }
     Ok(vec![DomainEvent::DoubleVoteActivated {
@@ -1834,7 +1949,7 @@ fn arm_vote_shield(state: &mut GameState, player: PlayerId) -> Result<Vec<Domain
             character: Character::NormalUprising,
         });
     }
-    state.vote_shield_armed = Some(player);
+    state.vote_shield_armed.insert(player);
     Ok(vec![DomainEvent::VoteShieldArmed { player }])
 }
 
@@ -1853,7 +1968,7 @@ fn consume_vote_weight_arming(state: &mut GameState) {
         state.firebrand_double_vote_armed = false;
         state.firebrand_double_vote_used = true;
     }
-    if let Some(shielded) = state.vote_shield_armed.take() {
+    for shielded in std::mem::take(&mut state.vote_shield_armed) {
         state.vote_shield_used.insert(shielded);
     }
 }
@@ -2222,7 +2337,7 @@ mod tests {
     // --- Convert ---
 
     #[test]
-    fn convert_flips_a_generic_member_to_cultist() {
+    fn convert_keeps_a_generic_members_original_character_and_ability() {
         let (mut state, ..) = setup_full_game();
         let cult_leader = state.cult_leader().unwrap();
         let extra = add_player(&mut state, "Extra", Faction::Ton);
@@ -2240,7 +2355,11 @@ mod tests {
 
         let p = state.player(extra).unwrap();
         assert!(p.converted);
-        assert_eq!(p.character, Some(Character::Cultist));
+        // rules.md §3.3: "a converted player keeps their original
+        // character and abilities" -- a plain Normal Ton member keeps
+        // being a Normal Ton member (and keeps their real auto-succeed
+        // ability), rather than being relabeled `Cultist`.
+        assert_eq!(p.character, Some(Character::NormalTon));
         assert_eq!(
             p.faction,
             Faction::Ton,
@@ -4392,11 +4511,15 @@ mod tests {
     fn assign_character_rejects_giving_a_player_a_second_different_character() {
         let (mut state, ..) = setup_game_with_extra_voters(0);
         let extra = add_player(&mut state, "Extra", Faction::Ton);
+        // A genuine named role (not a generic catch-all) -- those are
+        // exempt from this check specifically so a converted Cultist can
+        // later be upgraded to the Deceiver, see `assign_character`'s
+        // catch-all doc comment.
         apply_command(
             &mut state,
             Command::AssignCharacter {
                 player: extra,
-                character: Character::NormalTon,
+                character: Character::Oracle,
             },
         )
         .unwrap();
@@ -4411,13 +4534,71 @@ mod tests {
             result,
             Err(GameError::AlreadyHasCharacter {
                 player: extra,
-                existing: Character::NormalTon,
+                existing: Character::Oracle,
                 requested: Character::KingQueen,
             })
         );
         // The old title slot must not have been touched by the rejected
         // attempt.
         assert_ne!(state.king_queen(), Some(extra));
+    }
+
+    #[test]
+    fn assign_character_allows_upgrading_a_generic_catch_all_to_a_named_role() {
+        // The Cult Leader designates the Deceiver among already-recruited
+        // Cultists "at the moment of recruitment or any point after"
+        // (rules.md §3.3) -- `convert()` stamps a plain recruit's
+        // character as `Cultist` (or leaves a named role's character
+        // alone), so `AssignCharacter` must still be able to upgrade a
+        // `Cultist`-labeled player to `Deceiver` afterward.
+        let (mut state, ..) = setup_full_game();
+        let cult_leader = state.cult_leader().unwrap();
+        let recruit = add_player(&mut state, "Recruit", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        grant_recruitment_slots(&mut state, 1);
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: recruit,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.player(recruit).unwrap().character,
+            Some(Character::NormalUprising),
+            "a converted Normal Uprising member keeps their own character"
+        );
+
+        // A plain (no prior character) recruit is the case that actually
+        // gets stamped `Cultist` -- exercise that path directly too.
+        let plain = add_player(&mut state, "Plain", Faction::Uprising);
+        grant_recruitment_slots(&mut state, 1);
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: plain,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.player(plain).unwrap().character,
+            Some(Character::Cultist)
+        );
+
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: plain,
+                character: Character::Deceiver,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.player(plain).unwrap().character,
+            Some(Character::Deceiver)
+        );
     }
 
     #[test]
@@ -4966,6 +5147,12 @@ mod tests {
 
     #[test]
     fn cult_leader_query_is_ton_aligned_reflects_true_faction_not_apparent() {
+        // Converting an *Uprising* target here would pass even if the
+        // implementation buggily read apparent `faction` instead of
+        // `true_faction()` -- Uprising is non-Ton either way. Converting a
+        // *Ton* target is the actually-discriminating case: apparent
+        // faction stays Ton, but true faction becomes Cult, so only a
+        // correct `true_faction()` read produces `false` here.
         let (mut state, p) = setup_phase2_game();
         state.cult_leader_queries_available = 1;
         grant_recruitment_slots(&mut state, 1);
@@ -4973,16 +5160,21 @@ mod tests {
             &mut state,
             Command::Convert {
                 converter: p.cult_leader,
-                target: p.leader,
+                target: p.oracle,
             },
         )
         .unwrap();
+        assert_eq!(
+            state.player(p.oracle).unwrap().faction,
+            Faction::Ton,
+            "apparent faction must still read Ton for this test to be discriminating"
+        );
 
         let events = apply_command(
             &mut state,
             Command::CultLeaderQuery {
                 player: p.cult_leader,
-                target: p.leader,
+                target: p.oracle,
                 kind: InfoQueryKind::IsTonAligned,
             },
         )
@@ -5051,7 +5243,7 @@ mod tests {
     }
 
     #[test]
-    fn deceiver_falsifies_the_next_info_check_once_armed_then_stops() {
+    fn deceiver_falsifies_a_check_that_targets_them_once_armed_then_stops() {
         let (mut state, p) = setup_phase2_game();
         state.oracle_checks_available = 1;
         apply_command(
@@ -5063,11 +5255,14 @@ mod tests {
         )
         .unwrap();
 
+        // rules.md §3.3: "if targeted by another player's info-check
+        // ability... may force that check to return a false result" -- the
+        // Oracle must actually target the Deceiver for this to fire.
         let events = apply_command(
             &mut state,
             Command::UseOracle {
                 player: p.oracle,
-                target: p.king_queen,
+                target: p.deceiver,
             },
         )
         .unwrap();
@@ -5084,6 +5279,9 @@ mod tests {
             .unwrap();
         match answer {
             InfoCheckAnswer::Dossier(d) => {
+                // The Deceiver in this fixture is Cult-faction from setup
+                // (never run through `Convert`), so their true `converted`
+                // is `false` -- falsifying should flip it to `true`.
                 assert!(d.converted, "falsified dossier should lie about conversion")
             }
             other => panic!("expected a Dossier, got {other:?}"),
@@ -5096,13 +5294,56 @@ mod tests {
             &mut state,
             Command::UseOracle {
                 player: p.oracle,
-                target: p.king_queen,
+                target: p.deceiver,
             },
         )
         .unwrap();
         assert!(!events2
             .iter()
             .any(|e| matches!(e, DomainEvent::CheckFalsifiedByDeceiver { .. })));
+    }
+
+    #[test]
+    fn deceiver_armed_does_not_falsify_a_check_against_an_unrelated_player() {
+        let (mut state, p) = setup_phase2_game();
+        state.oracle_checks_available = 1;
+        apply_command(
+            &mut state,
+            Command::SetDeceiverArmed {
+                player: p.deceiver,
+                armed: true,
+            },
+        )
+        .unwrap();
+
+        // The Deceiver is armed, but this check targets someone else
+        // entirely -- it must come back genuine, and the arm must stay
+        // unconsumed for a check that actually does target the Deceiver
+        // later.
+        let events = apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::CheckFalsifiedByDeceiver { .. })));
+        match events
+            .iter()
+            .find_map(|e| match e {
+                DomainEvent::InfoCheckDelivered { answer, .. } => Some(answer),
+                _ => None,
+            })
+            .unwrap()
+        {
+            InfoCheckAnswer::Dossier(d) => assert!(!d.converted),
+            other => panic!("expected a Dossier, got {other:?}"),
+        }
+        assert!(state.deceiver_armed, "arming must stay unconsumed");
+        assert!(!state.deceiver_falsify_used);
     }
 
     #[test]
@@ -5140,7 +5381,7 @@ mod tests {
             &mut state,
             Command::UseOracle {
                 player: p.oracle,
-                target: p.king_queen,
+                target: p.deceiver,
             },
         )
         .unwrap();
@@ -6090,7 +6331,7 @@ mod tests {
             "the shield should have reduced the tally to a 1-1 tie: {events:?}"
         );
         assert!(state.vote_shield_used.contains(&p.normal_uprising));
-        assert!(state.vote_shield_armed.is_none());
+        assert!(state.vote_shield_armed.is_empty());
     }
 
     #[test]
@@ -6257,5 +6498,374 @@ mod tests {
             ),
             "a second failure shouldn't also be auto-upgraded"
         );
+    }
+
+    // --- Regression coverage from the Phase 2 code review ---
+
+    #[test]
+    fn a_converted_normal_ton_member_keeps_their_auto_succeed_ability() {
+        let (mut state, p) = setup_phase2_game();
+        grant_recruitment_slots(&mut state, 1);
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: p.cult_leader,
+                target: p.normal_ton,
+            },
+        )
+        .unwrap();
+
+        let task_id = match apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "t".into(),
+                tier: TaskTier::Easy,
+                qualifying_players: BTreeSet::new(),
+            },
+        )
+        .unwrap()[0]
+        {
+            DomainEvent::TaskPushed { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let events = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: p.normal_ton,
+                task: task_id,
+                named: [p.oracle, p.almanac, p.priest],
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(events[0], DomainEvent::TaskAttempted { credited: true, .. }),
+            "a converted Normal Ton member must keep their real auto-succeed ability, per rules.md's \
+             \"a converted player keeps their original character and abilities\""
+        );
+    }
+
+    #[test]
+    fn a_converted_normal_uprising_member_keeps_their_vote_shield_ability() {
+        let (mut state, p) = setup_phase2_game();
+        grant_recruitment_slots(&mut state, 1);
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: p.cult_leader,
+                target: p.normal_uprising,
+            },
+        )
+        .unwrap();
+
+        apply_command(
+            &mut state,
+            Command::ArmVoteShield {
+                player: p.normal_uprising,
+            },
+        )
+        .unwrap();
+        assert!(state.vote_shield_armed.contains(&p.normal_uprising));
+    }
+
+    #[test]
+    fn fellow_cultists_includes_a_converted_named_role_member() {
+        let (mut state, p) = setup_phase2_game();
+        grant_recruitment_slots(&mut state, 2);
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: p.cult_leader,
+                target: p.oracle,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: p.cult_leader,
+                target: p.normal_ton,
+            },
+        )
+        .unwrap();
+
+        // A converted Oracle keeps their `Oracle` character label (see the
+        // two tests above) but is now a full member of the Cult's
+        // fellow-member network too -- `fellow_cultists_for` must key off
+        // true faction, not the (unchanged) character label.
+        let fellow = state.fellow_cultists_for(p.oracle);
+        assert!(fellow.contains(&p.normal_ton));
+        assert!(fellow.contains(&p.cult_leader));
+        assert!(!fellow.contains(&p.oracle));
+    }
+
+    #[test]
+    fn medic_consecutive_round_rule_survives_an_intervening_contest_round() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        assert_eq!(state.current_round(), Round::Three);
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::MedicProtect {
+                player: p.medic,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: p.oracle,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.medic_protected_last_round, Some(p.king_queen));
+
+        // Round 4 is a contest round with no Denouncement at all -- the
+        // rotation must NOT re-fire here (it's driven by a Denouncement
+        // actually closing, not by `AdvanceRound`), or it would wipe the
+        // memory of Round 3's protection before Round 5 ever checks it.
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Four
+        assert_eq!(state.medic_protected_last_round, Some(p.king_queen));
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Five
+        assert_eq!(state.current_round(), Round::Five);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::MedicProtect {
+                player: p.medic,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::CannotProtectSameTargetConsecutively(
+                p.king_queen
+            ))
+        );
+    }
+
+    #[test]
+    fn multiple_normal_uprising_players_can_each_arm_their_own_vote_shield() {
+        let (mut state, p) = setup_phase2_game();
+        let second_uprising = add_player(&mut state, "SecondUprising", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        assert_eq!(
+            state.player(second_uprising).unwrap().character,
+            Some(Character::NormalUprising)
+        );
+
+        apply_command(
+            &mut state,
+            Command::ArmVoteShield {
+                player: p.normal_uprising,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::ArmVoteShield {
+                player: second_uprising,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.normal_uprising,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: second_uprising,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        // One vote against each shielded candidate -- both should be fully
+        // negated since each holds their own independent shield, not one
+        // shared global slot.
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.normal_uprising),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.almanac,
+                ballot: Ballot::For(second_uprising),
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&events[0], DomainEvent::BallotClosed { cast_out } if cast_out.is_empty()),
+            "both votes should have been fully shielded: {events:?}"
+        );
+        assert!(state.vote_shield_used.contains(&p.normal_uprising));
+        assert!(state.vote_shield_used.contains(&second_uprising));
+        assert!(state.vote_shield_armed.is_empty());
+    }
+
+    #[test]
+    fn potion_immunity_leaves_an_armed_double_vote_unconsumed() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ActivateDoubleVote {
+                player: p.magistrate,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity {
+                player: p.potion_maker,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.magistrate,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            state.magistrate_double_vote_armed,
+            "a discarded tally never decided anything, so the double vote shouldn't be consumed"
+        );
+        assert!(!state.magistrate_double_vote_used);
+    }
+
+    #[test]
+    fn potion_immunity_leaves_an_armed_vote_shield_unconsumed() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ArmVoteShield {
+                player: p.normal_uprising,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity {
+                player: p.potion_maker,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.normal_uprising,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.normal_uprising),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert!(state.vote_shield_armed.contains(&p.normal_uprising));
+        assert!(!state.vote_shield_used.contains(&p.normal_uprising));
+    }
+
+    #[test]
+    fn info_checks_for_returns_every_check_delivered_to_that_querier_without_crosstalk() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::UseSpymaster {
+                player: p.spymaster,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+        state.oracle_checks_available = 1;
+        apply_command(
+            &mut state,
+            Command::UseOracle {
+                player: p.oracle,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+
+        let spymaster_checks = state.info_checks_for(p.spymaster);
+        assert_eq!(spymaster_checks.len(), 1);
+        assert_eq!(spymaster_checks[0].kind, InfoQueryKind::FactionColorOnly);
+
+        let oracle_checks = state.info_checks_for(p.oracle);
+        assert_eq!(oracle_checks.len(), 1);
+        assert_eq!(oracle_checks[0].kind, InfoQueryKind::FullHistory);
     }
 }

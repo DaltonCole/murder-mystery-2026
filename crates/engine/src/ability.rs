@@ -91,6 +91,18 @@ impl InfoCheckAnswer {
                 // rules.md never suggests those get faked too, and
                 // fabricating a whole fake character would need to invent
                 // data this engine has no basis for.
+                //
+                // Known residual limitation: this can only ever falsify a
+                // check against the Deceiver themself (see
+                // `state::deliver_info_check`), and the Deceiver's own
+                // `character` is fixed. If it's ever `Cultist` specifically
+                // -- only reachable via `convert`'s defensive `None`
+                // fallback, not the normal recruited-and-later-designated
+                // path -- flipping `converted` to `false` alongside
+                // `character: Cultist` would contradict this engine's own
+                // `Player::is_consistent` invariant, a theoretical tell not
+                // currently worth a deeper fix given how narrow the path to
+                // it is.
                 converted: !d.converted,
                 ..d.clone()
             }),

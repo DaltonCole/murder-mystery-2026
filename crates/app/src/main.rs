@@ -451,9 +451,16 @@ fn AbilityPanel(
                     }
                 },
                 Character::DoctorMedic => rsx! {
+                    p {
+                        if abilities.medic_available.unwrap_or(false) {
+                            "A Denouncement is open -- you can protect someone."
+                        } else {
+                            "No Denouncement is currently open."
+                        }
+                    }
                     {target_picker}
                     button {
-                        disabled: target().is_none(),
+                        disabled: !abilities.medic_available.unwrap_or(false) || target().is_none(),
                         onclick: move |_| {
                             let Some(t) = target() else { return };
                             on_command.call(Command::MedicProtect { player: my_id, target: PlayerId(t) });
@@ -530,7 +537,11 @@ fn describe_check(check: &InfoCheckDelivery, roster: &[RosterEntry]) -> String {
             d.apparent_faction, d.converted, d.character
         ),
         InfoCheckAnswer::Faction(f) => format!("{target}: faction color {f:?}"),
-        InfoCheckAnswer::Bool(b) => format!("{target}: {b}"),
+        // `kind` distinguishes the Cult Leader's two possible yes/no
+        // queries (IsTheLeader vs. IsTonAligned) -- without it, two
+        // queries against different players/questions would render as
+        // indistinguishable "Name: true/false" lines.
+        InfoCheckAnswer::Bool(b) => format!("{target} ({:?}): {b}", check.kind),
         InfoCheckAnswer::PlayerSet(set) => {
             format!("Definitely not the Leader: {}", names(set, roster))
         }

@@ -115,6 +115,11 @@ pub struct PlayerView {
     pub fellow_cultists: Vec<PlayerId>,
     /// The Cell Leader's passive knowledge -- empty for every other viewer.
     pub known_uprising_members: Vec<PlayerId>,
+    /// Whether the viewer is currently drunk (rules.md §3.2: "the target
+    /// is told if drunk"). Always `false` for Host/Display, and never
+    /// exposed for anyone but the viewer themselves -- the Bartender isn't
+    /// told whether their target actually landed drunk.
+    pub i_am_drunk: bool,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -198,6 +203,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         })
         .map(|_| state.cell_leader_knows().to_vec())
         .unwrap_or_default();
+    let i_am_drunk = viewer_id.is_some_and(|id| state.is_drunk(id));
 
     PlayerView {
         roster,
@@ -210,6 +216,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         my_info_checks,
         fellow_cultists,
         known_uprising_members,
+        i_am_drunk,
     }
 }
 
@@ -866,5 +873,61 @@ mod tests {
 
         let king_view = view_for(&state, Viewer::Player(king_queen));
         assert!(king_view.known_uprising_members.is_empty());
+    }
+
+    #[test]
+    fn drunk_status_is_told_only_to_the_drunk_player_themself() {
+        let mut state = GameState::new();
+        let new_player = |state: &mut GameState, name: &str, faction: Faction| -> PlayerId {
+            let events = apply_command(
+                state,
+                Command::AddPlayer {
+                    name: name.to_string(),
+                },
+            )
+            .unwrap();
+            let id = match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_command(
+                state,
+                Command::AssignFaction {
+                    player: id,
+                    faction,
+                },
+            )
+            .unwrap();
+            id
+        };
+
+        let bartender = new_player(&mut state, "Bartender", Faction::Uprising);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: bartender,
+                character: Character::Bartender,
+            },
+        )
+        .unwrap();
+        let target = new_player(&mut state, "Target", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        apply_command(
+            &mut state,
+            Command::BartenderTarget {
+                player: bartender,
+                target,
+                lands: true,
+            },
+        )
+        .unwrap();
+
+        assert!(view_for(&state, Viewer::Player(target)).i_am_drunk);
+        // Nobody else -- not the Bartender, not another player, not
+        // Host/Display -- ever sees this in their own view.
+        assert!(!view_for(&state, Viewer::Player(bartender)).i_am_drunk);
+        assert!(!view_for(&state, Viewer::Host).i_am_drunk);
+        assert!(!view_for(&state, Viewer::Display).i_am_drunk);
     }
 }

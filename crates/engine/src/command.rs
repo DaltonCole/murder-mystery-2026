@@ -27,11 +27,24 @@ pub enum Command {
     /// one faction, once) stays the same.
     AssignFaction { player: PlayerId, faction: Faction },
 
-    /// Setup-only: assigns one of the four named titles (King/Queen,
-    /// Prince/Princess, Revolutionary Leader, Cult Leader) to a player.
-    /// Rejects a player whose faction doesn't match the title, and rejects
-    /// assigning a title that's already held by someone else. Everyone else
-    /// gets a catch-all character from [`Command::FinalizeSetup`], not this.
+    /// Assigns a named character to a player -- the four major titles
+    /// (King/Queen, Prince/Princess, Revolutionary Leader, Cult Leader)
+    /// during setup, but also every Phase 2 named role (Oracle, Deceiver,
+    /// ...), including *mid-game*: rules.md §3.3 has the Cult Leader
+    /// designate which recruited Cultist holds the Deceiver title "at the
+    /// moment of recruitment or any point after," so this command must
+    /// stay usable after setup too, not just during it. Rejects a player
+    /// whose faction doesn't match the character (checked against
+    /// `true_faction()` for a Cult-required character, so a secretly
+    /// recruited Cultist qualifies even though their apparent faction
+    /// never changes), and rejects a character that's already held by
+    /// someone else. A generic catch-all (`NormalTon`/`NormalUprising`/
+    /// `Cultist`) already assigned to the player -- whether by
+    /// [`Command::FinalizeSetup`] or by `Convert`'s own auto-stamp -- can
+    /// always be upgraded to a specific named role; any other existing
+    /// character is a hard rejection. Everyone who ends setup with no
+    /// character at all gets a catch-all from
+    /// [`Command::FinalizeSetup`], not this.
     AssignCharacter {
         player: PlayerId,
         character: Character,

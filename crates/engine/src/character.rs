@@ -58,7 +58,15 @@ pub enum Character {
     /// Cult, falsify pipeline: once per game (if armed), forces an
     /// info-check that targets them to return a false result.
     Deceiver,
-
+    // Deliberately no `Whisperer` variant yet, even though rules.md §3.3
+    // pairs it with `Deceiver` as the other Cult Leader-designated title
+    // ("may shield one named fellow Cultist from being a valid nomination
+    // target for one round"). Its ability is a Denouncement-*procedure*
+    // modifier -- shaped exactly like the Duelist's "guarantee a ballot
+    // spot" and the Agitator's "redirect discussion," both explicitly
+    // Phase 3 scope (`ProcedureEffect` in the implementation plan) -- so
+    // it belongs with that batch, not this one, despite rules.md grouping
+    // it with the Cult section.
     /// The full 23-character roster lands across Phase 2/3 per the
     /// implementation plan -- everyone on the Ton side without one of the
     /// named roles above is this catch-all for now, matching rules.md's own
