@@ -4,6 +4,7 @@ use crate::contest::ContestCategory;
 use crate::denouncement::Ballot;
 use crate::player::{Faction, PlayerId};
 use crate::round::Round;
+use crate::servant::GalleryPrediction;
 use crate::task::{TaskId, TaskTier};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -341,4 +342,40 @@ pub enum Command {
     /// reasoning behind `CastOut`'s `fallback_replacement`); every name in
     /// it must have actually opted in and still be active. Once per game.
     DrawIntermissionEntrants { selected: Vec<PlayerId> },
+
+    // --- Phase 3: Servant leaderboard + Gallery (rules.md §7) ---
+    /// Awards Servant leaderboard points to `player` -- host-recorded, the
+    /// same "objective fact the host records" shape as
+    /// `RecordContestResult`. Eligible only for someone currently
+    /// operating as a Servant: either literally `Faction::Servant`, or any
+    /// already-Cast-Out player (rules.md §5: "operationally, for the rest
+    /// of the game they participate alongside the Servants"). What
+    /// specifically earns points (zone scorekeeping, trivia, a minigame)
+    /// isn't specified by rules.md and isn't this engine's concern -- it
+    /// just tracks the running total.
+    AwardServantPoints { player: PlayerId, points: u32 },
+
+    /// A Cast-Out player's private Gallery prediction (rules.md §7: "who
+    /// gets Cast Out, or which faction ultimately wins"), submitted while
+    /// the Last Denouncement (the Finale) has an open Denouncement --
+    /// "before the Last Denouncement's ballot closes." Rejected for anyone
+    /// not currently Cast Out -- a late-arrival Servant doesn't get a
+    /// Gallery prediction, only someone who was actually voted out.
+    SubmitGalleryPrediction {
+        player: PlayerId,
+        prediction: GalleryPrediction,
+    },
+
+    /// Scores every submitted Gallery prediction against the actual
+    /// finale outcome, awarding one Servant leaderboard point per correct
+    /// guess (rules.md §7: "scored against the Servant leaderboard" --
+    /// the point value itself isn't specified, so this engine uses a
+    /// simple flat award). `actual_cast_out` is whoever the Last
+    /// Denouncement actually resolved; a `CastOutIs` prediction is correct
+    /// if its name is anywhere in that set (a multi-slot Finale can Cast
+    /// Out more than one person). Once per game.
+    ResolveGalleryPredictions {
+        actual_cast_out: Vec<PlayerId>,
+        actual_winner: Faction,
+    },
 }

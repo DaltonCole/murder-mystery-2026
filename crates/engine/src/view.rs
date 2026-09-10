@@ -138,6 +138,11 @@ pub struct PlayerView {
     /// frames the draw as a live, shared party moment), so every viewer
     /// kind gets the same answer.
     pub intermission_entrants: Option<Vec<PlayerId>>,
+    /// The Servant leaderboard (rules.md §5/§7), highest-first -- public
+    /// to every viewer kind, unlike anything faction/character related.
+    /// Gallery predictions themselves are never exposed here or anywhere
+    /// else -- only the resulting point awards, once resolved.
+    pub servant_leaderboard: Vec<(PlayerId, u32)>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -245,6 +250,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         revealed_leader,
         i_opted_into_intermission,
         intermission_entrants,
+        servant_leaderboard: state.servant_leaderboard(),
     }
 }
 
@@ -1137,5 +1143,54 @@ mod tests {
             view_for(&state, Viewer::Display).intermission_entrants,
             expected
         );
+    }
+
+    #[test]
+    fn servant_leaderboard_is_public_but_never_leaks_gallery_predictions() {
+        let mut state = GameState::new();
+        apply_command(
+            &mut state,
+            Command::AddPlayer {
+                name: "Servant".into(),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: PlayerId(0),
+                faction: Faction::Servant,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(
+            &mut state,
+            Command::AwardServantPoints {
+                player: PlayerId(0),
+                points: 4,
+            },
+        )
+        .unwrap();
+
+        let expected = vec![(PlayerId(0), 4)];
+        // The leaderboard is the same for every viewer kind -- it's a
+        // public party-game score, not a faction/character secret.
+        assert_eq!(
+            view_for(&state, Viewer::Player(PlayerId(0))).servant_leaderboard,
+            expected
+        );
+        assert_eq!(view_for(&state, Viewer::Host).servant_leaderboard, expected);
+        assert_eq!(
+            view_for(&state, Viewer::Display).servant_leaderboard,
+            expected
+        );
+
+        // No `PlayerView` field anywhere exposes a Gallery prediction's
+        // actual content -- belt-and-suspenders check across every field
+        // name on the type via serialization.
+        let serialized = serde_json::to_string(&view_for(&state, Viewer::Host)).unwrap();
+        assert!(!serialized.contains("CastOutIs"));
+        assert!(!serialized.contains("FactionWins"));
     }
 }

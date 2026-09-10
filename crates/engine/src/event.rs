@@ -8,6 +8,10 @@ use crate::task::{TaskId, TaskTier};
 use crate::win_condition::CultPath;
 use serde::{Deserialize, Serialize};
 
+// `GalleryPrediction` is deliberately NOT imported/used here -- the actual
+// prediction content is private and never enters the event log, only
+// `state::gallery_predictions`. See `GalleryPredictionSubmitted` below.
+
 /// The read-side record of everything that has happened. `apply_command`
 /// returns the events a command produced; `GameState` keeps an append-only
 /// log of all of them.
@@ -255,5 +259,17 @@ pub enum DomainEvent {
     },
     IntermissionEntrantsDrawn {
         entrants: Vec<PlayerId>,
+    },
+
+    // --- Phase 3: Servant leaderboard + Gallery ---
+    ServantPointsAwarded {
+        player: PlayerId,
+        points: u32,
+        total: u32,
+    },
+    /// Deliberately never carries the prediction itself -- see the module
+    /// doc note above `Command`'s Gallery variants.
+    GalleryPredictionSubmitted {
+        player: PlayerId,
     },
 }

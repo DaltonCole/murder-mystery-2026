@@ -156,4 +156,18 @@ pub enum GameError {
 
     #[error("duplicate Intermission entrant {0:?}")]
     DuplicateIntermissionEntrant(PlayerId),
+
+    #[error(
+        "player {0:?} isn't currently a Servant (must be Faction::Servant, or already Cast Out)"
+    )]
+    NotAServant(PlayerId),
+
+    #[error("player {0:?} must be Cast Out to submit a Gallery prediction")]
+    MustBeCastOutForGallery(PlayerId),
+
+    #[error("Gallery predictions can only be submitted while the Last Denouncement is open")]
+    GalleryPredictionWindowClosed,
+
+    #[error("Gallery predictions have already been resolved")]
+    GalleryAlreadyResolved,
 }

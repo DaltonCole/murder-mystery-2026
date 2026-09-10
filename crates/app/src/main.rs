@@ -53,8 +53,8 @@ use dioxus::prelude::*;
 use engine::DomainEvent;
 use engine::{
     AbilityStatus, Ballot, Character, Command, ContestCategory, DenouncementView, Faction,
-    InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind, PlayerId, PlayerStatus, PlayerView,
-    RosterEntry, Round, TaskTier, TaskView, Viewer,
+    GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind, PlayerId, PlayerStatus,
+    PlayerView, RosterEntry, Round, TaskTier, TaskView, Viewer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -215,6 +215,9 @@ fn Play() -> Element {
         });
     };
 
+    let mut gallery_pick = use_signal(|| None::<u32>);
+    let mut gallery_faction_pick = use_signal(|| None::<Faction>);
+
     let mut do_join = move || {
         let name = name_draft.peek().trim().to_string();
         if name.is_empty() {
@@ -282,6 +285,65 @@ fn Play() -> Element {
                 button {
                     onclick: move |_| send_cmd(Command::OptIntoIntermission { player: id }),
                     "Opt into the Intermission lottery",
+                }
+            }
+        }
+        if v.roster.iter().any(|r| r.id == id && r.status == PlayerStatus::CastOut) {
+            div {
+                h4 { "The Gallery" }
+                p { "Predict who gets Cast Out, or which faction wins -- scored against the Servant leaderboard once the Finale resolves." }
+                select {
+                    onchange: move |e| gallery_pick.set(e.value().parse().ok()),
+                    option { value: "", "-- who gets Cast Out? --" }
+                    for r in v.roster.iter().filter(|r| r.status == PlayerStatus::Active) {
+                        option { value: "{r.id.0}", "{r.name}" }
+                    }
+                }
+                button {
+                    disabled: gallery_pick().is_none(),
+                    onclick: move |_| {
+                        let Some(t) = gallery_pick() else { return };
+                        send_cmd(Command::SubmitGalleryPrediction {
+                            player: id,
+                            prediction: GalleryPrediction::CastOutIs(PlayerId(t)),
+                        });
+                    },
+                    "Predict this Cast-Out",
+                }
+                select {
+                    onchange: move |e| {
+                        gallery_faction_pick.set(match e.value().as_str() {
+                            "Ton" => Some(Faction::Ton),
+                            "Uprising" => Some(Faction::Uprising),
+                            "Cult" => Some(Faction::Cult),
+                            _ => None,
+                        });
+                    },
+                    option { value: "", "-- who wins? --" }
+                    option { value: "Ton", "Ton" }
+                    option { value: "Uprising", "Uprising" }
+                    option { value: "Cult", "Cult" }
+                }
+                button {
+                    disabled: gallery_faction_pick().is_none(),
+                    onclick: move |_| {
+                        let Some(f) = gallery_faction_pick() else { return };
+                        send_cmd(Command::SubmitGalleryPrediction {
+                            player: id,
+                            prediction: GalleryPrediction::FactionWins(f),
+                        });
+                    },
+                    "Predict this winner",
+                }
+            }
+        }
+        if !v.servant_leaderboard.is_empty() {
+            div {
+                h4 { "Servant leaderboard" }
+                ul {
+                    for (pid , points) in v.servant_leaderboard.clone() {
+                        li { key: "{pid.0}", "{names(&[pid], &v.roster)}: {points}" }
+                    }
                 }
             }
         }
@@ -813,6 +875,10 @@ fn Host() -> Element {
     let mut contest_category = use_signal(|| ContestCategory::Strength);
     let mut contest_ton_won = use_signal(|| true);
     let mut intermission_selected = use_signal(String::new);
+    let mut servant_award_player = use_signal(|| None::<u32>);
+    let mut servant_award_points = use_signal(|| 1u32);
+    let mut gallery_cast_out = use_signal(String::new);
+    let mut gallery_winner = use_signal(|| Faction::Ton);
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
 
@@ -1062,6 +1128,74 @@ fn Host() -> Element {
                     intermission_selected.set(String::new());
                 },
                 "Draw entrants"
+            }
+        }
+        div {
+            h3 { "Servant leaderboard" }
+            p { "Any Servant, or any already-Cast-Out player, is eligible. What earns points (zone scorekeeping, trivia, a minigame) is up to you -- the app just tracks the running total." }
+            select {
+                onchange: move |e| servant_award_player.set(e.value().parse().ok()),
+                option { value: "", "-- player --" }
+                for r in roster.clone() {
+                    option { value: "{r.id.0}", "{r.name}" }
+                }
+            }
+            input {
+                r#type: "number",
+                min: "1",
+                value: "{servant_award_points}",
+                oninput: move |e| {
+                    if let Ok(v) = e.value().parse() {
+                        servant_award_points.set(v);
+                    }
+                },
+            }
+            button {
+                disabled: servant_award_player().is_none(),
+                onclick: move |_| {
+                    let Some(player) = servant_award_player() else { return };
+                    do_cmd(Command::AwardServantPoints {
+                        player: PlayerId(player),
+                        points: servant_award_points(),
+                    });
+                },
+                "Award points"
+            }
+        }
+        div {
+            h3 { "Gallery resolution" }
+            p { "Once at the Finale: score every submitted Gallery prediction against the real outcome." }
+            input {
+                placeholder: "actual Cast-Out IDs, e.g. 2,5",
+                value: "{gallery_cast_out}",
+                oninput: move |e| gallery_cast_out.set(e.value()),
+            }
+            select {
+                onchange: move |e| {
+                    gallery_winner.set(match e.value().as_str() {
+                        "Uprising" => Faction::Uprising,
+                        "Cult" => Faction::Cult,
+                        _ => Faction::Ton,
+                    });
+                },
+                option { value: "Ton", "Ton wins" }
+                option { value: "Uprising", "Uprising wins" }
+                option { value: "Cult", "Cult wins" }
+            }
+            button {
+                onclick: move |_| {
+                    let actual_cast_out: Vec<PlayerId> = gallery_cast_out
+                        .peek()
+                        .split(',')
+                        .filter_map(|s| s.trim().parse::<u32>().ok())
+                        .map(PlayerId)
+                        .collect();
+                    do_cmd(Command::ResolveGalleryPredictions {
+                        actual_cast_out,
+                        actual_winner: gallery_winner(),
+                    });
+                },
+                "Resolve Gallery"
             }
         }
         RosterList { roster }

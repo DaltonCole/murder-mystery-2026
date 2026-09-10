@@ -198,6 +198,17 @@ pub struct GameState {
     /// `None` until `DrawIntermissionEntrants` runs -- once per game.
     intermission_entrants: Option<Vec<PlayerId>>,
 
+    // --- Phase 3: Servant leaderboard + Gallery (rules.md §7) ---
+    /// A running total per player -- a "leaderboard" in the rules.md sense
+    /// is public once it exists, unlike everything faction/character
+    /// related, so `view_for` exposes this to every viewer kind.
+    servant_points: BTreeMap<PlayerId, u32>,
+    /// Never exposed through `view_for` at all -- private until
+    /// `resolve_gallery_predictions` scores it, and even then only the
+    /// resulting point award is visible, never the prediction itself.
+    gallery_predictions: BTreeMap<PlayerId, crate::servant::GalleryPrediction>,
+    gallery_resolved: bool,
+
     // --- Phase 2: Cell Leader passive-knowledge (rules.md §3.2) ---
     /// Computed once, automatically, at `FinalizeSetup` -- starting
     /// knowledge, not something anyone activates.
@@ -274,6 +285,9 @@ impl Default for GameState {
             leader_known_by: BTreeSet::new(),
             intermission_opt_ins: BTreeSet::new(),
             intermission_entrants: None,
+            servant_points: BTreeMap::new(),
+            gallery_predictions: BTreeMap::new(),
+            gallery_resolved: false,
             cell_leader_knows: Vec::new(),
             oracle_checks_available: 0,
             almanac_used: false,
@@ -531,6 +545,19 @@ impl GameState {
     /// opt-in pool itself (which stays private to each opted-in player).
     pub(crate) fn intermission_entrants(&self) -> Option<&[PlayerId]> {
         self.intermission_entrants.as_deref()
+    }
+
+    /// The Servant leaderboard (rules.md §5/§7), sorted highest-first --
+    /// public to every viewer, unlike anything faction/character related.
+    /// Ties break by `PlayerId` for a stable, deterministic order.
+    pub(crate) fn servant_leaderboard(&self) -> Vec<(PlayerId, u32)> {
+        let mut board: Vec<(PlayerId, u32)> = self
+            .servant_points
+            .iter()
+            .map(|(&id, &pts)| (id, pts))
+            .collect();
+        board.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        board
     }
 
     /// The faction a title's holder must belong to. Used to validate
@@ -809,6 +836,17 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
         Command::DrawIntermissionEntrants { selected } => {
             draw_intermission_entrants(state, selected)?
         }
+
+        Command::AwardServantPoints { player, points } => {
+            award_servant_points(state, player, points)?
+        }
+        Command::SubmitGalleryPrediction { player, prediction } => {
+            submit_gallery_prediction(state, player, prediction)?
+        }
+        Command::ResolveGalleryPredictions {
+            actual_cast_out,
+            actual_winner,
+        } => resolve_gallery_predictions(state, actual_cast_out, actual_winner)?,
     };
 
     state.event_log.extend(events.clone());
@@ -1809,6 +1847,94 @@ fn draw_intermission_entrants(
     Ok(vec![DomainEvent::IntermissionEntrantsDrawn {
         entrants: selected,
     }])
+}
+
+/// True for anyone currently "operating as a Servant" (rules.md §5/§7):
+/// a literal late-arrival `Faction::Servant` player, or any already-Cast-Out
+/// competing player.
+fn is_servant(player: &Player) -> bool {
+    player.faction == Faction::Servant || player.status == PlayerStatus::CastOut
+}
+
+fn award_servant_points(
+    state: &mut GameState,
+    player: PlayerId,
+    points: u32,
+) -> Result<Vec<DomainEvent>, GameError> {
+    let p = state
+        .players
+        .get(&player)
+        .ok_or(GameError::UnknownPlayer(player))?;
+    if !is_servant(p) {
+        return Err(GameError::NotAServant(player));
+    }
+    let total = state.servant_points.entry(player).or_insert(0);
+    *total += points;
+    let total = *total;
+    Ok(vec![DomainEvent::ServantPointsAwarded {
+        player,
+        points,
+        total,
+    }])
+}
+
+/// Records `player`'s private Gallery prediction (rules.md §7). Requires
+/// the player to be Cast Out specifically (narrower than the general
+/// Servant eligibility above -- a late-arrival Servant never got a chance
+/// to be voted out, so they don't get a Gallery prediction either) and the
+/// Last Denouncement to currently be open. Re-submitting before resolution
+/// silently replaces the earlier choice, the same "standing choice"
+/// treatment as `Nominate`/`CastBallot`.
+fn submit_gallery_prediction(
+    state: &mut GameState,
+    player: PlayerId,
+    prediction: crate::servant::GalleryPrediction,
+) -> Result<Vec<DomainEvent>, GameError> {
+    let p = state
+        .players
+        .get(&player)
+        .ok_or(GameError::UnknownPlayer(player))?;
+    if p.status != PlayerStatus::CastOut {
+        return Err(GameError::MustBeCastOutForGallery(player));
+    }
+    if state.current_round != Round::Finale || state.denouncement.is_none() {
+        return Err(GameError::GalleryPredictionWindowClosed);
+    }
+
+    state.gallery_predictions.insert(player, prediction);
+    Ok(vec![DomainEvent::GalleryPredictionSubmitted { player }])
+}
+
+/// Scores every submitted Gallery prediction against the real finale
+/// outcome (rules.md §7), awarding one Servant leaderboard point per
+/// correct guess. Once per game -- see `Command::ResolveGalleryPredictions`.
+fn resolve_gallery_predictions(
+    state: &mut GameState,
+    actual_cast_out: Vec<PlayerId>,
+    actual_winner: Faction,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if state.gallery_resolved {
+        return Err(GameError::GalleryAlreadyResolved);
+    }
+    state.gallery_resolved = true;
+
+    let mut events = Vec::new();
+    for (&player, prediction) in state.gallery_predictions.clone().iter() {
+        let correct = match prediction {
+            crate::servant::GalleryPrediction::CastOutIs(id) => actual_cast_out.contains(id),
+            crate::servant::GalleryPrediction::FactionWins(f) => *f == actual_winner,
+        };
+        if correct {
+            let total = state.servant_points.entry(player).or_insert(0);
+            *total += 1;
+            events.push(DomainEvent::ServantPointsAwarded {
+                player,
+                points: 1,
+                total: *total,
+            });
+        }
+    }
+    Ok(events)
 }
 
 fn attempt_task(
@@ -8433,5 +8559,243 @@ mod tests {
             },
         );
         assert_eq!(result, Err(GameError::IntermissionAlreadyDrawn));
+    }
+
+    // --- Phase 3: Servant leaderboard + Gallery ---
+
+    #[test]
+    fn award_servant_points_rejects_a_non_servant() {
+        let mut state = GameState::new();
+        let player = add_player(&mut state, "Player", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AwardServantPoints { player, points: 5 },
+        );
+        assert_eq!(result, Err(GameError::NotAServant(player)));
+    }
+
+    #[test]
+    fn award_servant_points_succeeds_for_a_late_arrival_servant() {
+        let mut state = GameState::new();
+        let player = add_player(&mut state, "Servant", Faction::Servant);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        let events = apply_command(
+            &mut state,
+            Command::AwardServantPoints { player, points: 3 },
+        )
+        .unwrap();
+        assert!(matches!(
+            &events[0],
+            DomainEvent::ServantPointsAwarded { player: p, points: 3, total: 3 } if *p == player
+        ));
+    }
+
+    #[test]
+    fn award_servant_points_succeeds_for_a_cast_out_player() {
+        let mut state = GameState::new();
+        let player = add_player(&mut state, "Player", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let events = apply_command(
+            &mut state,
+            Command::AwardServantPoints { player, points: 2 },
+        )
+        .unwrap();
+        assert!(matches!(
+            &events[0],
+            DomainEvent::ServantPointsAwarded { .. }
+        ));
+    }
+
+    #[test]
+    fn award_servant_points_accumulates_across_multiple_awards() {
+        let mut state = GameState::new();
+        let player = add_player(&mut state, "Servant", Faction::Servant);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(
+            &mut state,
+            Command::AwardServantPoints { player, points: 2 },
+        )
+        .unwrap();
+        let events = apply_command(
+            &mut state,
+            Command::AwardServantPoints { player, points: 3 },
+        )
+        .unwrap();
+        assert!(matches!(
+            &events[0],
+            DomainEvent::ServantPointsAwarded { total: 5, .. }
+        ));
+        assert_eq!(state.servant_leaderboard(), vec![(player, 5)]);
+    }
+
+    fn setup_at_finale_with_open_denouncement() -> (GameState, PlayerId) {
+        let mut state = GameState::new();
+        let cast_out_player = add_player(&mut state, "CastOut", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: cast_out_player,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        for _ in 0..5 {
+            apply_command(&mut state, Command::AdvanceRound).unwrap();
+        }
+        assert_eq!(state.current_round(), Round::Finale);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        (state, cast_out_player)
+    }
+
+    #[test]
+    fn submit_gallery_prediction_rejects_a_non_cast_out_player() {
+        let (mut state, _) = setup_at_finale_with_open_denouncement();
+        let active_player = add_player(&mut state, "Active", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::SubmitGalleryPrediction {
+                player: active_player,
+                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Ton),
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::MustBeCastOutForGallery(active_player))
+        );
+    }
+
+    #[test]
+    fn submit_gallery_prediction_rejects_outside_the_last_denouncement() {
+        let mut state = GameState::new();
+        let player = add_player(&mut state, "Player", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::SubmitGalleryPrediction {
+                player,
+                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Ton),
+            },
+        );
+        assert_eq!(result, Err(GameError::GalleryPredictionWindowClosed));
+    }
+
+    #[test]
+    fn submit_gallery_prediction_succeeds_and_can_be_replaced() {
+        let (mut state, cast_out_player) = setup_at_finale_with_open_denouncement();
+        apply_command(
+            &mut state,
+            Command::SubmitGalleryPrediction {
+                player: cast_out_player,
+                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Ton),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitGalleryPrediction {
+                player: cast_out_player,
+                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Uprising),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.gallery_predictions.get(&cast_out_player),
+            Some(&crate::servant::GalleryPrediction::FactionWins(
+                Faction::Uprising
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_gallery_predictions_awards_correct_predictions_only() {
+        let (mut state, cast_out_a) = setup_at_finale_with_open_denouncement();
+        let cast_out_b = add_player(&mut state, "CastOutB", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: cast_out_b,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let target = add_player(&mut state, "Target", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        apply_command(
+            &mut state,
+            Command::SubmitGalleryPrediction {
+                player: cast_out_a,
+                prediction: crate::servant::GalleryPrediction::CastOutIs(target),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitGalleryPrediction {
+                player: cast_out_b,
+                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Uprising),
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::ResolveGalleryPredictions {
+                actual_cast_out: vec![target],
+                actual_winner: Faction::Ton,
+            },
+        )
+        .unwrap();
+
+        // cast_out_a correctly predicted the actual cast-out; cast_out_b
+        // incorrectly predicted Uprising when Ton actually won.
+        assert!(events.iter().any(
+            |e| matches!(e, DomainEvent::ServantPointsAwarded { player, .. } if *player == cast_out_a)
+        ));
+        assert!(!events.iter().any(
+            |e| matches!(e, DomainEvent::ServantPointsAwarded { player, .. } if *player == cast_out_b)
+        ));
+        assert_eq!(state.servant_leaderboard(), vec![(cast_out_a, 1)]);
+    }
+
+    #[test]
+    fn resolve_gallery_predictions_rejects_reuse() {
+        let (mut state, _) = setup_at_finale_with_open_denouncement();
+        apply_command(
+            &mut state,
+            Command::ResolveGalleryPredictions {
+                actual_cast_out: vec![],
+                actual_winner: Faction::Ton,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::ResolveGalleryPredictions {
+                actual_cast_out: vec![],
+                actual_winner: Faction::Ton,
+            },
+        );
+        assert_eq!(result, Err(GameError::GalleryAlreadyResolved));
     }
 }
