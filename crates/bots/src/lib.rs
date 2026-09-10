@@ -29,13 +29,21 @@ pub use host::{HostDriver, Roles};
 pub use player_bot::PlayerBot;
 pub use protocol::{ClientMsg, Conn, ConnError, ServerMsg};
 
-use engine::{PlayerStatus, RosterEntry, Round};
+use engine::{Faction, PlayerId, PlayerStatus, RosterEntry, Round};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct GameSummary {
     pub final_round: Round,
     pub final_roster: Vec<RosterEntry>,
     pub cast_out_count: usize,
+    /// The one faction `win_condition::evaluate` found winning once the
+    /// Finale's Denouncement closed -- `None` covers both "the Host's view
+    /// hadn't caught up yet" and the rare legitimate case rules.md's own
+    /// conditions allow where nobody's condition was actually met (see
+    /// `HostDriver::resolve_gallery_predictions`'s doc comment).
+    pub winner: Option<Faction>,
 }
 
 /// Runs one entire game end to end against `url` (a real, already-running
@@ -59,13 +67,19 @@ pub async fn run_full_automated_game(
     seed: u64,
     phase_wait: Duration,
 ) -> Result<GameSummary, ConnError> {
+    // Shared with every bot and read by `HostDriver::draw_intermission_entrants`
+    // -- see that method's doc comment for why the Intermission opt-in pool
+    // can't just be read back off the wire the way everything else is.
+    let intermission_pool: Arc<Mutex<BTreeSet<PlayerId>>> = Arc::new(Mutex::new(BTreeSet::new()));
+
     let mut handles = Vec::with_capacity(player_count);
     for i in 0..player_count {
         let url = url.to_string();
         let name = format!("Bot{i}");
         let bot_seed = seed.wrapping_add(i as u64 * 7_919 + 1);
+        let pool = Arc::clone(&intermission_pool);
         handles.push(tokio::spawn(async move {
-            let bot = PlayerBot::join(&url, &name, bot_seed).await?;
+            let bot = PlayerBot::join(&url, &name, bot_seed, pool).await?;
             bot.run().await
         }));
     }
@@ -74,19 +88,42 @@ pub async fn run_full_automated_game(
     let roster = host
         .wait_for_roster(player_count, Duration::from_secs(15))
         .await?;
-    host.setup_game(&roster, seed).await?;
+    let roles = host.setup_game(&roster, seed).await?;
     host.run_round_one_tasks(&roster, seed, phase_wait).await?;
+    // The literal late-arrival Servants earn their first point right away
+    // -- see `Roles::servants`'s doc comment on why the Host has to track
+    // this itself rather than reading it back from `PlayerView`.
+    host.award_servant_points(roles.servants.iter().copied())
+        .await?;
 
     host.advance_round_to(Round::Two).await?;
+    host.record_contest_results_for_round(Round::Two, seed)
+        .await?;
+    host.draw_intermission_entrants(&intermission_pool, seed)
+        .await?;
+
     host.advance_round_to(Round::Three).await?;
-    host.run_denouncement(phase_wait).await?;
+    let mut previously_cast_out: BTreeSet<PlayerId> = BTreeSet::new();
+    let view = host.run_denouncement(phase_wait).await?;
+    award_newly_cast_out(&mut host, &view, &mut previously_cast_out).await?;
 
     host.advance_round_to(Round::Four).await?;
+    host.record_contest_results_for_round(Round::Four, seed.wrapping_add(1))
+        .await?;
+
     host.advance_round_to(Round::Five).await?;
-    host.run_denouncement(phase_wait).await?;
+    let view = host.run_denouncement(phase_wait).await?;
+    award_newly_cast_out(&mut host, &view, &mut previously_cast_out).await?;
 
     host.advance_round_to(Round::Finale).await?;
     let final_view = host.run_denouncement(phase_wait).await?;
+    let newly_cast_out: Vec<PlayerId> = final_view
+        .roster
+        .iter()
+        .filter(|r| r.status == PlayerStatus::CastOut && !previously_cast_out.contains(&r.id))
+        .map(|r| r.id)
+        .collect();
+    let resolved_view = host.resolve_gallery_predictions(newly_cast_out).await?;
 
     for handle in handles {
         handle.abort();
@@ -101,5 +138,25 @@ pub async fn run_full_automated_game(
         final_round: final_view.current_round,
         final_roster: final_view.roster,
         cast_out_count,
+        winner: resolved_view.winner,
     })
+}
+
+/// Awards a Servant point to every player `view`'s roster shows as
+/// `CastOut` for the first time (not already in `previously_cast_out`),
+/// then folds them into it -- rules.md §5: an already-Cast-Out player
+/// operationally becomes a Servant for the rest of the game.
+async fn award_newly_cast_out(
+    host: &mut HostDriver,
+    view: &engine::PlayerView,
+    previously_cast_out: &mut BTreeSet<PlayerId>,
+) -> Result<(), ConnError> {
+    let newly: Vec<PlayerId> = view
+        .roster
+        .iter()
+        .filter(|r| r.status == PlayerStatus::CastOut && !previously_cast_out.contains(&r.id))
+        .map(|r| r.id)
+        .collect();
+    previously_cast_out.extend(&newly);
+    host.award_servant_points(newly).await
 }

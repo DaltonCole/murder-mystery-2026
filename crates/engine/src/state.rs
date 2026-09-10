@@ -419,6 +419,7 @@ impl GameState {
             Character::Spymaster => status.spymaster_available = Some(!self.spymaster_used),
             Character::CultLeader => {
                 status.cult_leader_queries_available = Some(self.cult_leader_queries_available);
+                status.recruitment_slots_available = Some(self.available_recruitment_slots);
             }
             Character::Deceiver => {
                 status.deceiver_armed = Some(self.deceiver_armed);
@@ -572,6 +573,27 @@ impl GameState {
     /// going unnoticed for the rest of a live event.
     pub(crate) fn contest_results_for_host(&self) -> Vec<((Round, ContestCategory), bool)> {
         self.contest_results.iter().map(|(&k, &v)| (k, v)).collect()
+    }
+
+    /// The one faction currently winning, if any (`win_condition::evaluate`
+    /// guarantees at most one -- see its module doc comment on the Cult's
+    /// priority ruling). `Viewer::Host`-only, the same scoping as
+    /// `contest_results_for_host`: without this, nothing in the live game
+    /// ever tells the Host who actually won, which `ResolveGalleryPredictions`
+    /// needs a real answer for. Public finale-reveal sequencing for
+    /// `Viewer::Player`/`Viewer::Display` is deferred to a later phase (see
+    /// the implementation plan's Phase 4).
+    pub(crate) fn winner_for_host(&self) -> Option<Faction> {
+        let outcome = crate::win_condition::evaluate(self);
+        if outcome.cult_wins {
+            Some(Faction::Cult)
+        } else if outcome.ton_wins {
+            Some(Faction::Ton)
+        } else if outcome.uprising_wins {
+            Some(Faction::Uprising)
+        } else {
+            None
+        }
     }
 
     /// The faction a title's holder must belong to. Used to validate

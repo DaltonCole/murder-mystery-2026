@@ -94,6 +94,13 @@ async fn main() {
     );
 
     let joined: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+    // This interactive tool leaves the real Host console to you (see the
+    // module doc comment), so nothing here ever reads the Intermission
+    // opt-in pool the way `run_full_automated_game`'s own `HostDriver` does
+    // -- it's still threaded through since `PlayerBot` shares one pool with
+    // every other bot it opts in alongside.
+    let intermission_pool: Arc<Mutex<std::collections::BTreeSet<engine::PlayerId>>> =
+        Arc::new(Mutex::new(std::collections::BTreeSet::new()));
     let mut handles = Vec::with_capacity(args.bots);
 
     for i in 0..args.bots {
@@ -101,9 +108,10 @@ async fn main() {
         let name = format!("Bot{i}");
         let bot_seed = args.seed.wrapping_add(i as u64 * 7_919 + 1);
         let joined = Arc::clone(&joined);
+        let pool = Arc::clone(&intermission_pool);
         let handle_name = name.clone();
         handles.push(tokio::spawn(async move {
-            match PlayerBot::join(&url, &name, bot_seed).await {
+            match PlayerBot::join(&url, &name, bot_seed, pool).await {
                 Ok(bot) => {
                     joined.lock().unwrap().insert(handle_name, true);
                     if let Err(e) = bot.run().await {

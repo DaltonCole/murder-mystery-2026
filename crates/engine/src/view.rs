@@ -150,6 +150,12 @@ pub struct PlayerView {
     /// ends). Gives the host a self-audit view before recording another
     /// result, since `RecordContestResult` has no correction command.
     pub contest_results: Vec<((Round, ContestCategory), bool)>,
+    /// The one faction currently winning, if any -- `Viewer::Host` ONLY,
+    /// always `None` for `Viewer::Player`/`Viewer::Display` (see
+    /// `GameState::winner_for_host`'s doc comment: public finale-reveal
+    /// sequencing is deferred to a later phase). `ResolveGalleryPredictions`
+    /// needs this to score `FactionWins` predictions against a real answer.
+    pub winner: Option<Faction>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -245,6 +251,11 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     } else {
         Vec::new()
     };
+    let winner = if matches!(viewer, Viewer::Host) {
+        state.winner_for_host()
+    } else {
+        None
+    };
 
     PlayerView {
         roster,
@@ -264,6 +275,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         intermission_entrants,
         servant_leaderboard: state.servant_leaderboard(),
         contest_results,
+        winner,
     }
 }
 
@@ -831,6 +843,67 @@ mod tests {
     }
 
     #[test]
+    fn recruitment_slots_available_reflects_open_windows_for_the_cult_leader_only() {
+        let mut state = GameState::new();
+        let new_player = |state: &mut GameState, name: &str, faction: Faction| -> PlayerId {
+            let events = apply_command(state, Command::AddPlayer { name: name.into() }).unwrap();
+            let id = match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_command(
+                state,
+                Command::AssignFaction {
+                    player: id,
+                    faction,
+                },
+            )
+            .unwrap();
+            id
+        };
+        let cult_leader = new_player(&mut state, "CultLeader", Faction::Cult);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: cult_leader,
+                character: Character::CultLeader,
+            },
+        )
+        .unwrap();
+        let bystander = new_player(&mut state, "Bystander", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        assert_eq!(
+            view_for(&state, Viewer::Player(cult_leader))
+                .my_abilities
+                .recruitment_slots_available,
+            Some(0)
+        );
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, opens a window
+
+        assert_eq!(
+            view_for(&state, Viewer::Player(cult_leader))
+                .my_abilities
+                .recruitment_slots_available,
+            Some(1)
+        );
+        // Nobody else ever sees this -- not even the Host.
+        assert_eq!(
+            view_for(&state, Viewer::Player(bystander))
+                .my_abilities
+                .recruitment_slots_available,
+            None
+        );
+        assert_eq!(
+            view_for(&state, Viewer::Host)
+                .my_abilities
+                .recruitment_slots_available,
+            None
+        );
+    }
+
+    #[test]
     fn own_ability_status_reflects_only_the_viewers_own_character() {
         let (mut state, oracle, king_queen, ..) = phase2_state();
         apply_command(&mut state, Command::AdvanceRound).unwrap();
@@ -1252,5 +1325,65 @@ mod tests {
             .contest_results
             .is_empty());
         assert!(view_for(&state, Viewer::Display).contest_results.is_empty());
+    }
+
+    #[test]
+    fn winner_is_computed_for_the_host_only() {
+        let mut state = GameState::new();
+        let new_player = |state: &mut GameState, name: &str, faction: Faction| -> PlayerId {
+            let events = apply_command(state, Command::AddPlayer { name: name.into() }).unwrap();
+            let id = match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_command(
+                state,
+                Command::AssignFaction {
+                    player: id,
+                    faction,
+                },
+            )
+            .unwrap();
+            id
+        };
+        let king_queen = new_player(&mut state, "King", Faction::Ton);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: king_queen,
+                character: Character::KingQueen,
+            },
+        )
+        .unwrap();
+        let leader = new_player(&mut state, "Leader", Faction::Uprising);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: leader,
+                character: Character::RevolutionaryLeader,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        // Nobody's won yet.
+        assert_eq!(view_for(&state, Viewer::Host).winner, None);
+
+        // Casting Out the sole Leader with no successor available exhausts
+        // the Uprising's line -- Ton wins (see win_condition::evaluate).
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: leader,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(view_for(&state, Viewer::Host).winner, Some(Faction::Ton));
+        // Never leaked to a player or Display -- see winner_for_host's doc
+        // comment on the deferred public finale-reveal sequencing.
+        assert_eq!(view_for(&state, Viewer::Player(king_queen)).winner, None);
+        assert_eq!(view_for(&state, Viewer::Display).winner, None);
     }
 }

@@ -154,6 +154,16 @@ fn assert_game_completed_soundly(summary: &GameSummary, player_count: usize) {
         "expected at least one Cast-Out across 3 Denouncements, got 0 -- \
          either a real regression or a fluke worth re-running with a different seed"
     );
+    // Not a hard assertion: bots run concurrently over real websockets, so
+    // which random `Convert`/`CastOut` cascades actually land isn't fully
+    // pinned down by the seed alone, and rules.md's own conditions do allow
+    // a legitimate "nobody won" state (a Leader who's converted but never
+    // caught, with no Cult path independently satisfied either -- see
+    // `HostDriver::resolve_gallery_predictions`'s doc comment). Confirmed
+    // by observation to actually happen occasionally at 5 players. Still
+    // worth printing: a `None` here across every run would itself be a
+    // sign `win_condition::evaluate` never gets wired up to real games.
+    eprintln!("{player_count}-player game winner: {:?}", summary.winner);
 }
 
 /// How long each Denouncement/task phase stays open before the host

@@ -135,6 +135,11 @@ pub struct AbilityStatus {
     pub almanac_available: Option<bool>,
     pub spymaster_available: Option<bool>,
     pub cult_leader_queries_available: Option<usize>,
+    /// Cult Leader only. Without this, the Cult Leader has no way to know
+    /// whether a recruitment window is currently open at all -- `Convert`
+    /// would otherwise be pure trial and error, unlike every other
+    /// ability's own `_available` field.
+    pub recruitment_slots_available: Option<usize>,
     pub deceiver_armed: Option<bool>,
     pub deceiver_falsify_used: Option<bool>,
     pub priest_protects_available: Option<usize>,

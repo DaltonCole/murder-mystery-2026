@@ -886,6 +886,7 @@ fn Host() -> Element {
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
     let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
+    let winner = view().and_then(|v| v.winner);
 
     rsx! {
         h1 { "Host Console" }
@@ -1188,6 +1189,12 @@ fn Host() -> Element {
         div {
             h3 { "Gallery resolution" }
             p { "Once at the Finale, after the ballot has actually closed: score every submitted Gallery prediction against the real outcome. Only one faction ever wins -- the Cult has priority over any overlap (see win_condition::evaluate's doc comment) -- so pick the one that actually won." }
+            p {
+                match winner {
+                    Some(f) => format!("The engine computes the winner as: {f:?}."),
+                    None => "The engine hasn't computed a winner yet -- make sure the Finale's Denouncement has actually closed first.".to_string(),
+                }
+            }
             input {
                 placeholder: "actual Cast-Out IDs, e.g. 2,5",
                 value: "{gallery_cast_out}",

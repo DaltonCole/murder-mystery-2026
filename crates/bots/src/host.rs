@@ -18,11 +18,14 @@
 
 use crate::protocol::{Conn, ConnError};
 use engine::{
-    Character, Command, DenouncementView, Faction, PlayerId, PlayerView, Round, TaskTier, Viewer,
+    Character, Command, ContestCategory, DenouncementView, Faction, PlayerId, PlayerView, Round,
+    TaskTier, Viewer,
 };
 use rand::rngs::StdRng;
 use rand::seq::{IndexedRandom, SliceRandom};
-use rand::SeedableRng;
+use rand::{RngExt, SeedableRng};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct HostDriver {
@@ -36,6 +39,12 @@ pub struct Roles {
     pub prince_princess: PlayerId,
     pub revolutionary_leader: PlayerId,
     pub cult_leader: PlayerId,
+    /// The literal `Faction::Servant` late-arrivals -- kept here because
+    /// nothing in `PlayerView` ever reveals a player's faction, not even to
+    /// the Host (see `view::view_for`'s "no ambient god-view" design note),
+    /// so this is the only way anything downstream can award them Servant
+    /// points by literal faction rather than only by Cast-Out status.
+    pub servants: Vec<PlayerId>,
 }
 
 impl HostDriver {
@@ -124,6 +133,7 @@ impl HostDriver {
             prince_princess: ton[1],
             revolutionary_leader: uprising[0],
             cult_leader: cult[0],
+            servants: servants.to_vec(),
         };
         for (player, character) in [
             (roles.king_queen, Character::KingQueen),
@@ -131,6 +141,45 @@ impl HostDriver {
             (roles.revolutionary_leader, Character::RevolutionaryLeader),
             (roles.cult_leader, Character::CultLeader),
         ] {
+            self.conn
+                .do_cmd_sequential(Command::AssignCharacter { player, character })
+                .await?;
+        }
+
+        // Everyone else who fits gets one of the remaining Phase 2/3 named
+        // roles too (rather than falling back to the generic NormalTon/
+        // NormalUprising `FinalizeSetup` gives out) -- otherwise none of
+        // these commands would ever have anyone able to issue them.
+        // `.zip()` naturally caps at whichever is shorter, so a small game
+        // just gets fewer named roles and leaves the remainder generic,
+        // exactly like `FinalizeSetup` already expects to handle. Deceiver
+        // is deliberately absent here -- it requires a Cult-faction holder,
+        // and the only Cult member at setup is the Cult Leader itself; see
+        // `PlayerBot`'s handling of a live `Convert` for how it gets
+        // assigned mid-game instead.
+        const TON_NAMED_ROLES: [Character; 7] = [
+            Character::Oracle,
+            Character::Almanac,
+            Character::PriestPriestess,
+            Character::PotionMaker,
+            Character::Magistrate,
+            Character::Duelist,
+            Character::GrandInquisitor,
+        ];
+        const UPRISING_NAMED_ROLES: [Character; 6] = [
+            Character::Spymaster,
+            Character::Bartender,
+            Character::DoctorMedic,
+            Character::Firebrand,
+            Character::CellLeader,
+            Character::Agitator,
+        ];
+        for (&player, &character) in ton[2..].iter().zip(TON_NAMED_ROLES.iter()) {
+            self.conn
+                .do_cmd_sequential(Command::AssignCharacter { player, character })
+                .await?;
+        }
+        for (&player, &character) in uprising[1..].iter().zip(UPRISING_NAMED_ROLES.iter()) {
             self.conn
                 .do_cmd_sequential(Command::AssignCharacter { player, character })
                 .await?;
@@ -265,5 +314,125 @@ impl HostDriver {
 
     pub async fn view(&mut self) -> Result<PlayerView, ConnError> {
         self.conn.watch(Viewer::Host).await
+    }
+
+    /// Records all three contest categories for `round` (rules.md §4:
+    /// Strength, Creativity, Intelligence) -- `round` must be `Two` or
+    /// `Four`. The activities themselves are still undesigned app content
+    /// (see `contest.rs`'s doc comment), so this just picks an arbitrary
+    /// winner per category; only the wire path is under test here, not
+    /// which faction the coin flip favors.
+    pub async fn record_contest_results_for_round(
+        &mut self,
+        round: Round,
+        seed: u64,
+    ) -> Result<(), ConnError> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        for category in [
+            ContestCategory::Strength,
+            ContestCategory::Creativity,
+            ContestCategory::Intelligence,
+        ] {
+            self.conn
+                .do_cmd_sequential(Command::RecordContestResult {
+                    round,
+                    category,
+                    ton_won: rng.random_range(0..2) == 0,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Draws up to 5 Intermission entrants (rules.md §4) from `opt_in_pool`
+    /// -- a plain in-process set the bots themselves add to as they opt in
+    /// (see `PlayerBot::react`), standing in for whatever real-world
+    /// mechanism (a physical raffle box, players raising a hand) a live
+    /// host would actually use. This is deliberately NOT read from the
+    /// wire: `view_for` never exposes the opt-in pool to the Host, by
+    /// design -- see `GameState::opted_into_intermission`'s doc comment on
+    /// why it stays private even from the Host, unlike the drawn entrants
+    /// themselves once this runs.
+    pub async fn draw_intermission_entrants(
+        &mut self,
+        opt_in_pool: &Arc<Mutex<BTreeSet<PlayerId>>>,
+        seed: u64,
+    ) -> Result<(), ConnError> {
+        let view = self.view().await?;
+        let active: BTreeSet<PlayerId> = view
+            .roster
+            .iter()
+            .filter(|r| r.status == engine::PlayerStatus::Active)
+            .map(|r| r.id)
+            .collect();
+        let mut candidates: Vec<PlayerId> = opt_in_pool
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| active.contains(id))
+            .copied()
+            .collect();
+        let mut rng = StdRng::seed_from_u64(seed);
+        candidates.shuffle(&mut rng);
+        candidates.truncate(5);
+
+        self.conn
+            .do_cmd_until(
+                Command::DrawIntermissionEntrants {
+                    selected: candidates,
+                },
+                |v| v.intermission_entrants.is_some(),
+                Duration::from_secs(10),
+                "intermission_entrants being drawn",
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Awards one Servant leaderboard point to each of `players` -- the
+    /// same "objective fact the host records" shape as contest results.
+    /// Uses `do_cmd_until` (not `do_cmd_sequential`) since this always runs
+    /// while bots are concurrently active, unlike setup.
+    pub async fn award_servant_points(
+        &mut self,
+        players: impl IntoIterator<Item = PlayerId>,
+    ) -> Result<(), ConnError> {
+        for player in players {
+            self.conn
+                .do_cmd_until(
+                    Command::AwardServantPoints { player, points: 1 },
+                    |v| v.servant_leaderboard.iter().any(|&(id, _)| id == player),
+                    Duration::from_secs(10),
+                    "servant_leaderboard reflecting the award",
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Scores every submitted Gallery prediction against the real outcome
+    /// (rules.md §7) -- `newly_cast_out` is whoever the Finale's own
+    /// Denouncement just resolved (the caller diffs the roster's CastOut
+    /// set before/after `run_denouncement` at the Finale; see
+    /// `run_full_automated_game`). Reads the actual winner from the Host's
+    /// own view (`PlayerView::winner`, `GameState::winner_for_host`'s
+    /// doc comment explains why only the Host ever sees this). rules.md's
+    /// own win conditions allow a completed game where nobody's condition
+    /// is met (e.g. a converted-but-never-caught Leader) -- `ResolveGalleryPredictions`
+    /// has no slot for that, so this harness falls back to an arbitrary
+    /// `Faction::Ton` in that rare case purely to keep exercising the
+    /// command's wire path, not as a claim that Ton actually won.
+    pub async fn resolve_gallery_predictions(
+        &mut self,
+        newly_cast_out: Vec<PlayerId>,
+    ) -> Result<PlayerView, ConnError> {
+        let view = self.view().await?;
+        let actual_winner = view.winner.unwrap_or(Faction::Ton);
+        self.conn
+            .do_cmd_sequential(Command::ResolveGalleryPredictions {
+                actual_cast_out: newly_cast_out,
+                actual_winner,
+            })
+            .await
     }
 }
