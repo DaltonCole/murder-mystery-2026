@@ -52,8 +52,8 @@ use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use engine::DomainEvent;
 use engine::{
-    Ballot, Command, DenouncementView, PlayerId, PlayerStatus, PlayerView, RosterEntry, TaskTier,
-    TaskView, Viewer,
+    Ballot, Character, Command, DenouncementView, Faction, PlayerId, PlayerStatus, PlayerView,
+    RosterEntry, TaskTier, TaskView, Viewer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -491,6 +491,15 @@ fn Host() -> Element {
     };
 
     let mut new_name = use_signal(String::new);
+    let mut faction_player = use_signal(|| None::<u32>);
+    let mut faction_choice = use_signal(|| Faction::Ton);
+    let mut character_player = use_signal(|| None::<u32>);
+    let mut character_choice = use_signal(|| Character::KingQueen);
+    let mut task_prompt = use_signal(String::new);
+    let mut task_tier = use_signal(|| TaskTier::Easy);
+    let mut task_qualifier = use_signal(|| None::<u32>);
+
+    let roster = view().map(|v| v.roster).unwrap_or_default();
 
     rsx! {
         h1 { "Host Console" }
@@ -514,6 +523,75 @@ fn Host() -> Element {
                 },
                 "Add player"
             }
+            div {
+                select {
+                    onchange: move |e| faction_player.set(e.value().parse().ok()),
+                    option { value: "", "-- player --" }
+                    for r in roster.clone() {
+                        option { value: "{r.id.0}", "{r.name}" }
+                    }
+                }
+                select {
+                    onchange: move |e| {
+                        faction_choice.set(match e.value().as_str() {
+                            "Uprising" => Faction::Uprising,
+                            "Cult" => Faction::Cult,
+                            "Servant" => Faction::Servant,
+                            _ => Faction::Ton,
+                        });
+                    },
+                    option { value: "Ton", "Ton" }
+                    option { value: "Uprising", "Uprising" }
+                    option { value: "Cult", "Cult" }
+                    option { value: "Servant", "Servant" }
+                }
+                button {
+                    disabled: faction_player().is_none(),
+                    onclick: move |_| {
+                        let Some(player) = faction_player() else { return };
+                        do_cmd(Command::AssignFaction {
+                            player: PlayerId(player),
+                            faction: faction_choice(),
+                        });
+                    },
+                    "Assign faction"
+                }
+            }
+            div {
+                select {
+                    onchange: move |e| character_player.set(e.value().parse().ok()),
+                    option { value: "", "-- player --" }
+                    for r in roster.clone() {
+                        option { value: "{r.id.0}", "{r.name}" }
+                    }
+                }
+                select {
+                    onchange: move |e| {
+                        character_choice.set(match e.value().as_str() {
+                            "PrincePrincess" => Character::PrincePrincess,
+                            "RevolutionaryLeader" => Character::RevolutionaryLeader,
+                            "CultLeader" => Character::CultLeader,
+                            _ => Character::KingQueen,
+                        });
+                    },
+                    option { value: "KingQueen", "King/Queen" }
+                    option { value: "PrincePrincess", "Prince/Princess" }
+                    option { value: "RevolutionaryLeader", "Revolutionary Leader" }
+                    option { value: "CultLeader", "Cult Leader" }
+                }
+                button {
+                    disabled: character_player().is_none(),
+                    onclick: move |_| {
+                        let Some(player) = character_player() else { return };
+                        do_cmd(Command::AssignCharacter {
+                            player: PlayerId(player),
+                            character: character_choice(),
+                        });
+                    },
+                    "Assign title"
+                }
+            }
+            p { "Assign a faction to every player first, assign the four titles above to their holders, then Finalize -- everyone else gets a generic character automatically." }
             button { onclick: move |_| do_cmd(Command::FinalizeSetup), "Finalize setup" }
         }
         div {
@@ -539,19 +617,47 @@ fn Host() -> Element {
         }
         div {
             h3 { "Tasks" }
+            input {
+                placeholder: "Task prompt",
+                value: "{task_prompt}",
+                oninput: move |e| task_prompt.set(e.value()),
+            }
+            select {
+                onchange: move |e| {
+                    task_tier.set(match e.value().as_str() {
+                        "Medium" => TaskTier::Medium,
+                        "Hard" => TaskTier::Hard,
+                        _ => TaskTier::Easy,
+                    });
+                },
+                option { value: "Easy", "Easy" }
+                option { value: "Medium", "Medium" }
+                option { value: "Hard", "Hard" }
+            }
+            select {
+                onchange: move |e| task_qualifier.set(e.value().parse().ok()),
+                option { value: "", "-- who qualifies? --" }
+                for r in roster.clone() {
+                    option { value: "{r.id.0}", "{r.name}" }
+                }
+            }
             button {
-                onclick: move |_| do_cmd(Command::PushTask {
-                    prompt: "Talk to someone new".into(),
-                    tier: TaskTier::Easy,
-                    qualifying_players: Default::default(),
-                }),
-                "Push a placeholder task"
+                disabled: task_prompt().trim().is_empty() || task_qualifier().is_none(),
+                onclick: move |_| {
+                    let prompt = task_prompt.peek().trim().to_string();
+                    let Some(qualifier) = task_qualifier() else { return };
+                    do_cmd(Command::PushTask {
+                        prompt,
+                        tier: task_tier(),
+                        qualifying_players: [PlayerId(qualifier)].into_iter().collect(),
+                    });
+                    task_prompt.set(String::new());
+                },
+                "Push task"
             }
             button { onclick: move |_| do_cmd(Command::CloseTasks), "Close tasks" }
         }
-        if let Some(v) = view() {
-            RosterList { roster: v.roster.clone() }
-        }
+        RosterList { roster }
     }
 }
 
