@@ -498,6 +498,8 @@ fn Host() -> Element {
     let mut task_prompt = use_signal(String::new);
     let mut task_tier = use_signal(|| TaskTier::Easy);
     let mut task_qualifier = use_signal(|| None::<u32>);
+    let mut convert_converter = use_signal(|| None::<u32>);
+    let mut convert_target = use_signal(|| None::<u32>);
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
 
@@ -656,6 +658,38 @@ fn Host() -> Element {
                 "Push task"
             }
             button { onclick: move |_| do_cmd(Command::CloseTasks), "Close tasks" }
+        }
+        div {
+            h3 { "Debug: Cult conversion" }
+            p { "The real recruitment schedule is Phase 2 -- this is a manual stand-in. The host's own view never shows factions/characters (see the security note on view_for), so use the player IDs you assigned above, not names shown here." }
+            select {
+                onchange: move |e| convert_converter.set(e.value().parse().ok()),
+                option { value: "", "-- converter (Cult Leader) --" }
+                for r in roster.clone() {
+                    option { value: "{r.id.0}", "{r.name}" }
+                }
+            }
+            select {
+                onchange: move |e| convert_target.set(e.value().parse().ok()),
+                option { value: "", "-- target --" }
+                for r in roster.clone() {
+                    option { value: "{r.id.0}", "{r.name}" }
+                }
+            }
+            button {
+                disabled: convert_converter().is_none() || convert_target().is_none(),
+                onclick: move |_| {
+                    let (Some(converter), Some(target)) = (convert_converter(), convert_target())
+                    else {
+                        return;
+                    };
+                    do_cmd(Command::Convert {
+                        converter: PlayerId(converter),
+                        target: PlayerId(target),
+                    });
+                },
+                "Convert"
+            }
         }
         RosterList { roster }
     }
