@@ -23,6 +23,7 @@ mod servant;
 mod state;
 mod task;
 mod view;
+mod whistledown;
 mod win_condition;
 
 pub use ability::{AbilityStatus, Dossier, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind};
@@ -39,4 +40,5 @@ pub use servant::GalleryPrediction;
 pub use state::{apply_command, GameState};
 pub use task::{TaskDef, TaskId, TaskTier};
 pub use view::{view_for, DenouncementView, PlayerView, RosterEntry, TaskView, Viewer};
+pub use whistledown::{posts as whistledown_posts, WhistledownPost};
 pub use win_condition::{evaluate as evaluate_win_conditions, CultPath, GameOutcome};

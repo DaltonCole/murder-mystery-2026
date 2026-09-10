@@ -6,6 +6,7 @@ use crate::player::{Faction, PlayerId};
 use crate::round::Round;
 use crate::state::GameState;
 use crate::task::{TaskId, TaskTier};
+use crate::whistledown::WhistledownPost;
 use serde::{Deserialize, Serialize};
 
 /// Who is asking to see the state. This is the *only* input that
@@ -160,6 +161,11 @@ pub struct PlayerView {
     /// ONLY, always `false` for `Viewer::Player`/`Viewer::Display`. See
     /// `GameState::gallery_resolved`'s doc comment.
     pub gallery_resolved: bool,
+    /// Lady Whistledown's posts so far (rules.md §6), one per completed
+    /// round -- public to every viewer kind, unlike anything faction- or
+    /// character-related. See `whistledown::posts`'s doc comment for why
+    /// this deliberately never covers the Finale.
+    pub whistledown: Vec<WhistledownPost>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -282,6 +288,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         contest_results,
         winner,
         gallery_resolved,
+        whistledown: crate::whistledown::posts(state),
     }
 }
 
@@ -1391,6 +1398,40 @@ mod tests {
         // comment on the deferred public finale-reveal sequencing.
         assert_eq!(view_for(&state, Viewer::Player(king_queen)).winner, None);
         assert_eq!(view_for(&state, Viewer::Display).winner, None);
+    }
+
+    #[test]
+    fn whistledown_posts_are_visible_to_every_viewer_kind() {
+        let mut state = GameState::new();
+        let alice = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Alice".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: alice,
+                faction: Faction::Ton,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, closes Round One's post
+
+        for viewer in [Viewer::Player(alice), Viewer::Host, Viewer::Display] {
+            let view = view_for(&state, viewer);
+            assert_eq!(view.whistledown.len(), 1);
+            assert_eq!(view.whistledown[0].round, Round::One);
+        }
     }
 
     #[test]

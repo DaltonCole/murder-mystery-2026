@@ -351,6 +351,18 @@ fn Play() -> Element {
                 }
             }
         }
+        if !v.whistledown.is_empty() {
+            div {
+                h4 { "Lady Whistledown's Society Papers" }
+                for post in v.whistledown.iter().rev().cloned() {
+                    p {
+                        key: "{post.round:?}",
+                        style: "font-style: italic;",
+                        "{post.text}"
+                    }
+                }
+            }
+        }
         RosterList { roster: v.roster.clone() }
         AbilityPanel {
             my_id: id,
@@ -1293,6 +1305,18 @@ fn Display() -> Element {
         }
         for task in v.open_tasks.iter().cloned() {
             p { key: "{task.id.0}", "{task.prompt} ({task.tier:?})" }
+        }
+        if !v.whistledown.is_empty() {
+            div {
+                h2 { "Lady Whistledown's Society Papers" }
+                for post in v.whistledown.iter().rev().cloned() {
+                    p {
+                        key: "{post.round:?}",
+                        style: "font-style: italic;",
+                        "{post.text}"
+                    }
+                }
+            }
         }
     }
 }
