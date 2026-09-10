@@ -98,8 +98,24 @@ impl GameOutcome {
 /// forced `false` regardless of what their own conditions would otherwise
 /// report, rather than leaving the overlap for a caller to resolve. See
 /// `win_condition::tests::
-/// path_c_can_overlap_with_uprising_survival_after_a_succession` for a
-/// worked example of the override actually firing.
+/// path_c_overlap_with_uprising_survival_is_resolved_in_the_cults_favor` for
+/// a worked example of the override actually firing.
+///
+/// # A real "nobody wins" gap, closed by broadening the Uprising
+///
+/// Before this session's follow-up ruling, converting exactly one royal
+/// (either the King/Queen or the Leader) and never getting caught satisfied
+/// none of the four win paths on its own: Path A needs *both* royals
+/// converted+active; B/C need the *other* title specifically Denounced
+/// while still unconverted (not just "never converted" -- an untouched,
+/// still-active title-holder never sets that flag); D needs martyrdom (the
+/// Cult Leader personally Cast Out). A secretly-converted-but-uncaught
+/// Leader, with an untouched King/Queen, satisfied nothing -- confirmed
+/// actually reachable (not just theoretical) via the `bots` integration
+/// suite. Dalton's ruling: in exactly that case, the Uprising still wins as
+/// long as the King/Queen also made it to the Finale alive -- see the
+/// Uprising section below for the exact condition and why it can't newly
+/// collide with anything the Cult-priority override doesn't already handle.
 pub fn evaluate(state: &GameState) -> GameOutcome {
     let mut outcome = GameOutcome::none();
 
@@ -122,12 +138,29 @@ pub fn evaluate(state: &GameState) -> GameOutcome {
     // Only checked at the Finale -- see the doc comment on `evaluate` for
     // why this can't be a live "currently true" check the way Ton's and
     // the Cult's conditions can.
+    //
+    // Dalton's follow-up ruling closes a real "nobody wins" gap: converting
+    // exactly one royal and never getting caught satisfied none of the four
+    // stated win paths on its own (Path A needs *both* royals converted;
+    // B/C need the *other* title specifically Denounced while still
+    // unconverted; D needs martyrdom) -- see this function's own doc
+    // comment. Now, if the Leader is converted but still alive, the
+    // Uprising still wins as long as the King/Queen also made it to the end
+    // alive (converted or not -- if they're *also* converted+active that's
+    // Path A instead, and the Cult-priority override at the end of this
+    // function settles the overlap the same way it already does elsewhere).
     if state.current_round() == crate::round::Round::Finale {
         if let Some(leader) = state.revolutionary_leader() {
             let player = state
                 .player(leader)
                 .expect("revolutionary_leader always names a real player");
-            if player.status == crate::character::PlayerStatus::Active && !player.converted {
+            let king_queen_alive = state
+                .king_queen()
+                .and_then(|id| state.player(id))
+                .is_some_and(|p| p.status == crate::character::PlayerStatus::Active);
+            if player.status == crate::character::PlayerStatus::Active
+                && (!player.converted || king_queen_alive)
+            {
                 outcome.uprising_wins = true;
             }
         }
@@ -284,6 +317,94 @@ mod tests {
         let outcome = evaluate(&state);
         assert!(outcome.uprising_wins);
         assert!(!outcome.ton_wins);
+    }
+
+    #[test]
+    fn uprising_wins_when_the_leader_is_converted_but_uncaught_and_the_king_queen_survives() {
+        // Before Dalton's follow-up ruling, this was a real "nobody wins"
+        // gap: the Leader is converted+active (fails Ton's condition and
+        // the Leader's own "unconverted" clause), but Cult Path A needs the
+        // King/Queen converted too, and B/C need the King/Queen
+        // specifically Denounced -- neither happened, since the King/Queen
+        // was never even touched.
+        let (mut state, _king_queen, leader, cult_leader, _prince) = base_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // recruitment slot
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: leader,
+            },
+        )
+        .unwrap();
+
+        // Not yet at the Finale -- same timing rule as the original clause.
+        assert!(!evaluate(&state).uprising_wins);
+
+        for _ in 0..4 {
+            apply_command(&mut state, Command::AdvanceRound).unwrap();
+        }
+        assert_eq!(state.current_round(), crate::round::Round::Finale);
+
+        let outcome = evaluate(&state);
+        assert!(outcome.uprising_wins);
+        assert!(!outcome.ton_wins);
+        assert!(!outcome.cult_wins);
+    }
+
+    #[test]
+    fn nobody_wins_is_still_reachable_if_a_converted_king_queen_gets_cast_out_unnoticed() {
+        // The King/Queen has to be *alive* for the new rule to grant the
+        // Uprising a win -- narrower than "was never caught converting,"
+        // since a Cast-Out gives the same deliberately uninformative
+        // treatment either way (rules.md §6). This is a known, much
+        // narrower residual gap Dalton's ruling didn't try to close -- see
+        // the module doc comment: it needs *both* royals to have actually
+        // been converted (a converted King/Queen who happens to get voted
+        // out without anyone learning why, plus a still-uncaught converted
+        // Leader), not just one, so it's a real but far rarer scenario than
+        // the one the new rule actually fixes.
+        let (mut state, king_queen, leader, cult_leader, _prince) = base_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, slot 1
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: king_queen,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        // Cast Out while already converted -- skips the "ever denounced
+        // unconverted" flag Cult Path B would otherwise read.
+        assert!(!state.king_queen_ever_denounced_unconverted());
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three, slot 2
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: leader,
+            },
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            apply_command(&mut state, Command::AdvanceRound).unwrap();
+        }
+        assert_eq!(state.current_round(), crate::round::Round::Finale);
+
+        let outcome = evaluate(&state);
+        assert!(!outcome.uprising_wins);
+        assert!(!outcome.ton_wins);
+        assert!(!outcome.cult_wins);
     }
 
     #[test]

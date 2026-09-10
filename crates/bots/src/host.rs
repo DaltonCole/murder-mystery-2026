@@ -415,13 +415,15 @@ impl HostDriver {
     /// Denouncement just resolved (the caller diffs the roster's CastOut
     /// set before/after `run_denouncement` at the Finale; see
     /// `run_full_automated_game`). Reads the actual winner from the Host's
-    /// own view (`PlayerView::winner`, `GameState::winner_for_host`'s
-    /// doc comment explains why only the Host ever sees this). rules.md's
-    /// own win conditions allow a completed game where nobody's condition
-    /// is met (e.g. a converted-but-never-caught Leader) -- `ResolveGalleryPredictions`
-    /// has no slot for that, so this harness falls back to an arbitrary
-    /// `Faction::Ton` in that rare case purely to keep exercising the
-    /// command's wire path, not as a claim that Ton actually won.
+    /// own view (`PlayerView::winner`, `GameState::winner_for_host`'s doc
+    /// comment explains why only the Host ever sees this). A completed game
+    /// where nobody's condition is met is still possible in one narrow
+    /// residual case even after Dalton's follow-up ruling closed the common
+    /// one (see `win_condition::evaluate`'s doc comment) --
+    /// `ResolveGalleryPredictions` has no slot for that, so this harness
+    /// falls back to an arbitrary `Faction::Ton` in that rare case purely
+    /// to keep exercising the command's wire path, not as a claim that Ton
+    /// actually won.
     pub async fn resolve_gallery_predictions(
         &mut self,
         newly_cast_out: Vec<PlayerId>,
