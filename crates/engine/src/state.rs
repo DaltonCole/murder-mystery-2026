@@ -1,6 +1,7 @@
 use crate::ability::{
     resolve_info_check, Dossier, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind,
 };
+use crate::bio::Bio;
 use crate::character::{Character, PlayerStatus};
 use crate::command::Command;
 use crate::contest::ContestCategory;
@@ -25,6 +26,11 @@ pub struct GameState {
     players: BTreeMap<PlayerId, Player>,
     next_player_id: u32,
     event_log: Vec<DomainEvent>,
+    /// rules.md §1's "Character creation" -- submitted independently of
+    /// faction/character assignment, so this stays a separate map rather
+    /// than a field on `Player`. See `bio::task_candidates` for the
+    /// consumer this exists for.
+    bios: BTreeMap<PlayerId, Bio>,
 
     current_round: Round,
 
@@ -242,6 +248,7 @@ impl Default for GameState {
             players: BTreeMap::new(),
             next_player_id: 0,
             event_log: Vec::new(),
+            bios: BTreeMap::new(),
             current_round: Round::One,
             king_queen: None,
             king_queen_transfer_used: false,
@@ -314,6 +321,14 @@ impl GameState {
         self.players.values()
     }
 
+    pub fn bio(&self, id: PlayerId) -> Option<&Bio> {
+        self.bios.get(&id)
+    }
+
+    pub(crate) fn bios(&self) -> impl Iterator<Item = (PlayerId, &Bio)> {
+        self.bios.iter().map(|(&id, bio)| (id, bio))
+    }
+
     pub fn event_log(&self) -> &[DomainEvent] {
         &self.event_log
     }
@@ -383,6 +398,15 @@ impl GameState {
 
     pub fn task(&self, id: TaskId) -> Option<&TaskDef> {
         self.tasks.get(&id)
+    }
+
+    /// Every task ever pushed, open or already closed -- unlike
+    /// `open_task_ids`, which only covers the currently-open subset. See
+    /// `bio::task_candidates`'s doc comment for the one consumer this
+    /// exists for (avoiding re-suggesting an already-used bio-derived
+    /// prompt).
+    pub(crate) fn tasks(&self) -> impl Iterator<Item = &TaskDef> {
+        self.tasks.values()
     }
 
     pub fn is_task_open(&self, id: TaskId) -> bool {
@@ -756,6 +780,8 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
 
         Command::FinalizeSetup => finalize_setup(state),
 
+        Command::SubmitBio { player, bio } => submit_bio(state, player, bio)?,
+
         Command::Convert { converter, target } => convert(state, converter, target)?,
 
         Command::DesignateSuccessor { leader, successor } => {
@@ -1049,6 +1075,24 @@ fn finalize_setup(state: &mut GameState) -> Vec<DomainEvent> {
     }
 
     vec![DomainEvent::SetupFinalized]
+}
+
+/// Records or replaces `player`'s bio (rules.md §1). A standing choice --
+/// see `Command::SubmitBio`'s doc comment for why re-submission silently
+/// replaces rather than being rejected as a duplicate.
+fn submit_bio(
+    state: &mut GameState,
+    player: PlayerId,
+    bio: Bio,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.players.contains_key(&player) {
+        return Err(GameError::UnknownPlayer(player));
+    }
+    if let Some((field, len)) = bio.first_oversized_field() {
+        return Err(GameError::BioFieldTooLong { field, len });
+    }
+    state.bios.insert(player, bio.clone());
+    Ok(vec![DomainEvent::BioSubmitted { player, bio }])
 }
 
 /// Converts `target` to secretly serve the Cult. Growing the Cult's ranks
@@ -2947,6 +2991,114 @@ mod tests {
         .unwrap();
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
         (state, king_queen, prince, leader, cult_leader)
+    }
+
+    // --- SubmitBio ---
+
+    fn sample_bio(character_name: &str) -> crate::bio::Bio {
+        crate::bio::Bio {
+            character_name: character_name.into(),
+            real_name: "Alex".into(),
+            occupation: "Duke".into(),
+            hobbies: [
+                "chess".into(),
+                "fencing".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+            clothing_features: [
+                "a silver mask".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+            skills: [
+                "sword fighting".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn submit_bio_records_it_and_is_readable_back() {
+        let (mut state, king_queen, ..) = setup_full_game();
+        apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: king_queen,
+                bio: sample_bio("Lord Ashworth"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.bio(king_queen).unwrap().character_name,
+            "Lord Ashworth"
+        );
+    }
+
+    #[test]
+    fn submit_bio_rejects_an_unknown_player() {
+        let mut state = GameState::new();
+        let result = apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: PlayerId(0),
+                bio: sample_bio("Nobody"),
+            },
+        );
+        assert_eq!(result, Err(GameError::UnknownPlayer(PlayerId(0))));
+    }
+
+    #[test]
+    fn submit_bio_rejects_an_over_length_field() {
+        let (mut state, king_queen, ..) = setup_full_game();
+        let mut bio = sample_bio("Lord Ashworth");
+        bio.occupation = "a".repeat(33);
+        let result = apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: king_queen,
+                bio,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::BioFieldTooLong {
+                field: "occupation",
+                len: 33
+            })
+        );
+        assert!(state.bio(king_queen).is_none());
+    }
+
+    #[test]
+    fn resubmitting_a_bio_silently_replaces_the_earlier_one() {
+        let (mut state, king_queen, ..) = setup_full_game();
+        apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: king_queen,
+                bio: sample_bio("Lord Ashworth"),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: king_queen,
+                bio: sample_bio("Lord Pemberton"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.bio(king_queen).unwrap().character_name,
+            "Lord Pemberton"
+        );
     }
 
     // --- Convert ---

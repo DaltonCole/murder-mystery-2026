@@ -1,4 +1,5 @@
 use crate::ability::{AbilityStatus, InfoCheckDelivery};
+use crate::bio::{Bio, TaskCandidate};
 use crate::character::{Character, PlayerStatus};
 use crate::contest::ContestCategory;
 use crate::denouncement::DenouncementPhase;
@@ -166,6 +167,21 @@ pub struct PlayerView {
     /// character-related. See `whistledown::posts`'s doc comment for why
     /// this deliberately never covers the Finale.
     pub whistledown: Vec<WhistledownPost>,
+    /// The viewer's own bio (rules.md §1), once submitted -- never another
+    /// player's, and never populated for Host/Display. A bio isn't a
+    /// secret (it feeds the public task pool), but there's no reason to
+    /// hand a client anyone else's raw bio when the task pool -- see
+    /// `task_candidates` below -- is the only thing that actually needs
+    /// to surface bio content to other people.
+    pub own_bio: Option<Bio>,
+    /// The bio-derived task pool (`bio::task_candidates`), one list per
+    /// tier -- `Viewer::Host` ONLY. Round 1's "exactly 2 fixed tasks"
+    /// (rules.md §4) don't come from here; this is for Rounds 3/5's
+    /// "easy/medium/hard tiers live." Always empty for
+    /// `Viewer::Player`/`Viewer::Display`, the same scoping as
+    /// `contest_results` -- a client-visible pool would spoil the
+    /// mingling the task itself is supposed to require.
+    pub task_candidates: Vec<(TaskTier, Vec<TaskCandidate>)>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -267,6 +283,15 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         None
     };
     let gallery_resolved = matches!(viewer, Viewer::Host) && state.gallery_resolved();
+    let own_bio = viewer_id.and_then(|id| state.bio(id)).cloned();
+    let task_candidates = if matches!(viewer, Viewer::Host) {
+        [TaskTier::Easy, TaskTier::Medium, TaskTier::Hard]
+            .into_iter()
+            .map(|tier| (tier, crate::bio::task_candidates(state, tier)))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     PlayerView {
         roster,
@@ -289,6 +314,8 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         winner,
         gallery_resolved,
         whistledown: crate::whistledown::posts(state),
+        own_bio,
+        task_candidates,
     }
 }
 
@@ -1496,5 +1523,108 @@ mod tests {
         assert!(view_for(&state, Viewer::Host).gallery_resolved);
         assert!(!view_for(&state, Viewer::Player(cast_out_player)).gallery_resolved);
         assert!(!view_for(&state, Viewer::Display).gallery_resolved);
+    }
+
+    fn sample_bio() -> crate::bio::Bio {
+        crate::bio::Bio {
+            character_name: "Lord Ashworth".into(),
+            real_name: "Alex".into(),
+            occupation: "Duke".into(),
+            hobbies: ["chess".into(), "".into(), "".into(), "".into(), "".into()],
+            clothing_features: [
+                "a silver mask".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+            skills: ["".into(), "".into(), "".into(), "".into(), "".into()],
+        }
+    }
+
+    #[test]
+    fn own_bio_is_visible_only_to_its_own_player_never_others_or_host_display() {
+        let mut state = GameState::new();
+        let alice = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Alice".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: alice,
+                faction: Faction::Ton,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: alice,
+                bio: sample_bio(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            view_for(&state, Viewer::Player(alice)).own_bio,
+            Some(sample_bio())
+        );
+        assert_eq!(view_for(&state, Viewer::Host).own_bio, None);
+        assert_eq!(view_for(&state, Viewer::Display).own_bio, None);
+    }
+
+    #[test]
+    fn task_candidates_are_visible_to_the_host_only() {
+        let mut state = GameState::new();
+        let alice = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Alice".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: alice,
+                faction: Faction::Ton,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: alice,
+                bio: sample_bio(),
+            },
+        )
+        .unwrap();
+
+        let host_view = view_for(&state, Viewer::Host);
+        assert_eq!(host_view.task_candidates.len(), 3);
+        let (medium_tier, medium_candidates) = &host_view.task_candidates[1];
+        assert_eq!(*medium_tier, crate::task::TaskTier::Medium);
+        assert!(medium_candidates.iter().any(|c| c.prompt.contains("Chess")));
+
+        assert!(view_for(&state, Viewer::Player(alice))
+            .task_candidates
+            .is_empty());
+        assert!(view_for(&state, Viewer::Display).task_candidates.is_empty());
     }
 }

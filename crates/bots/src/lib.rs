@@ -110,6 +110,7 @@ pub async fn run_full_automated_game(
         .await?;
 
     host.advance_round_to(Round::Three).await?;
+    host.run_bio_driven_tasks(phase_wait).await?;
     let mut previously_cast_out: BTreeSet<PlayerId> = BTreeSet::new();
     let view = host.run_denouncement(phase_wait).await?;
     award_newly_cast_out(&mut host, &view, &mut previously_cast_out).await?;
@@ -126,6 +127,7 @@ pub async fn run_full_automated_game(
         .await?;
 
     host.advance_round_to(Round::Five).await?;
+    host.run_bio_driven_tasks(phase_wait).await?;
     let view = host.run_denouncement(phase_wait).await?;
     award_newly_cast_out(&mut host, &view, &mut previously_cast_out).await?;
 

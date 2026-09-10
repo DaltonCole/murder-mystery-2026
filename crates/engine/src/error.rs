@@ -176,4 +176,7 @@ pub enum GameError {
 
     #[error("Gallery predictions can only be resolved once the Last Denouncement has closed")]
     GalleryResolutionTooEarly,
+
+    #[error("bio field {field} is {len} characters, over rules.md's 32-character cap")]
+    BioFieldTooLong { field: &'static str, len: usize },
 }

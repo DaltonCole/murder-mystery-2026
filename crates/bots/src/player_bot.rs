@@ -24,15 +24,73 @@
 
 use crate::protocol::{ClientMsg, Conn, ConnError, ServerMsg};
 use engine::{
-    Ballot, Character, Command, DenouncementView, Faction, InfoQueryKind, PlayerId, PlayerStatus,
-    PlayerView, RosterEntry, Round,
+    Ballot, Bio, Character, Command, DenouncementView, Faction, InfoQueryKind, PlayerId,
+    PlayerStatus, PlayerView, RosterEntry, Round,
 };
 use rand::rngs::StdRng;
-use rand::seq::IndexedRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{RngExt, SeedableRng};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// A small, deliberately-overlapping vocabulary -- real player bios would
+/// draw from a much wider space, but a small pool here means several bots
+/// are likely to land on the same value, exercising `bio::task_candidates`'
+/// same-value grouping (multiple qualifying players per candidate), not
+/// just the single-player case.
+const SAMPLE_HOBBIES: [&str; 8] = [
+    "chess",
+    "fencing",
+    "poetry",
+    "dancing",
+    "painting",
+    "archery",
+    "gambling",
+    "gossiping",
+];
+const SAMPLE_CLOTHING: [&str; 8] = [
+    "a silver mask",
+    "a red cape",
+    "peacock feathers",
+    "lace gloves",
+    "a pocket watch",
+    "a jeweled brooch",
+    "a top hat",
+    "a velvet cravat",
+];
+const SAMPLE_SKILLS: [&str; 8] = [
+    "sword fighting",
+    "card tricks",
+    "singing",
+    "riddles",
+    "dance choreography",
+    "wine tasting",
+    "storytelling",
+    "code breaking",
+];
+
+fn random_bio(rng: &mut StdRng, name: &str) -> Bio {
+    fn pick_three(pool: &[&str], rng: &mut StdRng) -> [String; 5] {
+        let mut items: Vec<&str> = pool.to_vec();
+        items.shuffle(rng);
+        [
+            items[0].to_string(),
+            items[1].to_string(),
+            items[2].to_string(),
+            String::new(),
+            String::new(),
+        ]
+    }
+    Bio {
+        character_name: format!("Lord {name}"),
+        real_name: name.to_string(),
+        occupation: "Guest".to_string(),
+        hobbies: pick_three(&SAMPLE_HOBBIES, rng),
+        clothing_features: pick_three(&SAMPLE_CLOTHING, rng),
+        skills: pick_three(&SAMPLE_SKILLS, rng),
+    }
+}
 
 /// How many blind guesses `DesignateSuccessor`/`TransferKingQueen` will
 /// make before giving up for the rest of the game -- neither has an
@@ -54,6 +112,7 @@ pub struct PlayerBot {
     /// returned -- see the doc comment on `react`'s guard for why this is
     /// necessary at all, not just a nice-to-have.
     setup_complete: Arc<AtomicBool>,
+    submitted_bio: bool,
     opted_into_intermission: bool,
     submitted_gallery_prediction: bool,
     /// Reset to `false` whenever no Denouncement is open -- `MedicProtect`
@@ -84,6 +143,7 @@ impl PlayerBot {
             rng: StdRng::seed_from_u64(seed),
             intermission_pool,
             setup_complete,
+            submitted_bio: false,
             opted_into_intermission: false,
             submitted_gallery_prediction: false,
             medic_declared_this_denouncement: false,
@@ -141,6 +201,15 @@ impl PlayerBot {
         // confirmed to actually happen under real load, producing
         // "player already has character X" rejections.
         if self.setup_complete.load(Ordering::Relaxed) {
+            if !self.submitted_bio {
+                self.submitted_bio = true;
+                let bio = random_bio(&mut self.rng, &self.name);
+                self.send(Command::SubmitBio {
+                    player: self.id,
+                    bio,
+                })
+                .await?;
+            }
             self.react_to_abilities(view).await?;
             self.react_to_standing_choices(view).await?;
         }

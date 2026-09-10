@@ -52,9 +52,9 @@ use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use engine::DomainEvent;
 use engine::{
-    AbilityStatus, Ballot, Character, Command, ContestCategory, DenouncementView, Faction,
-    GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind, PlayerId, PlayerStatus,
-    PlayerView, RosterEntry, Round, TaskTier, TaskView, Viewer,
+    pascal_case, AbilityStatus, Ballot, Bio, Character, Command, ContestCategory, DenouncementView,
+    Faction, GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind, PlayerId,
+    PlayerStatus, PlayerView, RosterEntry, Round, TaskTier, TaskView, Viewer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -363,6 +363,11 @@ fn Play() -> Element {
                 }
             }
         }
+        BioForm {
+            my_id: id,
+            own_bio: v.own_bio.clone(),
+            on_command: send_cmd,
+        }
         RosterList { roster: v.roster.clone() }
         AbilityPanel {
             my_id: id,
@@ -399,6 +404,126 @@ fn RosterList(roster: Vec<RosterEntry>) -> Element {
         ul {
             for entry in roster {
                 li { key: "{entry.id.0}", "{entry.name} ({entry.status:?})" }
+            }
+        }
+    }
+}
+
+/// rules.md §1's "Character creation" -- free text, each field capped at
+/// 32 characters (enforced here via `maxlength` and, as the real source of
+/// truth, by the engine's own `SubmitBio` validation). Doesn't pre-fill
+/// from an already-submitted `own_bio` -- resubmitting silently replaces
+/// (see `Command::SubmitBio`'s doc comment), so editing just means
+/// retyping, matching this Phase 1-era "basic shell" UI's overall level of
+/// polish elsewhere.
+#[component]
+fn BioForm(my_id: PlayerId, own_bio: Option<Bio>, on_command: EventHandler<Command>) -> Element {
+    let mut character_name = use_signal(String::new);
+    let mut real_name = use_signal(String::new);
+    let mut occupation = use_signal(String::new);
+    let mut hobbies = use_signal(|| std::array::from_fn::<String, 5, _>(|_| String::new()));
+    let mut clothing_features =
+        use_signal(|| std::array::from_fn::<String, 5, _>(|_| String::new()));
+    let mut skills = use_signal(|| std::array::from_fn::<String, 5, _>(|_| String::new()));
+
+    rsx! {
+        div {
+            h3 { "Your character sheet" }
+            if let Some(bio) = &own_bio {
+                div {
+                    p {
+                        "{pascal_case(&bio.character_name)} -- {pascal_case(&bio.occupation)}"
+                    }
+                    p {
+                        "Hobbies: "
+                        {bio.hobbies.iter().filter(|s| !s.is_empty()).map(|s| pascal_case(s)).collect::<Vec<_>>().join(", ")}
+                    }
+                    p {
+                        "Clothing: "
+                        {bio.clothing_features.iter().filter(|s| !s.is_empty()).map(|s| pascal_case(s)).collect::<Vec<_>>().join(", ")}
+                    }
+                    p {
+                        "Skills: "
+                        {bio.skills.iter().filter(|s| !s.is_empty()).map(|s| pascal_case(s)).collect::<Vec<_>>().join(", ")}
+                    }
+                }
+            }
+            input {
+                placeholder: "Character name",
+                maxlength: "32",
+                value: "{character_name}",
+                oninput: move |e| character_name.set(e.value()),
+            }
+            input {
+                placeholder: "Real name",
+                maxlength: "32",
+                value: "{real_name}",
+                oninput: move |e| real_name.set(e.value()),
+            }
+            input {
+                placeholder: "Occupation",
+                maxlength: "32",
+                value: "{occupation}",
+                oninput: move |e| occupation.set(e.value()),
+            }
+            p { "Hobbies (up to 5):" }
+            for i in 0..5 {
+                input {
+                    key: "hobby-{i}",
+                    placeholder: "Hobby {i + 1}",
+                    maxlength: "32",
+                    value: "{hobbies()[i]}",
+                    oninput: move |e| {
+                        let mut h = hobbies();
+                        h[i] = e.value();
+                        hobbies.set(h);
+                    },
+                }
+            }
+            p { "Notable clothing features (up to 5):" }
+            for i in 0..5 {
+                input {
+                    key: "clothing-{i}",
+                    placeholder: "Clothing feature {i + 1}",
+                    maxlength: "32",
+                    value: "{clothing_features()[i]}",
+                    oninput: move |e| {
+                        let mut c = clothing_features();
+                        c[i] = e.value();
+                        clothing_features.set(c);
+                    },
+                }
+            }
+            p { "Skills (up to 5):" }
+            for i in 0..5 {
+                input {
+                    key: "skill-{i}",
+                    placeholder: "Skill {i + 1}",
+                    maxlength: "32",
+                    value: "{skills()[i]}",
+                    oninput: move |e| {
+                        let mut s = skills();
+                        s[i] = e.value();
+                        skills.set(s);
+                    },
+                }
+            }
+            button {
+                onclick: move |_| {
+                    on_command
+                        .call(Command::SubmitBio {
+                            player: my_id,
+                            bio: Bio {
+                                character_name: character_name(),
+                                real_name: real_name(),
+                                occupation: occupation(),
+                                hobbies: hobbies(),
+                                clothing_features: clothing_features(),
+                                skills: skills(),
+                            },
+                        });
+                },
+                if own_bio.is_some() { "Update bio" } else { "Submit bio" }
             }
         }
     }
@@ -903,6 +1028,7 @@ fn Host() -> Element {
     let roster = view().map(|v| v.roster).unwrap_or_default();
     let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
     let winner = view().and_then(|v| v.winner);
+    let task_candidates = view().map(|v| v.task_candidates).unwrap_or_default();
 
     rsx! {
         h1 { "Host Console" }
@@ -1020,6 +1146,31 @@ fn Host() -> Element {
         }
         div {
             h3 { "Tasks" }
+            h4 { "From player bios (rules.md §4, Rounds 3/5)" }
+            p { "Round 1 uses 2 fixed tasks instead -- push those manually below." }
+            for (tier , candidates) in task_candidates.clone() {
+                div {
+                    key: "{tier:?}",
+                    p { "{tier:?}:" }
+                    for candidate in candidates {
+                        button {
+                            key: "{candidate.prompt}",
+                            onclick: {
+                                let candidate = candidate.clone();
+                                move |_| {
+                                    do_cmd(Command::PushTask {
+                                        prompt: candidate.prompt.clone(),
+                                        tier,
+                                        qualifying_players: candidate.qualifying_players.iter().copied().collect(),
+                                    });
+                                }
+                            },
+                            "{candidate.prompt}"
+                        }
+                    }
+                }
+            }
+            h4 { "Manual entry (Round 1's fixed tasks, or a fallback)" }
             input {
                 placeholder: "Task prompt",
                 value: "{task_prompt}",

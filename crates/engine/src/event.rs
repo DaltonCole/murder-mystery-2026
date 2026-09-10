@@ -1,4 +1,5 @@
 use crate::ability::{InfoCheckAnswer, InfoQueryKind};
+use crate::bio::Bio;
 use crate::character::Character;
 use crate::contest::ContestCategory;
 use crate::denouncement::Ballot;
@@ -37,6 +38,13 @@ pub enum DomainEvent {
         character: Character,
     },
     SetupFinalized,
+    /// Carries the full `Bio` -- unlike `GalleryPredictionSubmitted`, a
+    /// bio is public flavor/task-pool content by design (rules.md §1),
+    /// not private information the event log needs to keep out.
+    BioSubmitted {
+        player: PlayerId,
+        bio: Bio,
+    },
     Converted {
         converter: PlayerId,
         target: PlayerId,

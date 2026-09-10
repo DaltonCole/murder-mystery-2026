@@ -234,6 +234,47 @@ impl HostDriver {
         Ok(())
     }
 
+    /// Rounds 3 & 5's task phase (rules.md §4: "Task phase, easy/medium/hard
+    /// tiers live"), pushing one bio-derived task per tier from
+    /// `PlayerView::task_candidates` (Host-only; see that field's doc
+    /// comment) -- unlike Round 1's fixed prompts, these come from whatever
+    /// the room's own submitted bios actually contain. A tier with no
+    /// candidates yet (e.g. nobody filled in that category) is silently
+    /// skipped rather than erroring, same as pushing zero fixed tasks would
+    /// be harmless.
+    pub async fn run_bio_driven_tasks(&mut self, phase_wait: Duration) -> Result<(), ConnError> {
+        let view = self.view().await?;
+        let mut pushed = 0usize;
+        for (tier, candidates) in view.task_candidates {
+            let Some(candidate) = candidates.into_iter().next() else {
+                continue;
+            };
+            pushed += 1;
+            self.conn
+                .do_cmd_until(
+                    Command::PushTask {
+                        prompt: candidate.prompt,
+                        tier,
+                        qualifying_players: candidate.qualifying_players.into_iter().collect(),
+                    },
+                    |v| v.open_tasks.len() >= pushed,
+                    Duration::from_secs(10),
+                    "task count increasing after PushTask",
+                )
+                .await?;
+        }
+        tokio::time::sleep(phase_wait).await;
+        self.conn
+            .do_cmd_until(
+                Command::CloseTasks,
+                |v| v.open_tasks.is_empty(),
+                Duration::from_secs(10),
+                "open_tasks clearing after CloseTasks",
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn advance_round_to(&mut self, expected: Round) -> Result<PlayerView, ConnError> {
         self.conn
             .do_cmd_until(

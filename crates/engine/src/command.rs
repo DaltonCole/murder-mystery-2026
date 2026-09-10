@@ -1,4 +1,5 @@
 use crate::ability::InfoQueryKind;
+use crate::bio::Bio;
 use crate::character::Character;
 use crate::contest::ContestCategory;
 use crate::denouncement::Ballot;
@@ -59,6 +60,17 @@ pub enum Command {
     /// still-`Unassigned` players are left alone. Idempotent -- safe to
     /// call again after adding more players.
     FinalizeSetup,
+
+    /// A player's character sheet (rules.md §1: "Character Name, Real
+    /// Name, Occupation, 5 Hobbies, 5 Notable Clothing Features, and 5
+    /// Skills"), including Servants ("Servants' bios feed into the shared
+    /// task pool too"). A standing choice, changeable at any time (the
+    /// same "silently replaces" shape as `Nominate`/`CastBallot`) rather
+    /// than a one-shot submission, so a typo can be fixed later without a
+    /// dedicated correction command. Rejected if any field exceeds
+    /// rules.md's 32-character cap. See `bio::task_candidates` for how
+    /// this feeds Rounds 3/5's task pool.
+    SubmitBio { player: PlayerId, bio: Bio },
 
     /// The Cult Leader converts a player (rules.md §3.3/§4.3) -- growing
     /// the Cult's ranks if `target` isn't currently titled, or secretly
