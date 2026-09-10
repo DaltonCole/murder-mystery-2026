@@ -291,49 +291,53 @@ fn Play() -> Element {
         if v.roster.iter().any(|r| r.id == id && r.status == PlayerStatus::CastOut) {
             div {
                 h4 { "The Gallery" }
-                p { "Predict who gets Cast Out, or which faction wins -- scored against the Servant leaderboard once the Finale resolves." }
-                select {
-                    onchange: move |e| gallery_pick.set(e.value().parse().ok()),
-                    option { value: "", "-- who gets Cast Out? --" }
-                    for r in v.roster.iter().filter(|r| r.status == PlayerStatus::Active) {
-                        option { value: "{r.id.0}", "{r.name}" }
+                if v.current_round != Round::Finale {
+                    p { "The Gallery opens once the Finale begins." }
+                } else {
+                    p { "Predict who gets Cast Out, or which faction wins -- scored against the Servant leaderboard once the Finale resolves." }
+                    select {
+                        onchange: move |e| gallery_pick.set(e.value().parse().ok()),
+                        option { value: "", "-- who gets Cast Out? --" }
+                        for r in v.roster.iter().filter(|r| r.status == PlayerStatus::Active) {
+                            option { value: "{r.id.0}", "{r.name}" }
+                        }
                     }
-                }
-                button {
-                    disabled: gallery_pick().is_none(),
-                    onclick: move |_| {
-                        let Some(t) = gallery_pick() else { return };
-                        send_cmd(Command::SubmitGalleryPrediction {
-                            player: id,
-                            prediction: GalleryPrediction::CastOutIs(PlayerId(t)),
-                        });
-                    },
-                    "Predict this Cast-Out",
-                }
-                select {
-                    onchange: move |e| {
-                        gallery_faction_pick.set(match e.value().as_str() {
-                            "Ton" => Some(Faction::Ton),
-                            "Uprising" => Some(Faction::Uprising),
-                            "Cult" => Some(Faction::Cult),
-                            _ => None,
-                        });
-                    },
-                    option { value: "", "-- who wins? --" }
-                    option { value: "Ton", "Ton" }
-                    option { value: "Uprising", "Uprising" }
-                    option { value: "Cult", "Cult" }
-                }
-                button {
-                    disabled: gallery_faction_pick().is_none(),
-                    onclick: move |_| {
-                        let Some(f) = gallery_faction_pick() else { return };
-                        send_cmd(Command::SubmitGalleryPrediction {
-                            player: id,
-                            prediction: GalleryPrediction::FactionWins(f),
-                        });
-                    },
-                    "Predict this winner",
+                    button {
+                        disabled: gallery_pick().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = gallery_pick() else { return };
+                            send_cmd(Command::SubmitGalleryPrediction {
+                                player: id,
+                                prediction: GalleryPrediction::CastOutIs(PlayerId(t)),
+                            });
+                        },
+                        "Predict this Cast-Out",
+                    }
+                    select {
+                        onchange: move |e| {
+                            gallery_faction_pick.set(match e.value().as_str() {
+                                "Ton" => Some(Faction::Ton),
+                                "Uprising" => Some(Faction::Uprising),
+                                "Cult" => Some(Faction::Cult),
+                                _ => None,
+                            });
+                        },
+                        option { value: "", "-- who wins? --" }
+                        option { value: "Ton", "Ton" }
+                        option { value: "Uprising", "Uprising" }
+                        option { value: "Cult", "Cult" }
+                    }
+                    button {
+                        disabled: gallery_faction_pick().is_none(),
+                        onclick: move |_| {
+                            let Some(f) = gallery_faction_pick() else { return };
+                            send_cmd(Command::SubmitGalleryPrediction {
+                                player: id,
+                                prediction: GalleryPrediction::FactionWins(f),
+                            });
+                        },
+                        "Predict this winner",
+                    }
                 }
             }
         }
@@ -878,9 +882,10 @@ fn Host() -> Element {
     let mut servant_award_player = use_signal(|| None::<u32>);
     let mut servant_award_points = use_signal(|| 1u32);
     let mut gallery_cast_out = use_signal(String::new);
-    let mut gallery_winner = use_signal(|| Faction::Ton);
+    let mut gallery_winners = use_signal(Vec::<Faction>::new);
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
+    let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
 
     rsx! {
         h1 { "Host Console" }
@@ -1107,6 +1112,24 @@ fn Host() -> Element {
                 },
                 "Record result"
             }
+            if contest_results.is_empty() {
+                p { "Nothing recorded yet." }
+            } else {
+                p { "Already recorded (host-only self-audit -- players never see this):" }
+                ul {
+                    for ((round , category) , ton_won) in contest_results.clone() {
+                        {
+                            let winner = if ton_won { "Ton" } else { "Uprising" };
+                            rsx! {
+                                li {
+                                    key: "{round:?}-{category:?}",
+                                    "{round:?} / {category:?}: {winner} won"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         div {
             h3 { "Intermission lottery" }
@@ -1164,23 +1187,31 @@ fn Host() -> Element {
         }
         div {
             h3 { "Gallery resolution" }
-            p { "Once at the Finale: score every submitted Gallery prediction against the real outcome." }
+            p { "Once at the Finale, after the ballot has actually closed: score every submitted Gallery prediction against the real outcome. Check every faction that actually won -- a King/Queen succession can leave the Uprising and the Cult both winning the same game (see win_condition::evaluate's doc comment), so this isn't always exactly one box." }
             input {
                 placeholder: "actual Cast-Out IDs, e.g. 2,5",
                 value: "{gallery_cast_out}",
                 oninput: move |e| gallery_cast_out.set(e.value()),
             }
-            select {
-                onchange: move |e| {
-                    gallery_winner.set(match e.value().as_str() {
-                        "Uprising" => Faction::Uprising,
-                        "Cult" => Faction::Cult,
-                        _ => Faction::Ton,
-                    });
-                },
-                option { value: "Ton", "Ton wins" }
-                option { value: "Uprising", "Uprising wins" }
-                option { value: "Cult", "Cult wins" }
+            for faction in [Faction::Ton, Faction::Uprising, Faction::Cult] {
+                label {
+                    input {
+                        r#type: "checkbox",
+                        checked: gallery_winners().contains(&faction),
+                        onchange: move |e| {
+                            let mut current = gallery_winners();
+                            if e.checked() {
+                                if !current.contains(&faction) {
+                                    current.push(faction);
+                                }
+                            } else {
+                                current.retain(|&f| f != faction);
+                            }
+                            gallery_winners.set(current);
+                        },
+                    }
+                    " {faction:?} won"
+                }
             }
             button {
                 onclick: move |_| {
@@ -1192,7 +1223,7 @@ fn Host() -> Element {
                         .collect();
                     do_cmd(Command::ResolveGalleryPredictions {
                         actual_cast_out,
-                        actual_winner: gallery_winner(),
+                        actual_winners: gallery_winners(),
                     });
                 },
                 "Resolve Gallery"

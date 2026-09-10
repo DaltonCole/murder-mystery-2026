@@ -373,9 +373,15 @@ pub enum Command {
     /// simple flat award). `actual_cast_out` is whoever the Last
     /// Denouncement actually resolved; a `CastOutIs` prediction is correct
     /// if its name is anywhere in that set (a multi-slot Finale can Cast
-    /// Out more than one person). Once per game.
+    /// Out more than one person). `actual_winners` is every faction that
+    /// actually won -- `win_condition::evaluate`'s own doc comment flags a
+    /// real, known rules.md overlap where the Uprising and the Cult (via
+    /// Path C) can both win the same game, so a `FactionWins` prediction
+    /// must be checked against the *whole* winning set, not a single
+    /// faction, or a correct guess for the "other" true winner would be
+    /// marked wrong. Once per game.
     ResolveGalleryPredictions {
         actual_cast_out: Vec<PlayerId>,
-        actual_winner: Faction,
+        actual_winners: Vec<Faction>,
     },
 }

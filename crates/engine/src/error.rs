@@ -137,6 +137,9 @@ pub enum GameError {
     #[error("{0:?} is not a contest round (only Round::Two and Round::Four have one)")]
     NotAContestRound(Round),
 
+    #[error("{0:?} hasn't happened yet -- the game is still at an earlier round")]
+    ContestRoundNotYetReached(Round),
+
     #[error("the {category:?} result for {round:?} was already recorded")]
     ContestResultAlreadyRecorded {
         round: Round,
@@ -170,4 +173,7 @@ pub enum GameError {
 
     #[error("Gallery predictions have already been resolved")]
     GalleryAlreadyResolved,
+
+    #[error("Gallery predictions can only be resolved once the Last Denouncement has closed")]
+    GalleryResolutionTooEarly,
 }

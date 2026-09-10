@@ -1,5 +1,6 @@
 use crate::ability::{AbilityStatus, InfoCheckDelivery};
 use crate::character::{Character, PlayerStatus};
+use crate::contest::ContestCategory;
 use crate::denouncement::DenouncementPhase;
 use crate::player::{Faction, PlayerId};
 use crate::round::Round;
@@ -143,6 +144,12 @@ pub struct PlayerView {
     /// Gallery predictions themselves are never exposed here or anywhere
     /// else -- only the resulting point awards, once resolved.
     pub servant_leaderboard: Vec<(PlayerId, u32)>,
+    /// Every contest result recorded so far -- `Viewer::Host` ONLY, always
+    /// empty for `Viewer::Player`/`Viewer::Display` (rules.md: players
+    /// never learn the standings or the breakdown, even after the round
+    /// ends). Gives the host a self-audit view before recording another
+    /// result, since `RecordContestResult` has no correction command.
+    pub contest_results: Vec<((Round, ContestCategory), bool)>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -233,6 +240,11 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     let revealed_leader = viewer_id.and_then(|id| state.leader_known_to(id));
     let i_opted_into_intermission = viewer_id.is_some_and(|id| state.opted_into_intermission(id));
     let intermission_entrants = state.intermission_entrants().map(|e| e.to_vec());
+    let contest_results = if matches!(viewer, Viewer::Host) {
+        state.contest_results_for_host()
+    } else {
+        Vec::new()
+    };
 
     PlayerView {
         roster,
@@ -251,6 +263,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         i_opted_into_intermission,
         intermission_entrants,
         servant_leaderboard: state.servant_leaderboard(),
+        contest_results,
     }
 }
 
@@ -1054,6 +1067,7 @@ mod tests {
         let confidant = new_player(&mut state, "Confidant", Faction::Uprising);
         let bystander = new_player(&mut state, "Bystander", Faction::Uprising);
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
 
         apply_command(
             &mut state,
@@ -1192,5 +1206,51 @@ mod tests {
         let serialized = serde_json::to_string(&view_for(&state, Viewer::Host)).unwrap();
         assert!(!serialized.contains("CastOutIs"));
         assert!(!serialized.contains("FactionWins"));
+    }
+
+    #[test]
+    fn contest_results_are_visible_to_the_host_only() {
+        let mut state = GameState::new();
+        apply_command(
+            &mut state,
+            Command::AddPlayer {
+                name: "Alice".into(),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: PlayerId(0),
+                faction: Faction::Ton,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: crate::ContestCategory::Strength,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+
+        // The host gets a self-audit view of what's already recorded...
+        let host_view = view_for(&state, Viewer::Host);
+        assert_eq!(
+            host_view.contest_results,
+            vec![((Round::Two, crate::ContestCategory::Strength), true)]
+        );
+
+        // ...but no player, and not Display either, ever sees this --
+        // rules.md is explicit that players never learn the standings or
+        // the breakdown, even after the round ends.
+        assert!(view_for(&state, Viewer::Player(PlayerId(0)))
+            .contest_results
+            .is_empty());
+        assert!(view_for(&state, Viewer::Display).contest_results.is_empty());
     }
 }

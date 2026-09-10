@@ -12,6 +12,7 @@ use crate::event::DomainEvent;
 use crate::player::{Faction, Player, PlayerId};
 use crate::recruitment::recruitment_window_size;
 use crate::round::Round;
+use crate::servant::GalleryPrediction;
 use crate::task::{TaskDef, TaskId, TaskTier};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -206,7 +207,7 @@ pub struct GameState {
     /// Never exposed through `view_for` at all -- private until
     /// `resolve_gallery_predictions` scores it, and even then only the
     /// resulting point award is visible, never the prediction itself.
-    gallery_predictions: BTreeMap<PlayerId, crate::servant::GalleryPrediction>,
+    gallery_predictions: BTreeMap<PlayerId, GalleryPrediction>,
     gallery_resolved: bool,
 
     // --- Phase 2: Cell Leader passive-knowledge (rules.md §3.2) ---
@@ -560,6 +561,19 @@ impl GameState {
         board
     }
 
+    /// Every contest result recorded so far -- unlike every other Phase 3
+    /// accessor, this one is deliberately exposed to `Viewer::Host` only
+    /// (never `Viewer::Player`/`Viewer::Display`, and NOT keyed off a
+    /// `PlayerId` the way the rest of `view.rs` is), so the host has a
+    /// self-audit view: `RecordContestResult` has no correction command
+    /// and rules.md says players must never learn the breakdown, so
+    /// letting the host see what's already on record before they submit
+    /// another one is the only realistic guard against a mis-tagged round
+    /// going unnoticed for the rest of a live event.
+    pub(crate) fn contest_results_for_host(&self) -> Vec<((Round, ContestCategory), bool)> {
+        self.contest_results.iter().map(|(&k, &v)| (k, v)).collect()
+    }
+
     /// The faction a title's holder must belong to. Used to validate
     /// [`Command::AssignCharacter`] -- e.g. rejects assigning `CultLeader`
     /// to a Ton player.
@@ -845,8 +859,8 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
         }
         Command::ResolveGalleryPredictions {
             actual_cast_out,
-            actual_winner,
-        } => resolve_gallery_predictions(state, actual_cast_out, actual_winner)?,
+            actual_winners,
+        } => resolve_gallery_predictions(state, actual_cast_out, actual_winners)?,
     };
 
     state.event_log.extend(events.clone());
@@ -1278,6 +1292,16 @@ fn resolve_cast_out(
                 Some(Character::RevolutionaryLeader);
         }
         state.revolutionary_leader = replacement;
+        // The Leader's Confidants (rules.md §3.2) are a reveal about a
+        // *specific person*, not a standing permission that should follow
+        // whoever happens to hold the title next -- `leader_known_to`
+        // resolves dynamically against `state.revolutionary_leader`, so
+        // without this, every past Confidant would instantly and silently
+        // learn the brand-new successor's identity for free the moment
+        // succession happens, with no new trigger ever having fired for
+        // them. A fresh Leader starts fully unknown, matching rules.md's
+        // "a fresh, unconverted Leader" framing for succession.
+        state.leader_known_by.clear();
 
         events.push(DomainEvent::RevolutionaryLeaderSucceeded {
             old_leader: player,
@@ -1617,9 +1641,14 @@ fn close_runoff(
 
     let mut tally = tally_ballots(state, &candidates, &ballots);
     // Same override as `close_ballot` -- applies to whichever tally is
-    // open when the Grand Inquisitor is invoked, the runoff included.
+    // open when the Grand Inquisitor is invoked, the runoff included. The
+    // cap is on the Denouncement's *total* (rules.md: "forcing a 2-for-1
+    // Denouncement regardless of headcount"), not the runoff's own slot
+    // count in isolation -- `already_locked_in` here is whoever the
+    // *original* ballot already resolved cleanly before the tie, so the
+    // runoff itself may only fill whatever's left of that 2-person budget.
     let slots_remaining = if state.grand_inquisitor_armed {
-        2
+        2usize.saturating_sub(already_locked_in.len())
     } else {
         slots_remaining
     };
@@ -1785,6 +1814,16 @@ fn record_contest_result(
     if !matches!(round, Round::Two | Round::Four) {
         return Err(GameError::NotAContestRound(round));
     }
+    // Guards the specific live-event mistake of a host whose round
+    // selector is still sitting on a stale default (e.g. `Round::Two`)
+    // recording a result for a round that hasn't actually happened yet --
+    // that combination can only ever be a mis-click, never a real result.
+    // Deliberately NOT `round != state.current_round`: a host correcting a
+    // *past* contest round's category they forgot to tap in earlier is
+    // legitimate and must stay possible.
+    if round > state.current_round {
+        return Err(GameError::ContestRoundNotYetReached(round));
+    }
     if state.contest_results.contains_key(&(round, category)) {
         return Err(GameError::ContestResultAlreadyRecorded { round, category });
     }
@@ -1888,7 +1927,7 @@ fn award_servant_points(
 fn submit_gallery_prediction(
     state: &mut GameState,
     player: PlayerId,
-    prediction: crate::servant::GalleryPrediction,
+    prediction: GalleryPrediction,
 ) -> Result<Vec<DomainEvent>, GameError> {
     let p = state
         .players
@@ -1911,20 +1950,32 @@ fn submit_gallery_prediction(
 fn resolve_gallery_predictions(
     state: &mut GameState,
     actual_cast_out: Vec<PlayerId>,
-    actual_winner: Faction,
+    actual_winners: Vec<Faction>,
 ) -> Result<Vec<DomainEvent>, GameError> {
     if state.gallery_resolved {
         return Err(GameError::GalleryAlreadyResolved);
     }
+    // Guards against the single highest-consequence mistake in this whole
+    // command: resolution is once-per-game and irreversible, so firing it
+    // even one round early would permanently zero out the Gallery for the
+    // rest of a live 2-hour event with no way to re-run it once real
+    // predictions actually come in. Requires the Last Denouncement to have
+    // actually closed (not just be open) -- the real outcome isn't known
+    // until then, so resolving any earlier could only ever be a mistake.
+    if state.current_round != Round::Finale || state.denouncement.is_some() {
+        return Err(GameError::GalleryResolutionTooEarly);
+    }
     state.gallery_resolved = true;
 
     let mut events = Vec::new();
+    let mut correct_predictions = 0;
     for (&player, prediction) in state.gallery_predictions.clone().iter() {
         let correct = match prediction {
-            crate::servant::GalleryPrediction::CastOutIs(id) => actual_cast_out.contains(id),
-            crate::servant::GalleryPrediction::FactionWins(f) => *f == actual_winner,
+            GalleryPrediction::CastOutIs(id) => actual_cast_out.contains(id),
+            GalleryPrediction::FactionWins(f) => actual_winners.contains(f),
         };
         if correct {
+            correct_predictions += 1;
             let total = state.servant_points.entry(player).or_insert(0);
             *total += 1;
             events.push(DomainEvent::ServantPointsAwarded {
@@ -1934,6 +1985,9 @@ fn resolve_gallery_predictions(
             });
         }
     }
+    events.push(DomainEvent::GalleryPredictionsResolved {
+        correct_predictions,
+    });
     Ok(events)
 }
 
@@ -7908,6 +7962,136 @@ mod tests {
     }
 
     #[test]
+    fn grand_inquisitor_during_a_runoff_still_caps_the_whole_denouncement_at_two() {
+        // Regression test: at a population where the *original* ballot
+        // already locks in a clean winner before a tie sends the second
+        // slot to a runoff, arming the Grand Inquisitor during that runoff
+        // must still cap the Denouncement's total at 2 -- not add 2 more
+        // on top of whoever the original ballot already resolved.
+        let (mut state, p) = setup_phase2_game();
+        add_player(&mut state, "Extra", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        assert_eq!(
+            state.competing_player_count(),
+            21,
+            "need 21-30 for a 2-slot execution count"
+        );
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        for (voter, nominee) in [
+            (p.oracle, p.king_queen),
+            (p.almanac, p.medic),
+            (p.priest, p.priest),
+        ] {
+            apply_command(&mut state, Command::Nominate { voter, nominee }).unwrap();
+        }
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        // king_queen: a clean 5-vote winner. medic and priest: tied at 2
+        // votes each for the second slot.
+        for voter in [
+            p.oracle,
+            p.almanac,
+            p.potion_maker,
+            p.magistrate,
+            p.spymaster,
+        ] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.king_queen),
+                },
+            )
+            .unwrap();
+        }
+        for voter in [p.bartender, p.firebrand] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.medic),
+                },
+            )
+            .unwrap();
+        }
+        for voter in [p.cell_leader, p.deceiver] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.priest),
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&events[0], DomainEvent::RunoffOpened { .. }),
+            "expected king_queen locked in cleanly, medic/priest tied into a runoff: {events:?}"
+        );
+
+        apply_command(
+            &mut state,
+            Command::ActivateGrandInquisitor {
+                player: p.grand_inquisitor,
+            },
+        )
+        .unwrap();
+        // medic outpolls priest in the runoff -- with the override
+        // correctly capped, only medic should take the one slot left.
+        for voter in [p.normal_ton, p.normal_uprising] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.medic),
+                },
+            )
+            .unwrap();
+        }
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.duelist,
+                ballot: Ballot::For(p.priest),
+            },
+        )
+        .unwrap();
+
+        let runoff_events = apply_command(
+            &mut state,
+            Command::CloseRunoff {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        match &runoff_events[0] {
+            DomainEvent::RunoffClosed { cast_out, .. } => {
+                assert_eq!(
+                    cast_out.len(),
+                    2,
+                    "Grand Inquisitor promises exactly 2 total, not 3: {cast_out:?}"
+                );
+                assert!(cast_out.contains(&p.king_queen));
+                assert!(cast_out.contains(&p.medic));
+                assert!(
+                    !cast_out.contains(&p.priest),
+                    "priest lost the runoff and must not also be swept in"
+                );
+            }
+            other => panic!("expected RunoffClosed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn activate_grand_inquisitor_rejects_a_non_grand_inquisitor() {
         let (mut state, p) = setup_phase2_game();
         let result = apply_command(
@@ -8042,6 +8226,7 @@ mod tests {
     #[test]
     fn record_contest_result_rejects_a_duplicate() {
         let mut state = GameState::new();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
         apply_command(
             &mut state,
             Command::RecordContestResult {
@@ -8071,6 +8256,7 @@ mod tests {
     #[test]
     fn record_contest_result_tracks_distinct_categories_independently() {
         let mut state = GameState::new();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
         apply_command(
             &mut state,
             Command::RecordContestResult {
@@ -8093,12 +8279,54 @@ mod tests {
         .unwrap();
         // And the same category in a *different* contest round is its own
         // independent slot too.
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Four
         apply_command(
             &mut state,
             Command::RecordContestResult {
                 round: Round::Four,
                 category: ContestCategory::Strength,
                 ton_won: false,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn record_contest_result_rejects_a_round_that_has_not_happened_yet() {
+        let mut state = GameState::new();
+        // A fresh game starts at Round::One -- Round::Two hasn't happened
+        // yet, so this must be rejected even though it's a valid contest
+        // round in the abstract (the exact host mistake this check exists
+        // to catch: a round selector left on a stale default).
+        let result = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: true,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::ContestRoundNotYetReached(Round::Two))
+        );
+    }
+
+    #[test]
+    fn record_contest_result_allows_correcting_a_past_round() {
+        let mut state = GameState::new();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Four
+                                                                   // Round Two already happened -- a host filling in a category they
+                                                                   // forgot to tap in earlier must still be able to.
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: true,
             },
         )
         .unwrap();
@@ -8115,6 +8343,7 @@ mod tests {
         );
         let member = add_player(&mut state, "Member", Faction::Uprising);
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
 
         let events = apply_command(
             &mut state,
@@ -8144,6 +8373,7 @@ mod tests {
         );
         add_player(&mut state, "Member", Faction::Uprising);
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
 
         let events = apply_command(
             &mut state,
@@ -8172,6 +8402,7 @@ mod tests {
         let member_a = add_player(&mut state, "A", Faction::Uprising);
         let member_b = add_player(&mut state, "B", Faction::Uprising);
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
         let _ = leader;
 
         let events1 = apply_command(
@@ -8228,6 +8459,53 @@ mod tests {
     }
 
     #[test]
+    fn leader_confidant_knowledge_is_cleared_on_leader_succession() {
+        // Regression test: `leader_known_to` resolves dynamically against
+        // whoever `state.revolutionary_leader` currently is. Without
+        // clearing `leader_known_by` on succession, a past Confidant would
+        // instantly and silently learn the brand-new successor's identity
+        // for free the moment the old Leader is Cast Out, despite the
+        // Confidants mechanic never having fired for the successor at all.
+        let mut state = GameState::new();
+        let leader = assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        let confidant = add_player(&mut state, "Confidant", Faction::Uprising);
+        let successor = add_player(&mut state, "Successor", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.leader_known_to(confidant), Some(leader));
+
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: leader,
+                fallback_replacement: Some(successor),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.revolutionary_leader(), Some(successor));
+
+        // The old Confidant must NOT automatically know the new Leader --
+        // and the new Leader must start with nobody knowing them.
+        assert_eq!(state.leader_known_to(confidant), None);
+        assert!(state.confidants_known_to_leader(successor).is_empty());
+    }
+
+    #[test]
     fn leader_confidant_never_selects_the_leader_themselves() {
         let mut state = GameState::new();
         assign_new(
@@ -8237,6 +8515,7 @@ mod tests {
             Character::RevolutionaryLeader,
         );
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
 
         // No other Uprising member exists -- nothing eligible to reveal.
         let events = apply_command(
@@ -8666,7 +8945,7 @@ mod tests {
             &mut state,
             Command::SubmitGalleryPrediction {
                 player: active_player,
-                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Ton),
+                prediction: GalleryPrediction::FactionWins(Faction::Ton),
             },
         );
         assert_eq!(
@@ -8692,7 +8971,7 @@ mod tests {
             &mut state,
             Command::SubmitGalleryPrediction {
                 player,
-                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Ton),
+                prediction: GalleryPrediction::FactionWins(Faction::Ton),
             },
         );
         assert_eq!(result, Err(GameError::GalleryPredictionWindowClosed));
@@ -8705,7 +8984,7 @@ mod tests {
             &mut state,
             Command::SubmitGalleryPrediction {
                 player: cast_out_player,
-                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Ton),
+                prediction: GalleryPrediction::FactionWins(Faction::Ton),
             },
         )
         .unwrap();
@@ -8713,15 +8992,13 @@ mod tests {
             &mut state,
             Command::SubmitGalleryPrediction {
                 player: cast_out_player,
-                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Uprising),
+                prediction: GalleryPrediction::FactionWins(Faction::Uprising),
             },
         )
         .unwrap();
         assert_eq!(
             state.gallery_predictions.get(&cast_out_player),
-            Some(&crate::servant::GalleryPrediction::FactionWins(
-                Faction::Uprising
-            ))
+            Some(&GalleryPrediction::FactionWins(Faction::Uprising))
         );
     }
 
@@ -8745,7 +9022,7 @@ mod tests {
             &mut state,
             Command::SubmitGalleryPrediction {
                 player: cast_out_a,
-                prediction: crate::servant::GalleryPrediction::CastOutIs(target),
+                prediction: GalleryPrediction::CastOutIs(target),
             },
         )
         .unwrap();
@@ -8753,7 +9030,19 @@ mod tests {
             &mut state,
             Command::SubmitGalleryPrediction {
                 player: cast_out_b,
-                prediction: crate::servant::GalleryPrediction::FactionWins(Faction::Uprising),
+                prediction: GalleryPrediction::FactionWins(Faction::Uprising),
+            },
+        )
+        .unwrap();
+
+        // Predictions must be submitted before the ballot closes; resolving
+        // requires it to have actually closed.
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
             },
         )
         .unwrap();
@@ -8762,7 +9051,7 @@ mod tests {
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![target],
-                actual_winner: Faction::Ton,
+                actual_winners: vec![Faction::Ton],
             },
         )
         .unwrap();
@@ -8781,11 +9070,20 @@ mod tests {
     #[test]
     fn resolve_gallery_predictions_rejects_reuse() {
         let (mut state, _) = setup_at_finale_with_open_denouncement();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
         apply_command(
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![],
-                actual_winner: Faction::Ton,
+                actual_winners: vec![Faction::Ton],
             },
         )
         .unwrap();
@@ -8793,9 +9091,109 @@ mod tests {
             &mut state,
             Command::ResolveGalleryPredictions {
                 actual_cast_out: vec![],
-                actual_winner: Faction::Ton,
+                actual_winners: vec![Faction::Ton],
             },
         );
         assert_eq!(result, Err(GameError::GalleryAlreadyResolved));
+    }
+
+    #[test]
+    fn resolve_gallery_predictions_rejects_before_the_finale() {
+        let mut state = GameState::new();
+        let result = apply_command(
+            &mut state,
+            Command::ResolveGalleryPredictions {
+                actual_cast_out: vec![],
+                actual_winners: vec![Faction::Ton],
+            },
+        );
+        assert_eq!(result, Err(GameError::GalleryResolutionTooEarly));
+    }
+
+    #[test]
+    fn resolve_gallery_predictions_rejects_while_the_last_denouncement_is_still_open() {
+        // Regression test: resolution is once-per-game and irreversible --
+        // firing it before the real outcome is even known must be rejected,
+        // not silently accepted with a caller-guessed "actual" outcome.
+        let (mut state, _) = setup_at_finale_with_open_denouncement();
+        let result = apply_command(
+            &mut state,
+            Command::ResolveGalleryPredictions {
+                actual_cast_out: vec![],
+                actual_winners: vec![Faction::Ton],
+            },
+        );
+        assert_eq!(result, Err(GameError::GalleryResolutionTooEarly));
+    }
+
+    #[test]
+    fn resolve_gallery_predictions_handles_the_multi_winner_overlap() {
+        // win_condition::evaluate's own doc comment flags a real, known
+        // rules.md overlap: the Uprising and the Cult (via Path C) can both
+        // win the same game. A FactionWins prediction for either actual
+        // winner must score correct, not just whichever one the host lists
+        // first.
+        let (mut state, cast_out_player) = setup_at_finale_with_open_denouncement();
+        apply_command(
+            &mut state,
+            Command::SubmitGalleryPrediction {
+                player: cast_out_player,
+                prediction: GalleryPrediction::FactionWins(Faction::Uprising),
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::ResolveGalleryPredictions {
+                actual_cast_out: vec![],
+                actual_winners: vec![Faction::Uprising, Faction::Cult],
+            },
+        )
+        .unwrap();
+        assert!(events.iter().any(
+            |e| matches!(e, DomainEvent::ServantPointsAwarded { player, .. } if *player == cast_out_player)
+        ));
+    }
+
+    #[test]
+    fn resolve_gallery_predictions_emits_an_event_even_with_no_correct_predictions() {
+        let (mut state, _) = setup_at_finale_with_open_denouncement();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        // Nobody submitted a prediction at all -- resolution must still
+        // leave an event-log trace, the same as every other Phase 2/3
+        // command that always emits its own canonical event.
+        let events = apply_command(
+            &mut state,
+            Command::ResolveGalleryPredictions {
+                actual_cast_out: vec![],
+                actual_winners: vec![Faction::Ton],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![DomainEvent::GalleryPredictionsResolved {
+                correct_predictions: 0,
+            }]
+        );
     }
 }

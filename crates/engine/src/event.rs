@@ -272,4 +272,13 @@ pub enum DomainEvent {
     GalleryPredictionSubmitted {
         player: PlayerId,
     },
+    /// Emitted unconditionally, even if nobody predicted correctly (or
+    /// nobody predicted at all) -- every other Phase 2/3 command emits its
+    /// own canonical "this happened" event regardless of side effects, and
+    /// without this one, resolution leaves no event-log trace at all when
+    /// `correct_predictions` is 0, only the private `gallery_resolved`
+    /// flag.
+    GalleryPredictionsResolved {
+        correct_predictions: usize,
+    },
 }
