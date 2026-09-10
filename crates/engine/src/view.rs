@@ -120,6 +120,24 @@ pub struct PlayerView {
     /// exposed for anyone but the viewer themselves -- the Bartender isn't
     /// told whether their target actually landed drunk.
     pub i_am_drunk: bool,
+    /// The Revolutionary Leader's own view of who currently knows their
+    /// identity (rules.md §3.2, the Leader's Confidants) -- empty for
+    /// every other viewer, including a Confidant themselves (they see
+    /// `revealed_leader` instead, not this list).
+    pub my_confidants: Vec<PlayerId>,
+    /// The Revolutionary Leader's identity, if the viewer has been
+    /// revealed to as one of their Confidants -- `None` for everyone else,
+    /// including the Leader's own view of themselves.
+    pub revealed_leader: Option<PlayerId>,
+    /// Whether the viewer has opted into the Intermission lottery -- only
+    /// ever the viewer's own status, never anyone else's. Always `false`
+    /// for Host/Display.
+    pub i_opted_into_intermission: bool,
+    /// The drawn Intermission entrants, once drawn -- `None` until then.
+    /// Unlike the opt-in pool, this is public once it exists (rules.md §4
+    /// frames the draw as a live, shared party moment), so every viewer
+    /// kind gets the same answer.
+    pub intermission_entrants: Option<Vec<PlayerId>>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -204,6 +222,12 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         .map(|_| state.cell_leader_knows().to_vec())
         .unwrap_or_default();
     let i_am_drunk = viewer_id.is_some_and(|id| state.is_drunk(id));
+    let my_confidants = viewer_id
+        .map(|id| state.confidants_known_to_leader(id))
+        .unwrap_or_default();
+    let revealed_leader = viewer_id.and_then(|id| state.leader_known_to(id));
+    let i_opted_into_intermission = viewer_id.is_some_and(|id| state.opted_into_intermission(id));
+    let intermission_entrants = state.intermission_entrants().map(|e| e.to_vec());
 
     PlayerView {
         roster,
@@ -217,6 +241,10 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         fellow_cultists,
         known_uprising_members,
         i_am_drunk,
+        my_confidants,
+        revealed_leader,
+        i_opted_into_intermission,
+        intermission_entrants,
     }
 }
 
@@ -980,5 +1008,134 @@ mod tests {
         assert!(!view_for(&state, Viewer::Player(bartender)).i_am_drunk);
         assert!(!view_for(&state, Viewer::Host).i_am_drunk);
         assert!(!view_for(&state, Viewer::Display).i_am_drunk);
+    }
+
+    #[test]
+    fn leader_confidant_reveal_is_scoped_to_the_leader_and_the_confidant_only() {
+        let mut state = GameState::new();
+        let new_player = |state: &mut GameState, name: &str, faction: Faction| -> PlayerId {
+            let events = apply_command(
+                state,
+                Command::AddPlayer {
+                    name: name.to_string(),
+                },
+            )
+            .unwrap();
+            let id = match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_command(
+                state,
+                Command::AssignFaction {
+                    player: id,
+                    faction,
+                },
+            )
+            .unwrap();
+            id
+        };
+
+        let leader = new_player(&mut state, "Leader", Faction::Uprising);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: leader,
+                character: Character::RevolutionaryLeader,
+            },
+        )
+        .unwrap();
+        let confidant = new_player(&mut state, "Confidant", Faction::Uprising);
+        let bystander = new_player(&mut state, "Bystander", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: crate::ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+
+        // The Leader sees who now knows them.
+        let leader_view = view_for(&state, Viewer::Player(leader));
+        assert_eq!(leader_view.my_confidants, vec![confidant]);
+        assert_eq!(leader_view.revealed_leader, None);
+
+        // The Confidant learns the Leader's identity -- but doesn't get
+        // the Leader's own "who knows me" list.
+        let confidant_view = view_for(&state, Viewer::Player(confidant));
+        assert_eq!(confidant_view.revealed_leader, Some(leader));
+        assert!(confidant_view.my_confidants.is_empty());
+
+        // Nobody else -- not an uninvolved Uprising member, not Host,
+        // not Display -- learns anything from either field.
+        let bystander_view = view_for(&state, Viewer::Player(bystander));
+        assert_eq!(bystander_view.revealed_leader, None);
+        assert!(bystander_view.my_confidants.is_empty());
+        assert_eq!(view_for(&state, Viewer::Host).revealed_leader, None);
+        assert_eq!(view_for(&state, Viewer::Display).revealed_leader, None);
+    }
+
+    #[test]
+    fn intermission_opt_in_is_private_but_the_drawn_entrants_are_public() {
+        let mut state = GameState::new();
+        apply_command(
+            &mut state,
+            Command::AddPlayer {
+                name: "Alice".into(),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: PlayerId(0),
+                faction: Faction::Ton,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        apply_command(
+            &mut state,
+            Command::OptIntoIntermission {
+                player: PlayerId(0),
+            },
+        )
+        .unwrap();
+
+        // Opt-in status is private to the opted-in player themselves.
+        assert!(view_for(&state, Viewer::Player(PlayerId(0))).i_opted_into_intermission);
+        assert!(!view_for(&state, Viewer::Host).i_opted_into_intermission);
+        assert_eq!(
+            view_for(&state, Viewer::Player(PlayerId(0))).intermission_entrants,
+            None
+        );
+
+        apply_command(
+            &mut state,
+            Command::DrawIntermissionEntrants {
+                selected: vec![PlayerId(0)],
+            },
+        )
+        .unwrap();
+
+        // Once drawn, the entrant list is the same for every viewer kind.
+        let expected = Some(vec![PlayerId(0)]);
+        assert_eq!(
+            view_for(&state, Viewer::Player(PlayerId(0))).intermission_entrants,
+            expected
+        );
+        assert_eq!(
+            view_for(&state, Viewer::Host).intermission_entrants,
+            expected
+        );
+        assert_eq!(
+            view_for(&state, Viewer::Display).intermission_entrants,
+            expected
+        );
     }
 }

@@ -1,5 +1,7 @@
 use crate::character::Character;
+use crate::contest::ContestCategory;
 use crate::player::{Faction, PlayerId};
+use crate::round::Round;
 use crate::task::TaskId;
 use thiserror::Error;
 
@@ -131,4 +133,27 @@ pub enum GameError {
     /// §3.1: "the Cult Leader can't target that person that round").
     #[error("player {0:?} is protected from conversion this round by the Priest/Priestess")]
     ProtectedFromConversionThisRound(PlayerId),
+
+    #[error("{0:?} is not a contest round (only Round::Two and Round::Four have one)")]
+    NotAContestRound(Round),
+
+    #[error("the {category:?} result for {round:?} was already recorded")]
+    ContestResultAlreadyRecorded {
+        round: Round,
+        category: ContestCategory,
+    },
+
+    #[error("the Intermission lottery has already been drawn")]
+    IntermissionAlreadyDrawn,
+
+    #[error(
+        "player {0:?} can't be an Intermission entrant (didn't opt in, or isn't currently active)"
+    )]
+    InvalidIntermissionEntrant(PlayerId),
+
+    #[error("at most 5 Intermission entrants can be drawn, got {0}")]
+    TooManyIntermissionEntrants(usize),
+
+    #[error("duplicate Intermission entrant {0:?}")]
+    DuplicateIntermissionEntrant(PlayerId),
 }

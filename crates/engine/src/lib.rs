@@ -12,6 +12,7 @@
 mod ability;
 mod character;
 mod command;
+mod contest;
 mod denouncement;
 mod error;
 mod event;
@@ -26,6 +27,7 @@ mod win_condition;
 pub use ability::{AbilityStatus, Dossier, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind};
 pub use character::{Character, PlayerStatus};
 pub use command::Command;
+pub use contest::ContestCategory;
 pub use denouncement::{Ballot, DenouncementPhase};
 pub use error::GameError;
 pub use event::DomainEvent;

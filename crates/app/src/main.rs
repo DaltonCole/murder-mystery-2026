@@ -52,9 +52,9 @@ use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use engine::DomainEvent;
 use engine::{
-    AbilityStatus, Ballot, Character, Command, DenouncementView, Faction, InfoCheckAnswer,
-    InfoCheckDelivery, InfoQueryKind, PlayerId, PlayerStatus, PlayerView, RosterEntry, TaskTier,
-    TaskView, Viewer,
+    AbilityStatus, Ballot, Character, Command, ContestCategory, DenouncementView, Faction,
+    InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind, PlayerId, PlayerStatus, PlayerView,
+    RosterEntry, Round, TaskTier, TaskView, Viewer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -261,6 +261,28 @@ fn Play() -> Element {
             "Your faction: {v.own_faction:?}"
             if let Some(c) = v.own_character {
                 " -- {c:?}"
+            }
+        }
+        if v.i_am_drunk {
+            p { style: "color:red", "You're drunk this round -- you can't nominate or vote." }
+        }
+        if let Some(leader) = v.revealed_leader {
+            p { "You now know the Revolutionary Leader: {names(&[leader], &v.roster)}." }
+        }
+        if !v.my_confidants.is_empty() {
+            p { "These people now know you're the Revolutionary Leader: {names(&v.my_confidants, &v.roster)}." }
+        }
+        div {
+            h4 { "Intermission" }
+            if let Some(entrants) = &v.intermission_entrants {
+                p { "Entrants: {names(entrants, &v.roster)}" }
+            } else if v.i_opted_into_intermission {
+                p { "You're in the pool. Entrants haven't been drawn yet." }
+            } else {
+                button {
+                    onclick: move |_| send_cmd(Command::OptIntoIntermission { player: id }),
+                    "Opt into the Intermission lottery",
+                }
             }
         }
         RosterList { roster: v.roster.clone() }
@@ -787,6 +809,10 @@ fn Host() -> Element {
     let mut task_qualifier = use_signal(|| None::<u32>);
     let mut convert_converter = use_signal(|| None::<u32>);
     let mut convert_target = use_signal(|| None::<u32>);
+    let mut contest_round = use_signal(|| Round::Two);
+    let mut contest_category = use_signal(|| ContestCategory::Strength);
+    let mut contest_ton_won = use_signal(|| true);
+    let mut intermission_selected = use_signal(String::new);
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
 
@@ -976,6 +1002,66 @@ fn Host() -> Element {
                     });
                 },
                 "Convert"
+            }
+        }
+        div {
+            h3 { "Contest rounds (Round 2 & 4)" }
+            p { "The actual mini-games are designed later -- this just records each category's result. Players never see the running standings or the breakdown (only the engine tracks it, for the Leader's Confidants)." }
+            select {
+                onchange: move |e| {
+                    contest_round.set(if e.value() == "Four" { Round::Four } else { Round::Two });
+                },
+                option { value: "Two", "Round 2" }
+                option { value: "Four", "Round 4" }
+            }
+            select {
+                onchange: move |e| {
+                    contest_category.set(match e.value().as_str() {
+                        "Creativity" => ContestCategory::Creativity,
+                        "Intelligence" => ContestCategory::Intelligence,
+                        _ => ContestCategory::Strength,
+                    });
+                },
+                option { value: "Strength", "Strength" }
+                option { value: "Creativity", "Creativity" }
+                option { value: "Intelligence", "Intelligence" }
+            }
+            select {
+                onchange: move |e| contest_ton_won.set(e.value() == "Ton"),
+                option { value: "Ton", "Ton won" }
+                option { value: "Uprising", "Uprising won" }
+            }
+            button {
+                onclick: move |_| {
+                    do_cmd(Command::RecordContestResult {
+                        round: contest_round(),
+                        category: contest_category(),
+                        ton_won: contest_ton_won(),
+                    });
+                },
+                "Record result"
+            }
+        }
+        div {
+            h3 { "Intermission lottery" }
+            p { "Draw the 5 entrants from whoever opted in (comma-separated player IDs -- the host doesn't get a names-and-opt-ins list here, per the same no-ambient-god-view rule as everything else)." }
+            input {
+                placeholder: "e.g. 2,5,9",
+                value: "{intermission_selected}",
+                oninput: move |e| intermission_selected.set(e.value()),
+            }
+            button {
+                onclick: move |_| {
+                    let selected: Vec<PlayerId> = intermission_selected
+                        .peek()
+                        .split(',')
+                        .filter_map(|s| s.trim().parse::<u32>().ok())
+                        .map(PlayerId)
+                        .collect();
+                    do_cmd(Command::DrawIntermissionEntrants { selected });
+                    intermission_selected.set(String::new());
+                },
+                "Draw entrants"
             }
         }
         RosterList { roster }

@@ -1,5 +1,6 @@
 use crate::ability::{InfoCheckAnswer, InfoQueryKind};
 use crate::character::Character;
+use crate::contest::ContestCategory;
 use crate::denouncement::Ballot;
 use crate::player::{Faction, PlayerId};
 use crate::round::Round;
@@ -230,5 +231,29 @@ pub enum DomainEvent {
     },
     GrandInquisitorInvoked {
         player: PlayerId,
+    },
+
+    // --- Phase 3: contest rounds + the Leader's Confidants ---
+    ContestResultRecorded {
+        round: Round,
+        category: ContestCategory,
+        ton_won: bool,
+    },
+    /// A bidirectional identity reveal (rules.md §3.2): `confidant` learns
+    /// who `leader` is, and `leader` learns `confidant`'s identity in
+    /// return (though `leader` already knew who every active Uprising
+    /// member was publicly -- what's new for them is specifically that
+    /// this person now knows about *them*).
+    LeaderConfidantRevealed {
+        leader: PlayerId,
+        confidant: PlayerId,
+    },
+
+    // --- Phase 3: the Intermission lottery ---
+    IntermissionOptedIn {
+        player: PlayerId,
+    },
+    IntermissionEntrantsDrawn {
+        entrants: Vec<PlayerId>,
     },
 }

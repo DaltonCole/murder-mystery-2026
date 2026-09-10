@@ -3,6 +3,7 @@ use crate::ability::{
 };
 use crate::character::{Character, PlayerStatus};
 use crate::command::Command;
+use crate::contest::ContestCategory;
 use crate::denouncement::{
     execution_count, resolve_ballot, surfaced_nominees, Ballot, Denouncement, DenouncementPhase,
 };
@@ -178,6 +179,25 @@ pub struct GameState {
     grand_inquisitor_armed: bool,
     grand_inquisitor_used: bool,
 
+    // --- Phase 3: contest rounds + the Leader's Confidants (rules.md
+    // §3.2/§4) ---
+    /// Every recorded contest category result, keyed by (round, category)
+    /// so `RecordContestResult` can reject a duplicate. Deliberately never
+    /// surfaced through `view_for` to any viewer -- see
+    /// `Command::RecordContestResult`'s doc comment.
+    contest_results: BTreeMap<(Round, ContestCategory), bool>,
+    /// Every active Uprising member who currently knows the Revolutionary
+    /// Leader's identity, grown one at a time by `trigger_leader_confidant`
+    /// -- never shrinks, and self-limits once it covers every active
+    /// Uprising member (rules.md §3.2: "once every Uprising member knows
+    /// the Leader, further triggers have nothing left to reveal").
+    leader_known_by: BTreeSet<PlayerId>,
+
+    // --- Phase 3: the Intermission lottery (rules.md §4) ---
+    intermission_opt_ins: BTreeSet<PlayerId>,
+    /// `None` until `DrawIntermissionEntrants` runs -- once per game.
+    intermission_entrants: Option<Vec<PlayerId>>,
+
     // --- Phase 2: Cell Leader passive-knowledge (rules.md §3.2) ---
     /// Computed once, automatically, at `FinalizeSetup` -- starting
     /// knowledge, not something anyone activates.
@@ -250,6 +270,10 @@ impl Default for GameState {
             agitator_used: false,
             grand_inquisitor_armed: false,
             grand_inquisitor_used: false,
+            contest_results: BTreeMap::new(),
+            leader_known_by: BTreeSet::new(),
+            intermission_opt_ins: BTreeSet::new(),
+            intermission_entrants: None,
             cell_leader_knows: Vec::new(),
             oracle_checks_available: 0,
             almanac_used: false,
@@ -473,6 +497,40 @@ impl GameState {
     /// about themselves, never to the Bartender or anyone else).
     pub(crate) fn is_drunk(&self, viewer: PlayerId) -> bool {
         self.drunk_this_round.contains(&viewer)
+    }
+
+    /// The Revolutionary Leader's own view of who currently knows their
+    /// identity -- see `leader_known_by`'s doc comment. Empty for anyone
+    /// who isn't currently the Leader.
+    pub(crate) fn confidants_known_to_leader(&self, viewer: PlayerId) -> Vec<PlayerId> {
+        if self.revolutionary_leader != Some(viewer) {
+            return Vec::new();
+        }
+        self.leader_known_by.iter().copied().collect()
+    }
+
+    /// The Revolutionary Leader's identity, if `viewer` has been revealed
+    /// to as one of their Confidants -- `None` for everyone else,
+    /// including the Leader's own view of themselves (they don't need to
+    /// be told their own identity).
+    pub(crate) fn leader_known_to(&self, viewer: PlayerId) -> Option<PlayerId> {
+        if self.leader_known_by.contains(&viewer) {
+            self.revolutionary_leader
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn opted_into_intermission(&self, viewer: PlayerId) -> bool {
+        self.intermission_opt_ins.contains(&viewer)
+    }
+
+    /// The drawn Intermission entrants, once `DrawIntermissionEntrants` has
+    /// run -- a public reveal (rules.md §4 frames the draw itself as a live
+    /// party moment), so every viewer gets the same answer, unlike the
+    /// opt-in pool itself (which stays private to each opted-in player).
+    pub(crate) fn intermission_entrants(&self) -> Option<&[PlayerId]> {
+        self.intermission_entrants.as_deref()
     }
 
     /// The faction a title's holder must belong to. Used to validate
@@ -740,6 +798,17 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
         Command::DuelistChallenge { player, target } => duelist_challenge(state, player, target)?,
         Command::AgitatorRedirect { player, target } => agitator_redirect(state, player, target)?,
         Command::ActivateGrandInquisitor { player } => activate_grand_inquisitor(state, player)?,
+
+        Command::RecordContestResult {
+            round,
+            category,
+            ton_won,
+        } => record_contest_result(state, round, category, ton_won)?,
+
+        Command::OptIntoIntermission { player } => opt_into_intermission(state, player)?,
+        Command::DrawIntermissionEntrants { selected } => {
+            draw_intermission_entrants(state, selected)?
+        }
     };
 
     state.event_log.extend(events.clone());
@@ -1588,7 +1657,158 @@ fn push_task(
 fn close_tasks(state: &mut GameState) -> Vec<DomainEvent> {
     let closed: Vec<TaskId> = state.open_tasks.iter().copied().collect();
     state.open_tasks.clear();
-    vec![DomainEvent::TasksClosed { closed }]
+    let mut events = vec![DomainEvent::TasksClosed {
+        closed: closed.clone(),
+    }];
+
+    // The Leader's Confidants (rules.md §3.2): a task round (3 or 5) where
+    // the Ton failed to hit their talking-task completion threshold
+    // triggers one reveal. Skipped entirely when nothing was actually open
+    // to close (covers Round 1, which isn't Confidants-eligible anyway).
+    if !closed.is_empty()
+        && matches!(state.current_round, Round::Three | Round::Five)
+        && !ton_met_task_threshold(state, &closed)
+    {
+        trigger_leader_confidant(state, &mut events);
+    }
+
+    events
+}
+
+/// Whether the Ton hit "that round's talking-task completion threshold"
+/// (rules.md §3.2) -- a number rules.md never actually specifies anywhere.
+/// First-pass, documented-as-tunable default (same spirit as
+/// `recruitment::recruitment_window_size`'s schedule): at least half of
+/// the currently-active Ton players must be credited on at least one of
+/// `closed`'s tasks. Vacuously met if there are no active Ton players at
+/// all (nobody to fail it).
+fn ton_met_task_threshold(state: &GameState, closed: &[TaskId]) -> bool {
+    let active_ton: Vec<PlayerId> = state
+        .players
+        .values()
+        .filter(|p| p.status == PlayerStatus::Active && p.faction == Faction::Ton)
+        .map(|p| p.id)
+        .collect();
+    if active_ton.is_empty() {
+        return true;
+    }
+    let credited = active_ton
+        .iter()
+        .filter(|&&id| {
+            closed.iter().any(|task| {
+                state
+                    .task_attempts
+                    .get(&(id, *task))
+                    .copied()
+                    .unwrap_or(false)
+            })
+        })
+        .count();
+    credited * 2 >= active_ton.len()
+}
+
+/// The Leader's Confidants effect (rules.md §3.2): reveals identities
+/// bidirectionally between the Revolutionary Leader and one Uprising
+/// member who doesn't already know them. Deterministic lowest-`PlayerId`
+/// selection among eligible candidates -- the same fixed,
+/// test-reproducible substitute for "random" used throughout this engine
+/// (see `first_eligible`). Silently a no-op if there's no Leader seated
+/// yet, or if every active Uprising member already knows them (rules.md's
+/// own self-limiting clause).
+fn trigger_leader_confidant(state: &mut GameState, events: &mut Vec<DomainEvent>) {
+    let Some(leader) = state.revolutionary_leader else {
+        return;
+    };
+    let confidant = state
+        .players
+        .values()
+        .find(|p| {
+            p.status == PlayerStatus::Active
+                && p.faction == Faction::Uprising
+                && p.id != leader
+                && !state.leader_known_by.contains(&p.id)
+        })
+        .map(|p| p.id);
+    if let Some(confidant) = confidant {
+        state.leader_known_by.insert(confidant);
+        events.push(DomainEvent::LeaderConfidantRevealed { leader, confidant });
+    }
+}
+
+/// Records one contest category's result (rules.md §4) and, on a Ton loss,
+/// triggers the Leader's Confidants the same way a missed task threshold
+/// does. No actor -- see `Command::RecordContestResult`'s doc comment.
+fn record_contest_result(
+    state: &mut GameState,
+    round: Round,
+    category: ContestCategory,
+    ton_won: bool,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !matches!(round, Round::Two | Round::Four) {
+        return Err(GameError::NotAContestRound(round));
+    }
+    if state.contest_results.contains_key(&(round, category)) {
+        return Err(GameError::ContestResultAlreadyRecorded { round, category });
+    }
+
+    state.contest_results.insert((round, category), ton_won);
+    let mut events = vec![DomainEvent::ContestResultRecorded {
+        round,
+        category,
+        ton_won,
+    }];
+
+    if !ton_won {
+        trigger_leader_confidant(state, &mut events);
+    }
+
+    Ok(events)
+}
+
+/// Opts `player` into the Intermission lottery (rules.md §4). Rejected for
+/// an already-Cast-Out player -- "anyone Cast Out earlier is ineligible to
+/// enter." Idempotent: opting in again before the draw is a harmless
+/// no-op (re-inserting into a `BTreeSet`).
+fn opt_into_intermission(
+    state: &mut GameState,
+    player: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    state.intermission_opt_ins.insert(player);
+    Ok(vec![DomainEvent::IntermissionOptedIn { player }])
+}
+
+/// Draws the Intermission's entrants (rules.md §4: "5 entrants are then
+/// selected at random from that pool") from `selected`, the caller-supplied
+/// random draw -- this engine never generates its own randomness (see the
+/// plan's "keep randomness at the boundary" principle). Once per game;
+/// every name must have actually opted in and still be active.
+fn draw_intermission_entrants(
+    state: &mut GameState,
+    selected: Vec<PlayerId>,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if state.intermission_entrants.is_some() {
+        return Err(GameError::IntermissionAlreadyDrawn);
+    }
+    if selected.len() > 5 {
+        return Err(GameError::TooManyIntermissionEntrants(selected.len()));
+    }
+    let mut seen = BTreeSet::new();
+    for &id in &selected {
+        if !seen.insert(id) {
+            return Err(GameError::DuplicateIntermissionEntrant(id));
+        }
+        if !state.intermission_opt_ins.contains(&id) || !state.is_active(id) {
+            return Err(GameError::InvalidIntermissionEntrant(id));
+        }
+    }
+
+    state.intermission_entrants = Some(selected.clone());
+    Ok(vec![DomainEvent::IntermissionEntrantsDrawn {
+        entrants: selected,
+    }])
 }
 
 fn attempt_task(
@@ -7675,5 +7895,543 @@ mod tests {
 
         assert!(state.grand_inquisitor_armed);
         assert!(!state.grand_inquisitor_used);
+    }
+
+    // --- Phase 3: contest rounds + the Leader's Confidants ---
+
+    #[test]
+    fn record_contest_result_rejects_a_non_contest_round() {
+        let mut state = GameState::new();
+        let result = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Three,
+                category: ContestCategory::Strength,
+                ton_won: true,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotAContestRound(Round::Three)));
+    }
+
+    #[test]
+    fn record_contest_result_rejects_a_duplicate() {
+        let mut state = GameState::new();
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::ContestResultAlreadyRecorded {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+            })
+        );
+    }
+
+    #[test]
+    fn record_contest_result_tracks_distinct_categories_independently() {
+        let mut state = GameState::new();
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        // A different category in the same round is unaffected by the
+        // first one already being recorded.
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        // And the same category in a *different* contest round is its own
+        // independent slot too.
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Four,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_ton_contest_loss_triggers_a_leader_confidant() {
+        let mut state = GameState::new();
+        let leader = assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        let member = add_player(&mut state, "Member", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            DomainEvent::LeaderConfidantRevealed { leader: l, confidant }
+                if *l == leader && *confidant == member
+        )));
+    }
+
+    #[test]
+    fn a_ton_contest_win_does_not_trigger_a_confidant() {
+        let mut state = GameState::new();
+        assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        add_player(&mut state, "Member", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::LeaderConfidantRevealed { .. })));
+    }
+
+    #[test]
+    fn leader_confidant_selection_is_deterministic_and_never_repeats_the_same_person() {
+        let mut state = GameState::new();
+        let leader = assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        let member_a = add_player(&mut state, "A", Faction::Uprising);
+        let member_b = add_player(&mut state, "B", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        let _ = leader;
+
+        let events1 = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        let first = events1
+            .iter()
+            .find_map(|e| match e {
+                DomainEvent::LeaderConfidantRevealed { confidant, .. } => Some(*confidant),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(first, member_a.min(member_b));
+
+        let events2 = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        let second = events2
+            .iter()
+            .find_map(|e| match e {
+                DomainEvent::LeaderConfidantRevealed { confidant, .. } => Some(*confidant),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(second, member_a.max(member_b));
+        assert_ne!(first, second);
+
+        // Both known Uprising members already know the Leader -- a third
+        // loss is a harmless no-op (rules.md's self-limiting clause).
+        let events3 = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Intelligence,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        assert!(!events3
+            .iter()
+            .any(|e| matches!(e, DomainEvent::LeaderConfidantRevealed { .. })));
+    }
+
+    #[test]
+    fn leader_confidant_never_selects_the_leader_themselves() {
+        let mut state = GameState::new();
+        assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        // No other Uprising member exists -- nothing eligible to reveal.
+        let events = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::LeaderConfidantRevealed { .. })));
+    }
+
+    #[test]
+    fn missing_the_task_threshold_in_a_task_round_triggers_a_confidant() {
+        let mut state = GameState::new();
+        let leader = assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        let member = add_player(&mut state, "Member", Faction::Uprising);
+        add_player(&mut state, "Ton1", Faction::Ton);
+        add_player(&mut state, "Ton2", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        assert_eq!(state.current_round(), Round::Three);
+
+        apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "t".into(),
+                tier: TaskTier::Easy,
+                qualifying_players: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        // Neither Ton player attempted anything -- 0% completion.
+        let events = apply_command(&mut state, Command::CloseTasks).unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            DomainEvent::LeaderConfidantRevealed { leader: l, confidant }
+                if *l == leader && *confidant == member
+        )));
+    }
+
+    #[test]
+    fn meeting_the_task_threshold_does_not_trigger_a_confidant() {
+        let mut state = GameState::new();
+        let leader = assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        let member = add_player(&mut state, "Member", Faction::Uprising);
+        let ton1 = add_player(&mut state, "Ton1", Faction::Ton);
+        let ton2 = add_player(&mut state, "Ton2", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+        assert_eq!(state.current_round(), Round::Three);
+
+        let task_id = match apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "t".into(),
+                tier: TaskTier::Easy,
+                qualifying_players: [member].into_iter().collect(),
+            },
+        )
+        .unwrap()[0]
+        {
+            DomainEvent::TaskPushed { id, .. } => id,
+            _ => unreachable!(),
+        };
+        // Both active Ton players get credited -- 100% completion, well
+        // above the 50% first-pass threshold.
+        apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: ton1,
+                task: task_id,
+                named: [leader, member, ton2],
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: ton2,
+                task: task_id,
+                named: [leader, member, ton1],
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(&mut state, Command::CloseTasks).unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::LeaderConfidantRevealed { .. })));
+    }
+
+    #[test]
+    fn round_one_task_closure_never_triggers_a_confidant() {
+        let mut state = GameState::new();
+        assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        add_player(&mut state, "Member", Faction::Uprising);
+        add_player(&mut state, "Ton1", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        assert_eq!(state.current_round(), Round::One);
+
+        apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "t".into(),
+                tier: TaskTier::Easy,
+                qualifying_players: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        let events = apply_command(&mut state, Command::CloseTasks).unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::LeaderConfidantRevealed { .. })));
+    }
+
+    #[test]
+    fn closing_tasks_with_nothing_open_never_triggers_a_confidant() {
+        let mut state = GameState::new();
+        assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+        assert_eq!(state.current_round(), Round::Three);
+
+        let events = apply_command(&mut state, Command::CloseTasks).unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::LeaderConfidantRevealed { .. })));
+    }
+
+    // --- Phase 3: the Intermission lottery ---
+
+    fn setup_game_with_voters(count: usize) -> (GameState, Vec<PlayerId>) {
+        let mut state = GameState::new();
+        let players: Vec<PlayerId> = (0..count)
+            .map(|i| add_player(&mut state, &format!("Player{i}"), Faction::Ton))
+            .collect();
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        (state, players)
+    }
+
+    #[test]
+    fn opt_into_intermission_rejects_a_cast_out_player() {
+        let (mut state, players) = setup_game_with_voters(2);
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: players[0],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::OptIntoIntermission { player: players[0] },
+        );
+        assert_eq!(result, Err(GameError::NotActive(players[0])));
+    }
+
+    #[test]
+    fn opt_into_intermission_is_idempotent() {
+        let (mut state, players) = setup_game_with_voters(1);
+        apply_command(
+            &mut state,
+            Command::OptIntoIntermission { player: players[0] },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::OptIntoIntermission { player: players[0] },
+        )
+        .unwrap();
+        assert!(state.intermission_opt_ins.contains(&players[0]));
+    }
+
+    #[test]
+    fn draw_intermission_entrants_succeeds_with_a_valid_pool() {
+        let (mut state, players) = setup_game_with_voters(3);
+        for &p in &players {
+            apply_command(&mut state, Command::OptIntoIntermission { player: p }).unwrap();
+        }
+        let events = apply_command(
+            &mut state,
+            Command::DrawIntermissionEntrants {
+                selected: players.clone(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            &events[0],
+            DomainEvent::IntermissionEntrantsDrawn { entrants } if entrants == &players
+        ));
+        assert_eq!(state.intermission_entrants(), Some(players.as_slice()));
+    }
+
+    #[test]
+    fn draw_intermission_entrants_rejects_someone_who_never_opted_in() {
+        let (mut state, players) = setup_game_with_voters(1);
+        let result = apply_command(
+            &mut state,
+            Command::DrawIntermissionEntrants {
+                selected: vec![players[0]],
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::InvalidIntermissionEntrant(players[0]))
+        );
+    }
+
+    #[test]
+    fn draw_intermission_entrants_rejects_a_cast_out_opted_in_player() {
+        let (mut state, players) = setup_game_with_voters(1);
+        apply_command(
+            &mut state,
+            Command::OptIntoIntermission { player: players[0] },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: players[0],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::DrawIntermissionEntrants {
+                selected: vec![players[0]],
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::InvalidIntermissionEntrant(players[0]))
+        );
+    }
+
+    #[test]
+    fn draw_intermission_entrants_rejects_a_duplicate() {
+        let (mut state, players) = setup_game_with_voters(1);
+        apply_command(
+            &mut state,
+            Command::OptIntoIntermission { player: players[0] },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::DrawIntermissionEntrants {
+                selected: vec![players[0], players[0]],
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::DuplicateIntermissionEntrant(players[0]))
+        );
+    }
+
+    #[test]
+    fn draw_intermission_entrants_rejects_more_than_five() {
+        let (mut state, players) = setup_game_with_voters(6);
+        for &p in &players {
+            apply_command(&mut state, Command::OptIntoIntermission { player: p }).unwrap();
+        }
+        let result = apply_command(
+            &mut state,
+            Command::DrawIntermissionEntrants { selected: players },
+        );
+        assert_eq!(result, Err(GameError::TooManyIntermissionEntrants(6)));
+    }
+
+    #[test]
+    fn draw_intermission_entrants_rejects_reuse() {
+        let (mut state, players) = setup_game_with_voters(1);
+        apply_command(
+            &mut state,
+            Command::OptIntoIntermission { player: players[0] },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::DrawIntermissionEntrants {
+                selected: vec![players[0]],
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::DrawIntermissionEntrants {
+                selected: vec![players[0]],
+            },
+        );
+        assert_eq!(result, Err(GameError::IntermissionAlreadyDrawn));
     }
 }

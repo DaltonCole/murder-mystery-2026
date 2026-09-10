@@ -1,7 +1,9 @@
 use crate::ability::InfoQueryKind;
 use crate::character::Character;
+use crate::contest::ContestCategory;
 use crate::denouncement::Ballot;
 use crate::player::{Faction, PlayerId};
+use crate::round::Round;
 use crate::task::{TaskId, TaskTier};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -306,4 +308,37 @@ pub enum Command {
     /// closes -- Dalton's resolution of that ambiguity during the original
     /// implementation planning). Once per game.
     ArmVoteShield { player: PlayerId },
+
+    // --- Phase 3: contest rounds + the Leader's Confidants (rules.md
+    // §3.2/§4) ---
+    /// Records one contest category's outcome for Round 2 or Round 4 --
+    /// however that category was actually run (a live judged activity, a
+    /// self-reported physical challenge, a digital mini-game); this engine
+    /// only owns the recorded result and what it triggers, not the
+    /// activity itself (Dalton's own scoping during Phase 3 planning: the
+    /// actual mini-games are still being designed). No actor -- this is an
+    /// objective fact the host records, not a player ability, the same
+    /// shape as `PushTask`/`CastOut`. `round` must be `Two` or `Four`;
+    /// rejected if this exact (round, category) pair was already recorded.
+    /// Deliberately never exposed back through `view_for` to any viewer --
+    /// Dalton's explicit instruction: players learn nothing about the
+    /// running standings, and not even the breakdown once the round ends.
+    RecordContestResult {
+        round: Round,
+        category: ContestCategory,
+        ton_won: bool,
+    },
+
+    // --- Phase 3: the Intermission lottery (rules.md §4) ---
+    /// A player opts into "Who is Lorel's number one love?" -- rejected if
+    /// they're already Cast Out ("anyone Cast Out earlier is ineligible to
+    /// enter"). Idempotent: opting in twice is a harmless no-op.
+    OptIntoIntermission { player: PlayerId },
+
+    /// Draws the Intermission's entrants from the opted-in pool.
+    /// `selected` is the caller-supplied random draw (up to 5 -- see the
+    /// plan's "keep randomness at the boundary" principle, the same
+    /// reasoning behind `CastOut`'s `fallback_replacement`); every name in
+    /// it must have actually opted in and still be active. Once per game.
+    DrawIntermissionEntrants { selected: Vec<PlayerId> },
 }
