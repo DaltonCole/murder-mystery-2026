@@ -36,6 +36,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "bots",
  "dioxus",
  "engine",
  "serde",
@@ -228,6 +229,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bots"
+version = "0.1.0"
+dependencies = [
+ "engine",
+ "futures-util",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
 ]
 
 [[package]]

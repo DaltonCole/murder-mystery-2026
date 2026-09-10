@@ -17,3 +17,15 @@ tokio = { version = "1.53.1", features = ["sync", "macros"], optional = true }
 default = ["web"]
 web = ["dioxus/web"]
 server = ["dioxus/server", "dep:tokio"]
+
+# `bots` drives a real, spawned `app` server binary over its actual
+# websocket protocol for `tests/full_game_with_bots.rs` -- see that file
+# and `crates/bots/src/lib.rs`'s doc comment for why this lives as an
+# integration test here (same package as the binary being spawned, so
+# `CARGO_BIN_EXE_app` is available) rather than in `bots` itself. Needs
+# the full `server` feature build to actually serve `/api/ws` when run as
+# a child process: `cargo test -p app --no-default-features --features
+# server` (see the Makefile's `test` target).
+[dev-dependencies]
+bots = { path = "../bots" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net"] }
