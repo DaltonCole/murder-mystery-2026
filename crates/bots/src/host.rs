@@ -334,11 +334,20 @@ impl HostDriver {
             ContestCategory::Intelligence,
         ] {
             self.conn
-                .do_cmd_sequential(Command::RecordContestResult {
-                    round,
-                    category,
-                    ton_won: rng.random_range(0..2) == 0,
-                })
+                .do_cmd_until(
+                    Command::RecordContestResult {
+                        round,
+                        category,
+                        ton_won: rng.random_range(0..2) == 0,
+                    },
+                    |v| {
+                        v.contest_results
+                            .iter()
+                            .any(|&((r, c), _)| r == round && c == category)
+                    },
+                    Duration::from_secs(10),
+                    "contest_results reflecting the recorded category",
+                )
                 .await?;
         }
         Ok(())
@@ -423,7 +432,10 @@ impl HostDriver {
     /// `ResolveGalleryPredictions` has no slot for that, so this harness
     /// falls back to an arbitrary `Faction::Ton` in that rare case purely
     /// to keep exercising the command's wire path, not as a claim that Ton
-    /// actually won.
+    /// actually won. Uses `do_cmd_until` against `PlayerView::gallery_resolved`
+    /// rather than `do_cmd_sequential`, since bots can still be concurrently
+    /// active at this point in the game (they aren't `.abort()`'d until
+    /// after this returns).
     pub async fn resolve_gallery_predictions(
         &mut self,
         newly_cast_out: Vec<PlayerId>,
@@ -431,10 +443,15 @@ impl HostDriver {
         let view = self.view().await?;
         let actual_winner = view.winner.unwrap_or(Faction::Ton);
         self.conn
-            .do_cmd_sequential(Command::ResolveGalleryPredictions {
-                actual_cast_out: newly_cast_out,
-                actual_winner,
-            })
+            .do_cmd_until(
+                Command::ResolveGalleryPredictions {
+                    actual_cast_out: newly_cast_out,
+                    actual_winner,
+                },
+                |v| v.gallery_resolved,
+                Duration::from_secs(10),
+                "gallery_resolved flipping true",
+            )
             .await
     }
 }

@@ -99,8 +99,6 @@ pub async fn run_full_automated_game(
     host.advance_round_to(Round::Two).await?;
     host.record_contest_results_for_round(Round::Two, seed)
         .await?;
-    host.draw_intermission_entrants(&intermission_pool, seed)
-        .await?;
 
     host.advance_round_to(Round::Three).await?;
     let mut previously_cast_out: BTreeSet<PlayerId> = BTreeSet::new();
@@ -109,6 +107,13 @@ pub async fn run_full_automated_game(
 
     host.advance_round_to(Round::Four).await?;
     host.record_contest_results_for_round(Round::Four, seed.wrapping_add(1))
+        .await?;
+    // rules.md §4's round order is Round 4 -> Intermission -> Round 5, not
+    // right after Round 2 -- drawing here (rather than right after bots
+    // opt in during Round 1) also means an entrant can no longer be Cast
+    // Out at Round 3's Denouncement before their own live Intermission
+    // moment ever happens.
+    host.draw_intermission_entrants(&intermission_pool, seed)
         .await?;
 
     host.advance_round_to(Round::Five).await?;

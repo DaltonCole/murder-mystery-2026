@@ -1188,43 +1188,61 @@ fn Host() -> Element {
         }
         div {
             h3 { "Gallery resolution" }
-            p { "Once at the Finale, after the ballot has actually closed: score every submitted Gallery prediction against the real outcome. Only one faction ever wins -- the Cult has priority over any overlap (see win_condition::evaluate's doc comment) -- so pick the one that actually won." }
-            p {
-                match winner {
-                    Some(f) => format!("The engine computes the winner as: {f:?}."),
-                    None => "The engine hasn't computed a winner yet -- make sure the Finale's Denouncement has actually closed first.".to_string(),
-                }
-            }
+            p { "Once at the Finale, after the ballot has actually closed: score every submitted Gallery prediction against the real outcome. Only one faction ever wins -- the Cult has priority over any overlap (see win_condition::evaluate's doc comment)." }
             input {
                 placeholder: "actual Cast-Out IDs, e.g. 2,5",
                 value: "{gallery_cast_out}",
                 oninput: move |e| gallery_cast_out.set(e.value()),
             }
-            for faction in [Faction::Ton, Faction::Uprising, Faction::Cult] {
-                label {
-                    input {
-                        r#type: "radio",
-                        name: "gallery-winner",
-                        checked: gallery_winner() == faction,
-                        onchange: move |_| gallery_winner.set(faction),
-                    }
-                    " {faction:?} won"
+            if let Some(f) = winner {
+                // The button sends the engine's own computed answer
+                // directly -- never a separately-tracked signal that could
+                // silently drift out of sync with it and mis-score every
+                // Gallery prediction, irreversibly, at the Finale.
+                p { "The engine computed the winner as {f:?} -- this is what gets recorded." }
+                button {
+                    onclick: move |_| {
+                        let actual_cast_out: Vec<PlayerId> = gallery_cast_out
+                            .peek()
+                            .split(',')
+                            .filter_map(|s| s.trim().parse::<u32>().ok())
+                            .map(PlayerId)
+                            .collect();
+                        do_cmd(Command::ResolveGalleryPredictions {
+                            actual_cast_out,
+                            actual_winner: f,
+                        });
+                    },
+                    "Resolve Gallery ({f:?} wins)"
                 }
-            }
-            button {
-                onclick: move |_| {
-                    let actual_cast_out: Vec<PlayerId> = gallery_cast_out
-                        .peek()
-                        .split(',')
-                        .filter_map(|s| s.trim().parse::<u32>().ok())
-                        .map(PlayerId)
-                        .collect();
-                    do_cmd(Command::ResolveGalleryPredictions {
-                        actual_cast_out,
-                        actual_winner: gallery_winner(),
-                    });
-                },
-                "Resolve Gallery"
+            } else {
+                p { "The engine hasn't computed a winner -- either the Finale's Denouncement hasn't closed yet, or this is the rare legitimate case where nobody's win condition was met (see win_condition::evaluate's doc comment). Pick a winner to record manually:" }
+                for faction in [Faction::Ton, Faction::Uprising, Faction::Cult] {
+                    label {
+                        input {
+                            r#type: "radio",
+                            name: "gallery-winner",
+                            checked: gallery_winner() == faction,
+                            onchange: move |_| gallery_winner.set(faction),
+                        }
+                        " {faction:?} won"
+                    }
+                }
+                button {
+                    onclick: move |_| {
+                        let actual_cast_out: Vec<PlayerId> = gallery_cast_out
+                            .peek()
+                            .split(',')
+                            .filter_map(|s| s.trim().parse::<u32>().ok())
+                            .map(PlayerId)
+                            .collect();
+                        do_cmd(Command::ResolveGalleryPredictions {
+                            actual_cast_out,
+                            actual_winner: gallery_winner(),
+                        });
+                    },
+                    "Resolve Gallery (manual override)"
+                }
             }
         }
         RosterList { roster }

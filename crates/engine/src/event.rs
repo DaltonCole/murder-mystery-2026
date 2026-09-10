@@ -268,7 +268,8 @@ pub enum DomainEvent {
         total: u32,
     },
     /// Deliberately never carries the prediction itself -- see the module
-    /// doc note above `Command`'s Gallery variants.
+    /// doc note above (`GalleryPrediction` is deliberately NOT
+    /// imported/used here).
     GalleryPredictionSubmitted {
         player: PlayerId,
     },

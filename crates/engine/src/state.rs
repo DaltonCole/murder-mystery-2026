@@ -596,6 +596,17 @@ impl GameState {
         }
     }
 
+    /// Whether `ResolveGalleryPredictions` has already run -- `Viewer::Host`
+    /// ONLY, the same scoping as `winner_for_host`/`contest_results_for_host`.
+    /// Without this, nothing tells a caller (a live host, or the `bots`
+    /// integration harness driving a real game end to end) whether the
+    /// once-per-game, irreversible resolution actually took effect, forcing
+    /// a guess -- see `HostDriver::resolve_gallery_predictions` in the
+    /// `bots` crate.
+    pub(crate) fn gallery_resolved(&self) -> bool {
+        self.gallery_resolved
+    }
+
     /// The faction a title's holder must belong to. Used to validate
     /// [`Command::AssignCharacter`] -- e.g. rejects assigning `CultLeader`
     /// to a Ton player.
@@ -623,26 +634,31 @@ impl GameState {
         }
     }
 
-    /// The lowest-`PlayerId` active, *untitled* player of `faction`,
-    /// excluding anyone in `exclude` -- the deterministic fallback used
-    /// when no explicit replacement is supplied or the supplied one isn't
-    /// eligible. "Untitled" (a `Normal*`/`Cultist`/no character yet)
-    /// matters: without it, this could hand the King/Queen's crown to
-    /// whoever's currently the Prince/Princess, since they're Ton-faction
-    /// too -- double-titling someone was never intended. `exclude` takes a
-    /// slice (not a single `PlayerId`) so a caller resolving several
-    /// Cast-Outs from the same Denouncement batch can exclude everyone in
-    /// that batch, not just the one player currently being processed --
-    /// see the doc comment on `resolve_cast_out`'s `also_departing`
-    /// parameter for why that matters. Lowest ID (rather than e.g.
-    /// highest, or first-inserted) is an arbitrary but fixed choice,
-    /// picked so tests are reproducible without needing to inject a fake
-    /// RNG.
+    /// The lowest-`PlayerId` active, *untitled* player whose `true_faction`
+    /// is `faction`, excluding anyone in `exclude` -- the deterministic
+    /// fallback used when no explicit replacement is supplied or the
+    /// supplied one isn't eligible. "Untitled" (a `Normal*`/`Cultist`/no
+    /// character yet) matters: without it, this could hand the King/Queen's
+    /// crown to whoever's currently the Prince/Princess, since they're
+    /// Ton-faction too -- double-titling someone was never intended.
+    /// `true_faction` (not the apparent `faction` field) matters just as
+    /// much: without it, this could install an already-secretly-converted
+    /// Cult member as the new King/Queen or Revolutionary Leader,
+    /// contradicting rules.md's "a fresh, unconverted Leader/King-Queen"
+    /// framing for succession and silently pre-loading Cult Path A/B/C.
+    /// `exclude` takes a slice (not a single `PlayerId`) so a caller
+    /// resolving several Cast-Outs from the same Denouncement batch can
+    /// exclude everyone in that batch, not just the one player currently
+    /// being processed -- see the doc comment on `resolve_cast_out`'s
+    /// `also_departing` parameter for why that matters. Lowest ID (rather
+    /// than e.g. highest, or first-inserted) is an arbitrary but fixed
+    /// choice, picked so tests are reproducible without needing to inject a
+    /// fake RNG.
     fn first_eligible(&self, faction: Faction, exclude: &[PlayerId]) -> Option<PlayerId> {
         self.players
             .values()
             .find(|p| {
-                p.faction == faction
+                p.true_faction() == faction
                     && p.status == PlayerStatus::Active
                     && !exclude.contains(&p.id)
                     && self.is_untitled(p.id)
@@ -1151,8 +1167,11 @@ fn designate_successor(
         .players
         .get(&successor)
         .ok_or(GameError::UnknownPlayer(successor))?;
+    // true_faction(), not the apparent faction: a secretly-converted
+    // Uprising member is Cult now, not a valid successor -- see
+    // `first_eligible`'s doc comment for why this matters.
     if s.status != PlayerStatus::Active
-        || s.faction != Faction::Uprising
+        || s.true_faction() != Faction::Uprising
         || successor == leader
         || !state.is_untitled(successor)
     {
@@ -1179,8 +1198,12 @@ fn transfer_king_queen(
         .players
         .get(&new_holder)
         .ok_or(GameError::UnknownPlayer(new_holder))?;
+    // true_faction(), not the apparent faction -- a King/Queen voluntarily
+    // handing the crown to a secretly-converted Ton member would be an
+    // immediate, player-triggered version of the same bug `first_eligible`'s
+    // doc comment describes.
     if np.status != PlayerStatus::Active
-        || np.faction != Faction::Ton
+        || np.true_faction() != Faction::Ton
         || new_holder == old_holder
         || !state.is_untitled(new_holder)
     {
@@ -1269,7 +1292,7 @@ fn resolve_cast_out(
                         c != player
                             && !also_departing.contains(&c)
                             && state.is_active(c)
-                            && state.player(c).unwrap().faction == Faction::Ton
+                            && state.player(c).unwrap().true_faction() == Faction::Ton
                             && state.is_untitled(c)
                     })
                     .or_else(|| state.first_eligible(Faction::Ton, also_departing));
@@ -1297,7 +1320,7 @@ fn resolve_cast_out(
             id != player
                 && !also_departing.contains(&id)
                 && state.is_active(id)
-                && state.player(id).unwrap().faction == Faction::Uprising
+                && state.player(id).unwrap().true_faction() == Faction::Uprising
                 && state.is_untitled(id)
         };
         let designated = state
@@ -1813,7 +1836,7 @@ fn trigger_leader_confidant(state: &mut GameState, events: &mut Vec<DomainEvent>
         .values()
         .find(|p| {
             p.status == PlayerStatus::Active
-                && p.faction == Faction::Uprising
+                && p.true_faction() == Faction::Uprising
                 && p.id != leader
                 && !state.leader_known_by.contains(&p.id)
         })
@@ -3189,6 +3212,34 @@ mod tests {
         assert_eq!(result, Err(GameError::IneligibleSuccessor(king_queen)));
     }
 
+    #[test]
+    fn designate_successor_rejects_an_already_converted_candidate() {
+        // Regression test: eligibility used to check the apparent `faction`
+        // field, not `true_faction()`, so a secretly-converted Uprising
+        // member could be designated -- installing a Cult asset as the
+        // Leader's chosen heir.
+        let (mut state, _king_queen, _prince, leader, cult_leader) = setup_full_game();
+        let turncoat = add_player(&mut state, "Turncoat", Faction::Uprising);
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, slot
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: turncoat,
+            },
+        )
+        .unwrap();
+
+        let result = apply_command(
+            &mut state,
+            Command::DesignateSuccessor {
+                leader,
+                successor: turncoat,
+            },
+        );
+        assert_eq!(result, Err(GameError::IneligibleSuccessor(turncoat)));
+    }
+
     // --- TransferKingQueen ---
 
     #[test]
@@ -3268,6 +3319,36 @@ mod tests {
             Some(king_queen),
             "the rejected transfer must not mutate anything"
         );
+    }
+
+    #[test]
+    fn transfer_king_queen_rejects_an_already_converted_candidate() {
+        // Regression test: eligibility used to check the apparent `faction`
+        // field, not `true_faction()`, so a King/Queen could voluntarily
+        // hand the crown to a secretly-converted Ton member.
+        let (mut state, king_queen, _prince, _leader, cult_leader) = setup_full_game();
+        let turncoat = add_player(&mut state, "Turncoat", Faction::Ton);
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, slot
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: turncoat,
+            },
+        )
+        .unwrap();
+
+        let result = apply_command(
+            &mut state,
+            Command::TransferKingQueen {
+                new_holder: turncoat,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::IneligibleKingQueenReplacement(turncoat))
+        );
+        assert_eq!(state.king_queen(), Some(king_queen));
     }
 
     // --- CastOut: King/Queen ---
@@ -3356,6 +3437,45 @@ mod tests {
 
         assert_eq!(state.prince_princess(), None);
         assert_eq!(state.king_queen(), Some(extra_ton));
+    }
+
+    #[test]
+    fn king_queen_round_three_cascade_fallback_skips_an_already_converted_candidate() {
+        // Regression test: the Round-3 cascade's own fallback filter (and
+        // `first_eligible` beneath it) used to check the apparent `faction`
+        // field, not `true_faction()`, so an already-secretly-converted Ton
+        // member could inherit the crown. `turncoat` has a lower PlayerId
+        // than `loyal` (added first), so the old, faction-only check would
+        // have picked them.
+        let (mut state, king_queen, _prince, _leader, cult_leader) = setup_full_game();
+        let turncoat = add_player(&mut state, "Turncoat", Faction::Ton);
+        let loyal = add_player(&mut state, "Loyal", Faction::Ton);
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, slot
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: turncoat,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        assert_eq!(state.current_round(), Round::Three);
+
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: king_queen,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.king_queen(), Some(loyal));
+        assert_ne!(
+            state.player(turncoat).unwrap().character,
+            Some(Character::KingQueen)
+        );
     }
 
     #[test]
@@ -3485,6 +3605,45 @@ mod tests {
         .unwrap();
         assert_eq!(state.revolutionary_leader(), None);
         assert!(state.revolutionary_leader_ever_denounced_unconverted());
+    }
+
+    #[test]
+    fn leader_succession_fallback_skips_an_already_converted_candidate() {
+        // Regression test: `first_eligible`/`eligible_uprising` used to
+        // check the apparent `faction` field, not `true_faction()`, so the
+        // deterministic lowest-PlayerId fallback could install an
+        // already-secretly-converted Cult asset as the new Revolutionary
+        // Leader -- directly contradicting "a fresh Leader starts fully
+        // unknown" and silently pre-loading Cult Path A/B. `turncoat` has a
+        // lower PlayerId than `loyal` (added first), so the old,
+        // faction-only check would have picked them.
+        let (mut state, _king_queen, _prince, leader, cult_leader) = setup_full_game();
+        let turncoat = add_player(&mut state, "Turncoat", Faction::Uprising);
+        let loyal = add_player(&mut state, "Loyal", Faction::Uprising);
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, slot
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: turncoat,
+            },
+        )
+        .unwrap();
+
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: leader,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.revolutionary_leader(), Some(loyal));
+        assert_ne!(
+            state.player(turncoat).unwrap().character,
+            Some(Character::RevolutionaryLeader)
+        );
     }
 
     #[test]
@@ -8552,6 +8711,75 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, DomainEvent::LeaderConfidantRevealed { .. })));
+    }
+
+    #[test]
+    fn leader_confidant_never_selects_an_already_converted_uprising_member() {
+        // Regression test: `trigger_leader_confidant` used to filter
+        // candidates on the apparent `faction` field instead of
+        // `true_faction()`, so a secretly-converted Uprising member could
+        // be picked as a Confidant -- handing the Cult exactly the intel
+        // it wants most (the real Leader's identity) via its own asset.
+        let mut state = GameState::new();
+        let leader = assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        let cult_leader = assign_new(
+            &mut state,
+            "CultLeader",
+            Faction::Cult,
+            Character::CultLeader,
+        );
+        let turncoat = add_player(&mut state, "Turncoat", Faction::Uprising);
+        let loyal = add_player(&mut state, "Loyal", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, slot
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: turncoat,
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        let revealed_to = events
+            .iter()
+            .find_map(|e| match e {
+                DomainEvent::LeaderConfidantRevealed { confidant, .. } => Some(*confidant),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(revealed_to, loyal);
+
+        // The next loss finds nobody else genuinely eligible -- the
+        // already-converted Turncoat must never be selected, even as a
+        // fallback once the one loyal candidate is used up.
+        let events2 = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        assert!(!events2
+            .iter()
+            .any(|e| matches!(e, DomainEvent::LeaderConfidantRevealed { .. })));
+        assert!(!state.confidants_known_to_leader(leader).contains(&turncoat));
     }
 
     #[test]

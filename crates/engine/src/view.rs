@@ -156,6 +156,10 @@ pub struct PlayerView {
     /// sequencing is deferred to a later phase). `ResolveGalleryPredictions`
     /// needs this to score `FactionWins` predictions against a real answer.
     pub winner: Option<Faction>,
+    /// Whether `ResolveGalleryPredictions` has already run -- `Viewer::Host`
+    /// ONLY, always `false` for `Viewer::Player`/`Viewer::Display`. See
+    /// `GameState::gallery_resolved`'s doc comment.
+    pub gallery_resolved: bool,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -256,6 +260,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     } else {
         None
     };
+    let gallery_resolved = matches!(viewer, Viewer::Host) && state.gallery_resolved();
 
     PlayerView {
         roster,
@@ -276,6 +281,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         servant_leaderboard: state.servant_leaderboard(),
         contest_results,
         winner,
+        gallery_resolved,
     }
 }
 
@@ -1385,5 +1391,69 @@ mod tests {
         // comment on the deferred public finale-reveal sequencing.
         assert_eq!(view_for(&state, Viewer::Player(king_queen)).winner, None);
         assert_eq!(view_for(&state, Viewer::Display).winner, None);
+    }
+
+    #[test]
+    fn gallery_resolved_is_tracked_for_the_host_only() {
+        let mut state = GameState::new();
+        let cast_out_player = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "CastOut".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: cast_out_player,
+                faction: Faction::Ton,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: cast_out_player,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        for _ in 0..5 {
+            apply_command(&mut state, Command::AdvanceRound).unwrap();
+        }
+        assert_eq!(state.current_round(), Round::Finale);
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!view_for(&state, Viewer::Host).gallery_resolved);
+
+        apply_command(
+            &mut state,
+            Command::ResolveGalleryPredictions {
+                actual_cast_out: vec![],
+                actual_winner: Faction::Ton,
+            },
+        )
+        .unwrap();
+
+        assert!(view_for(&state, Viewer::Host).gallery_resolved);
+        assert!(!view_for(&state, Viewer::Player(cast_out_player)).gallery_resolved);
+        assert!(!view_for(&state, Viewer::Display).gallery_resolved);
     }
 }
