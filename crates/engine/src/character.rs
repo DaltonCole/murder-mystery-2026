@@ -58,15 +58,34 @@ pub enum Character {
     /// Cult, falsify pipeline: once per game (if armed), forces an
     /// info-check that targets them to return a false result.
     Deceiver,
+
+    // --- Phase 3: Denouncement procedural modifiers (rules.md §3.1/§3.2)
+    // ---
+    /// Ton: once per game, before nomination closes, guarantees one
+    /// player a spot on the ballot regardless of verbal support -- added
+    /// on top of whoever naturally surfaced (Dalton's resolution of the
+    /// "adds vs. replaces" ambiguity during Phase 3 planning). See
+    /// `state::close_nomination`.
+    Duelist,
+    /// Uprising: once per game, during discussion, forces a different
+    /// player of their choosing onto the ballot too -- "the mirror to the
+    /// Duelist" (rules.md §3.2), and per Dalton's resolution during Phase
+    /// 3 planning, mechanically identical to the Duelist's effect, just
+    /// triggered from the Discussion phase instead of pre-Nomination-close.
+    /// See `state::agitator_redirect`.
+    Agitator,
+    /// Ton: once per game, before a ballot/runoff closes, forces exactly 2
+    /// Cast-Outs (the top two vote-getters) regardless of the standard
+    /// headcount-scaled execution count. See `GameState::grand_inquisitor_armed`.
+    GrandInquisitor,
     // Deliberately no `Whisperer` variant yet, even though rules.md §3.3
     // pairs it with `Deceiver` as the other Cult Leader-designated title
     // ("may shield one named fellow Cultist from being a valid nomination
-    // target for one round"). Its ability is a Denouncement-*procedure*
-    // modifier -- shaped exactly like the Duelist's "guarantee a ballot
-    // spot" and the Agitator's "redirect discussion," both explicitly
-    // Phase 3 scope (`ProcedureEffect` in the implementation plan) -- so
-    // it belongs with that batch, not this one, despite rules.md grouping
-    // it with the Cult section.
+    // target for one round"). Its ability is a Denouncement-procedure
+    // modifier shaped like the three above, but scoped out of this first
+    // Phase 3 batch (which covers the plan's Duelist/Agitator/Grand
+    // Inquisitor trio specifically) despite rules.md grouping it with the
+    // Cult section -- still pending.
     /// The full 23-character roster lands across Phase 2/3 per the
     /// implementation plan -- everyone on the Ton side without one of the
     /// named roles above is this catch-all for now, matching rules.md's own

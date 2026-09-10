@@ -520,6 +520,38 @@ fn AbilityPanel(
                         "Shield yourself from one vote",
                     }
                 },
+                Character::Duelist => rsx! {
+                    p { "Guarantees a ballot spot -- use only while nomination is open." }
+                    {target_picker}
+                    button {
+                        disabled: !abilities.duelist_available.unwrap_or(false) || target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command.call(Command::DuelistChallenge { player: my_id, target: PlayerId(t) });
+                        },
+                        "Challenge",
+                    }
+                },
+                Character::Agitator => rsx! {
+                    p { "Adds a target to the ballot -- use only while discussion is open." }
+                    {target_picker}
+                    button {
+                        disabled: !abilities.agitator_available.unwrap_or(false) || target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command.call(Command::AgitatorRedirect { player: my_id, target: PlayerId(t) });
+                        },
+                        "Redirect",
+                    }
+                },
+                Character::GrandInquisitor => rsx! {
+                    p { "Forces exactly 2 Cast-Outs this Denouncement, regardless of headcount." }
+                    button {
+                        disabled: !abilities.grand_inquisitor_available.unwrap_or(false),
+                        onclick: move |_| on_command.call(Command::ActivateGrandInquisitor { player: my_id }),
+                        "Invoke the office",
+                    }
+                },
                 _ => rsx! {},
             }
         }

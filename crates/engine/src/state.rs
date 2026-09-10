@@ -163,6 +163,21 @@ pub struct GameState {
     vote_shield_armed: BTreeSet<PlayerId>,
     vote_shield_used: BTreeSet<PlayerId>,
 
+    // --- Phase 3: Denouncement procedural modifiers (rules.md §3.1/§3.2) ---
+    /// The Duelist's once-per-game challenge, pending until the currently
+    /// open Nomination phase actually closes -- see
+    /// `state::duelist_challenge`/`close_nomination`. Always `None`
+    /// outside of that window; cleared the moment it's consumed.
+    duelist_challenge: Option<PlayerId>,
+    duelist_used: bool,
+    agitator_used: bool,
+    /// The Grand Inquisitor's once-per-game override, armed for whichever
+    /// ballot/runoff is open when invoked, consumed the moment a tally
+    /// that used it actually resolves -- same lifecycle as
+    /// `magistrate_double_vote_armed`.
+    grand_inquisitor_armed: bool,
+    grand_inquisitor_used: bool,
+
     // --- Phase 2: Cell Leader passive-knowledge (rules.md §3.2) ---
     /// Computed once, automatically, at `FinalizeSetup` -- starting
     /// knowledge, not something anyone activates.
@@ -230,6 +245,11 @@ impl Default for GameState {
             firebrand_double_vote_used: false,
             vote_shield_armed: BTreeSet::new(),
             vote_shield_used: BTreeSet::new(),
+            duelist_challenge: None,
+            duelist_used: false,
+            agitator_used: false,
+            grand_inquisitor_armed: false,
+            grand_inquisitor_used: false,
             cell_leader_knows: Vec::new(),
             oracle_checks_available: 0,
             almanac_used: false,
@@ -388,6 +408,11 @@ impl GameState {
             Character::NormalUprising => {
                 status.vote_shield_available = Some(!self.vote_shield_used.contains(&viewer));
             }
+            Character::Duelist => status.duelist_available = Some(!self.duelist_used),
+            Character::Agitator => status.agitator_available = Some(!self.agitator_used),
+            Character::GrandInquisitor => {
+                status.grand_inquisitor_available = Some(!self.grand_inquisitor_used);
+            }
             _ => {}
         }
         status
@@ -462,14 +487,17 @@ impl GameState {
             | Character::Almanac
             | Character::PriestPriestess
             | Character::PotionMaker
-            | Character::Magistrate => Some(Faction::Ton),
+            | Character::Magistrate
+            | Character::Duelist
+            | Character::GrandInquisitor => Some(Faction::Ton),
             Character::RevolutionaryLeader
             | Character::NormalUprising
             | Character::Spymaster
             | Character::Bartender
             | Character::DoctorMedic
             | Character::Firebrand
-            | Character::CellLeader => Some(Faction::Uprising),
+            | Character::CellLeader
+            | Character::Agitator => Some(Faction::Uprising),
             Character::CultLeader | Character::Cultist | Character::Deceiver => Some(Faction::Cult),
         }
     }
@@ -708,6 +736,10 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
         Command::ActivateDoubleVote { player } => activate_double_vote(state, player)?,
 
         Command::ArmVoteShield { player } => arm_vote_shield(state, player)?,
+
+        Command::DuelistChallenge { player, target } => duelist_challenge(state, player, target)?,
+        Command::AgitatorRedirect { player, target } => agitator_redirect(state, player, target)?,
+        Command::ActivateGrandInquisitor { player } => activate_grand_inquisitor(state, player)?,
     };
 
     state.event_log.extend(events.clone());
@@ -1182,6 +1214,12 @@ fn nominate(
 }
 
 fn close_nomination(state: &mut GameState) -> Result<Vec<DomainEvent>, GameError> {
+    // Read out before taking `state.denouncement`'s mutable borrow below --
+    // must not be consumed until success is certain, so this is only a
+    // peek (`Option<PlayerId>` is `Copy`), cleared explicitly once actually
+    // applied further down.
+    let challenge = state.duelist_challenge;
+
     let denouncement = state
         .denouncement
         .as_mut()
@@ -1196,11 +1234,23 @@ fn close_nomination(state: &mut GameState) -> Result<Vec<DomainEvent>, GameError
     }
     // Top 3, with everyone tied for the last spot surfacing too -- see
     // `denouncement::surfaced_nominees`.
-    let surfaced = surfaced_nominees(&tally, 3);
+    let mut surfaced = surfaced_nominees(&tally, 3);
+
+    // The Duelist's challenge (rules.md §3.1): guarantees a ballot spot
+    // regardless of verbal support -- added on top of the naturally
+    // surfaced candidates, per Dalton's resolution during Phase 3
+    // planning. A no-op if the challenged player already surfaced on
+    // their own.
+    if let Some(challenged) = challenge {
+        if !surfaced.contains(&challenged) {
+            surfaced.push(challenged);
+        }
+    }
 
     denouncement.phase = DenouncementPhase::Discussion {
         surfaced: surfaced.clone(),
     };
+    state.duelist_challenge = None;
     Ok(vec![DomainEvent::NominationClosed { surfaced }])
 }
 
@@ -1337,9 +1387,9 @@ fn close_ballot(
     // would have selected survives instead, so short-circuit before even
     // tallying -- nothing about who "won" the vote can matter once nobody
     // this Denouncement is going to be Cast Out regardless. The double
-    // vote/vote-shield are left un-consumed in this branch (see
-    // `consume_vote_weight_arming`'s doc comment) since a discarded tally
-    // never decided anything.
+    // vote/vote-shield/Grand Inquisitor are left un-consumed in this branch
+    // (see `consume_ballot_modifiers`'s doc comment) since a discarded
+    // tally never decided anything.
     if state.potion_immunity_armed {
         state.potion_immunity_armed = false;
         state.potion_maker_used = true;
@@ -1350,7 +1400,15 @@ fn close_ballot(
     }
 
     let mut tally = tally_ballots(state, &surfaced, &ballots);
-    consume_vote_weight_arming(state);
+    // The Grand Inquisitor's override (rules.md §5): forces exactly 2
+    // Cast-Outs regardless of the headcount-scaled formula. Computed
+    // before consuming, since that's what clears the armed flag.
+    let slots = if state.grand_inquisitor_armed {
+        2
+    } else {
+        execution_count(state.competing_player_count())
+    };
+    consume_ballot_modifiers(state);
 
     // Doctor/Medic's protection (rules.md §3.2): the protected player is
     // pulled out of the tally entirely -- not merely spared -- so the
@@ -1361,7 +1419,6 @@ fn close_ballot(
         tally.remove(&protected);
     }
 
-    let slots = execution_count(state.competing_player_count());
     let resolution = resolve_ballot(&tally, slots);
 
     let mut events = Vec::new();
@@ -1452,7 +1509,14 @@ fn close_runoff(
     }
 
     let mut tally = tally_ballots(state, &candidates, &ballots);
-    consume_vote_weight_arming(state);
+    // Same override as `close_ballot` -- applies to whichever tally is
+    // open when the Grand Inquisitor is invoked, the runoff included.
+    let slots_remaining = if state.grand_inquisitor_armed {
+        2
+    } else {
+        slots_remaining
+    };
+    consume_ballot_modifiers(state);
 
     if let Some(protected) = state.medic_protected_this_round {
         tally.remove(&protected);
@@ -1897,7 +1961,7 @@ fn activate_potion_immunity(
 /// The Magistrate and Firebrand share one command since `player`'s own
 /// character determines which of the two this is (rules.md: there's only
 /// ever one of each). `_used` is consumed only once a tally that applied the
-/// weight actually runs -- see `consume_vote_weight_arming`.
+/// weight actually runs -- see `consume_ballot_modifiers`.
 fn activate_double_vote(
     state: &mut GameState,
     player: PlayerId,
@@ -1953,13 +2017,101 @@ fn arm_vote_shield(state: &mut GameState, player: PlayerId) -> Result<Vec<Domain
     Ok(vec![DomainEvent::VoteShieldArmed { player }])
 }
 
-/// Consumes whichever vote-weight abilities actually applied to a tally that
-/// just ran -- called once per real tally-and-resolve (both `close_ballot`
-/// and `close_runoff`), but deliberately skipped on the Potion Maker's
-/// blanket-immunity short-circuit in both, since a discarded tally never
-/// really "decided" anything the double vote or shield could be credited
-/// (or charged) for.
-fn consume_vote_weight_arming(state: &mut GameState) {
+/// The Duelist's once-per-game "challenge" (rules.md §3.1). Only records
+/// the choice -- `close_nomination` is where it actually reaches the
+/// candidate list, since `surfaced` doesn't exist until that tally runs.
+/// Requires an open Nomination phase specifically ("before nomination
+/// closes"): arming it any earlier would risk a *later*, unrelated
+/// Denouncement's `close_nomination` consuming it instead, since only one
+/// Denouncement runs at a time and this field has no round/Denouncement
+/// identity of its own.
+fn duelist_challenge(
+    state: &mut GameState,
+    player: PlayerId,
+    target: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::Duelist)?;
+    if state.duelist_used {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::Duelist,
+        });
+    }
+    if !state.is_active(target) {
+        return Err(GameError::NotActive(target));
+    }
+    match state.denouncement.as_ref().map(|d| &d.phase) {
+        Some(DenouncementPhase::Nomination { .. }) => {}
+        Some(_) => return Err(GameError::NominationNotOpen),
+        None => return Err(GameError::NoDenouncementOpen),
+    }
+
+    state.duelist_used = true;
+    state.duelist_challenge = Some(target);
+    Ok(vec![DomainEvent::DuelistChallengeIssued { player, target }])
+}
+
+/// The Agitator's once-per-game redirect (rules.md §3.2) -- mechanically
+/// identical to the Duelist's challenge (Dalton's resolution during Phase 3
+/// planning), but applied immediately: unlike Nomination's `surfaced` (only
+/// computed when it closes), Discussion's `surfaced` already exists the
+/// moment this fires, so there's no need for a separate pending field --
+/// `target` is spliced straight into the live candidate list.
+fn agitator_redirect(
+    state: &mut GameState,
+    player: PlayerId,
+    target: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::Agitator)?;
+    if state.agitator_used {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::Agitator,
+        });
+    }
+    if !state.is_active(target) {
+        return Err(GameError::NotActive(target));
+    }
+    let denouncement = state
+        .denouncement
+        .as_mut()
+        .ok_or(GameError::NoDenouncementOpen)?;
+    let DenouncementPhase::Discussion { surfaced } = &mut denouncement.phase else {
+        return Err(GameError::DiscussionNotOpen);
+    };
+    if !surfaced.contains(&target) {
+        surfaced.push(target);
+    }
+
+    state.agitator_used = true;
+    Ok(vec![DomainEvent::AgitatorRedirectIssued { player, target }])
+}
+
+/// Arms the Grand Inquisitor's once-per-game override (rules.md §5) for
+/// whichever ballot/runoff is currently open. `grand_inquisitor_used` is
+/// deliberately NOT set here -- consumed only when a tally that used it
+/// actually resolves, see `consume_ballot_modifiers`, the same lifecycle as
+/// the Magistrate/Firebrand's double vote.
+fn activate_grand_inquisitor(
+    state: &mut GameState,
+    player: PlayerId,
+) -> Result<Vec<DomainEvent>, GameError> {
+    require_character(state, player, Character::GrandInquisitor)?;
+    if state.grand_inquisitor_used {
+        return Err(GameError::AbilityNotAvailable {
+            character: Character::GrandInquisitor,
+        });
+    }
+    state.grand_inquisitor_armed = true;
+    Ok(vec![DomainEvent::GrandInquisitorInvoked { player }])
+}
+
+/// Consumes whichever Phase 2/3 ballot-modifying abilities actually applied
+/// to a tally that just ran (the double vote, the vote-shield, and the
+/// Grand Inquisitor's forced-2-slots override) -- called once per real
+/// tally-and-resolve (both `close_ballot` and `close_runoff`), but
+/// deliberately skipped on the Potion Maker's blanket-immunity
+/// short-circuit in both, since a discarded tally never really "decided"
+/// anything any of these could be credited (or charged) for.
+fn consume_ballot_modifiers(state: &mut GameState) {
     if state.magistrate_double_vote_armed {
         state.magistrate_double_vote_armed = false;
         state.magistrate_double_vote_used = true;
@@ -1970,6 +2122,10 @@ fn consume_vote_weight_arming(state: &mut GameState) {
     }
     for shielded in std::mem::take(&mut state.vote_shield_armed) {
         state.vote_shield_used.insert(shielded);
+    }
+    if state.grand_inquisitor_armed {
+        state.grand_inquisitor_armed = false;
+        state.grand_inquisitor_used = true;
     }
 }
 
@@ -4786,6 +4942,9 @@ mod tests {
         deceiver: PlayerId,
         normal_ton: PlayerId,
         normal_uprising: PlayerId,
+        duelist: PlayerId,
+        agitator: PlayerId,
+        grand_inquisitor: PlayerId,
     }
 
     fn assign_new(
@@ -4836,6 +4995,13 @@ mod tests {
             Faction::Ton,
             Character::Magistrate,
         );
+        let duelist = assign_new(&mut state, "Duelist", Faction::Ton, Character::Duelist);
+        let grand_inquisitor = assign_new(
+            &mut state,
+            "GrandInquisitor",
+            Faction::Ton,
+            Character::GrandInquisitor,
+        );
         let normal_ton = add_player(&mut state, "NormalTon", Faction::Ton);
 
         let leader = assign_new(
@@ -4874,6 +5040,12 @@ mod tests {
             Faction::Uprising,
             Character::CellLeader,
         );
+        let agitator = assign_new(
+            &mut state,
+            "Agitator",
+            Faction::Uprising,
+            Character::Agitator,
+        );
         let normal_uprising = add_player(&mut state, "NormalUprising", Faction::Uprising);
 
         let cult_leader = assign_new(
@@ -4906,6 +5078,9 @@ mod tests {
                 deceiver,
                 normal_ton,
                 normal_uprising,
+                duelist,
+                agitator,
+                grand_inquisitor,
             },
         )
     }
@@ -5673,9 +5848,7 @@ mod tests {
     #[test]
     fn medic_protection_saves_an_already_locked_in_candidate_during_a_runoff_with_no_backfill() {
         let (mut state, p) = setup_phase2_game();
-        for i in 0..4 {
-            add_player(&mut state, &format!("Extra{i}"), Faction::Ton);
-        }
+        add_player(&mut state, "Extra", Faction::Ton);
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
         assert_eq!(state.competing_player_count(), 21);
 
@@ -6867,5 +7040,640 @@ mod tests {
         let oracle_checks = state.info_checks_for(p.oracle);
         assert_eq!(oracle_checks.len(), 1);
         assert_eq!(oracle_checks[0].kind, InfoQueryKind::FullHistory);
+    }
+
+    // --- Phase 3: Denouncement procedural modifiers ---
+
+    #[test]
+    fn duelist_challenge_adds_to_the_surfaced_list_on_top_of_natural_nominees() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+
+        apply_command(
+            &mut state,
+            Command::DuelistChallenge {
+                player: p.duelist,
+                target: p.medic,
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(&mut state, Command::CloseNomination).unwrap();
+        let surfaced = match &events[0] {
+            DomainEvent::NominationClosed { surfaced } => surfaced.clone(),
+            other => panic!("expected NominationClosed, got {other:?}"),
+        };
+        assert!(surfaced.contains(&p.king_queen));
+        assert!(surfaced.contains(&p.medic));
+    }
+
+    #[test]
+    fn duelist_challenge_is_a_no_op_if_the_target_already_surfaced() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::DuelistChallenge {
+                player: p.duelist,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(&mut state, Command::CloseNomination).unwrap();
+        let surfaced = match &events[0] {
+            DomainEvent::NominationClosed { surfaced } => surfaced.clone(),
+            other => panic!("expected NominationClosed, got {other:?}"),
+        };
+        assert_eq!(surfaced.iter().filter(|&&id| id == p.king_queen).count(), 1);
+    }
+
+    #[test]
+    fn duelist_challenge_requires_an_open_nomination_phase() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::DuelistChallenge {
+                player: p.duelist,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(result, Err(GameError::NoDenouncementOpen));
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        let result2 = apply_command(
+            &mut state,
+            Command::DuelistChallenge {
+                player: p.duelist,
+                target: p.medic,
+            },
+        );
+        assert_eq!(result2, Err(GameError::NominationNotOpen));
+    }
+
+    #[test]
+    fn duelist_challenge_rejects_a_second_use() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::DuelistChallenge {
+                player: p.duelist,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::DuelistChallenge {
+                player: p.duelist,
+                target: p.medic,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Duelist,
+            })
+        );
+    }
+
+    #[test]
+    fn duelist_challenge_rejects_a_non_duelist() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::DuelistChallenge {
+                player: p.oracle,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::NotCharacter {
+                player: p.oracle,
+                required: Character::Duelist,
+            })
+        );
+    }
+
+    #[test]
+    fn duelist_challenge_rejects_an_inactive_target() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: p.king_queen,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::DuelistChallenge {
+                player: p.duelist,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(p.king_queen)));
+    }
+
+    #[test]
+    fn agitator_redirect_adds_the_target_to_the_live_discussion_candidates() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+
+        apply_command(
+            &mut state,
+            Command::AgitatorRedirect {
+                player: p.agitator,
+                target: p.medic,
+            },
+        )
+        .unwrap();
+
+        match state.denouncement_phase() {
+            Some(DenouncementPhase::Discussion { surfaced }) => {
+                assert!(surfaced.contains(&p.king_queen));
+                assert!(surfaced.contains(&p.medic));
+            }
+            other => panic!("expected Discussion phase, got {other:?}"),
+        }
+
+        // Carries forward into the Ballot too.
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        match state.denouncement_phase() {
+            Some(DenouncementPhase::Ballot { surfaced, .. }) => {
+                assert!(surfaced.contains(&p.medic));
+            }
+            other => panic!("expected Ballot phase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agitator_redirect_is_a_no_op_if_the_target_already_surfaced() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(
+            &mut state,
+            Command::AgitatorRedirect {
+                player: p.agitator,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+
+        match state.denouncement_phase() {
+            Some(DenouncementPhase::Discussion { surfaced }) => {
+                assert_eq!(surfaced.iter().filter(|&&id| id == p.king_queen).count(), 1);
+            }
+            other => panic!("expected Discussion phase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agitator_redirect_requires_an_open_discussion_phase() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::AgitatorRedirect {
+                player: p.agitator,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(result, Err(GameError::NoDenouncementOpen));
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        let result2 = apply_command(
+            &mut state,
+            Command::AgitatorRedirect {
+                player: p.agitator,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(result2, Err(GameError::DiscussionNotOpen));
+    }
+
+    #[test]
+    fn agitator_redirect_rejects_a_second_use() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(
+            &mut state,
+            Command::AgitatorRedirect {
+                player: p.agitator,
+                target: p.medic,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AgitatorRedirect {
+                player: p.agitator,
+                target: p.priest,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Agitator,
+            })
+        );
+    }
+
+    #[test]
+    fn agitator_redirect_rejects_a_non_agitator() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AgitatorRedirect {
+                player: p.medic,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::NotCharacter {
+                player: p.medic,
+                required: Character::Agitator,
+            })
+        );
+    }
+
+    #[test]
+    fn agitator_redirect_rejects_an_inactive_target() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: p.king_queen,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.medic,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AgitatorRedirect {
+                player: p.agitator,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(p.king_queen)));
+    }
+
+    #[test]
+    fn grand_inquisitor_forces_two_cast_outs_regardless_of_headcount() {
+        let (mut state, p) = setup_phase2_game();
+        assert!(
+            state.competing_player_count() <= 20,
+            "this fixture must stay in the flat 1-slot population tier for the test to be meaningful"
+        );
+        apply_command(
+            &mut state,
+            Command::ActivateGrandInquisitor {
+                player: p.grand_inquisitor,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: p.medic,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.almanac,
+                ballot: Ballot::For(p.medic),
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&events[0], DomainEvent::BallotClosed { cast_out }
+                if cast_out.len() == 2 && cast_out.contains(&p.king_queen) && cast_out.contains(&p.medic)),
+            "expected both candidates cast out despite the flat 1-slot headcount: {events:?}"
+        );
+        assert!(state.grand_inquisitor_used);
+        assert!(!state.grand_inquisitor_armed);
+    }
+
+    #[test]
+    fn grand_inquisitor_override_also_applies_during_a_runoff() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: p.medic,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        // Both candidates tie at 1 vote each for the single normal slot.
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.almanac,
+                ballot: Ballot::For(p.medic),
+            },
+        )
+        .unwrap();
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&events[0], DomainEvent::RunoffOpened { .. }),
+            "expected a tie into a runoff: {events:?}"
+        );
+
+        // The Grand Inquisitor invokes their office during the runoff
+        // window, not before the original ballot -- see `close_runoff`'s
+        // own override check.
+        apply_command(
+            &mut state,
+            Command::ActivateGrandInquisitor {
+                player: p.grand_inquisitor,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.priest,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.potion_maker,
+                ballot: Ballot::For(p.medic),
+            },
+        )
+        .unwrap();
+
+        let runoff_events = apply_command(
+            &mut state,
+            Command::CloseRunoff {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        match &runoff_events[0] {
+            DomainEvent::RunoffClosed {
+                cast_out,
+                unfilled_slot,
+            } => {
+                assert_eq!(cast_out.len(), 2);
+                assert!(cast_out.contains(&p.king_queen));
+                assert!(cast_out.contains(&p.medic));
+                assert!(!unfilled_slot);
+            }
+            other => panic!("expected RunoffClosed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activate_grand_inquisitor_rejects_a_non_grand_inquisitor() {
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::ActivateGrandInquisitor { player: p.oracle },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::NotCharacter {
+                player: p.oracle,
+                required: Character::GrandInquisitor,
+            })
+        );
+    }
+
+    #[test]
+    fn activate_grand_inquisitor_rejects_reuse() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ActivateGrandInquisitor {
+                player: p.grand_inquisitor,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        let result = apply_command(
+            &mut state,
+            Command::ActivateGrandInquisitor {
+                player: p.grand_inquisitor,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::GrandInquisitor,
+            })
+        );
+    }
+
+    #[test]
+    fn potion_immunity_leaves_an_armed_grand_inquisitor_unconsumed() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::ActivateGrandInquisitor {
+                player: p.grand_inquisitor,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity {
+                player: p.potion_maker,
+            },
+        )
+        .unwrap();
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.king_queen),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert!(state.grand_inquisitor_armed);
+        assert!(!state.grand_inquisitor_used);
     }
 }

@@ -808,6 +808,57 @@ mod tests {
     }
 
     #[test]
+    fn phase_3_procedural_modifier_ability_status_is_also_scoped_to_the_holder() {
+        let mut state = GameState::new();
+        let new_player = |state: &mut GameState, name: &str, faction: Faction| -> PlayerId {
+            let events = apply_command(
+                state,
+                Command::AddPlayer {
+                    name: name.to_string(),
+                },
+            )
+            .unwrap();
+            let id = match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_command(
+                state,
+                Command::AssignFaction {
+                    player: id,
+                    faction,
+                },
+            )
+            .unwrap();
+            id
+        };
+
+        let duelist = new_player(&mut state, "Duelist", Faction::Ton);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: duelist,
+                character: Character::Duelist,
+            },
+        )
+        .unwrap();
+        let bystander = new_player(&mut state, "Bystander", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        let duelist_view = view_for(&state, Viewer::Player(duelist));
+        assert_eq!(duelist_view.my_abilities.duelist_available, Some(true));
+
+        // Nobody else -- not another player, not Host/Display -- ever sees
+        // this reflected in their own view.
+        let bystander_view = view_for(&state, Viewer::Player(bystander));
+        assert_eq!(bystander_view.my_abilities, AbilityStatus::default());
+        assert_eq!(
+            view_for(&state, Viewer::Host).my_abilities,
+            AbilityStatus::default()
+        );
+    }
+
+    #[test]
     fn my_info_checks_never_leaks_into_another_players_view() {
         let (mut state, oracle, king_queen, ..) = phase2_state();
         apply_command(&mut state, Command::AdvanceRound).unwrap();

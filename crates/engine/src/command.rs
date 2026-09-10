@@ -268,6 +268,37 @@ pub enum Command {
     /// is -- there's only ever one of each.
     ActivateDoubleVote { player: PlayerId },
 
+    // --- Phase 3: Denouncement procedural modifiers (rules.md §3.1/§3.2)
+    // ---
+    /// The Duelist "challenges" `target`, once per game, guaranteeing them
+    /// a spot on the ballot regardless of verbal support (rules.md §3.1).
+    /// `target` is added on top of whoever naturally surfaced from
+    /// nominations, not swapped in for them (Dalton's resolution of that
+    /// ambiguity during Phase 3 planning). Must be issued while a
+    /// Denouncement's Nomination phase is currently open -- see
+    /// `state::duelist_challenge`.
+    DuelistChallenge { player: PlayerId, target: PlayerId },
+
+    /// The Agitator "redirects" the room's attention to `target`, once per
+    /// game, during Discussion (rules.md §3.2: "the mirror to the
+    /// Duelist"). Per Dalton's resolution during Phase 3 planning, this is
+    /// mechanically identical to the Duelist's effect -- `target` is added
+    /// to the candidate list too, not merely discussed -- just triggered
+    /// from the Discussion phase instead of pre-Nomination-close. Must be
+    /// issued while a Denouncement's Discussion phase is currently open --
+    /// see `state::agitator_redirect`.
+    AgitatorRedirect { player: PlayerId, target: PlayerId },
+
+    /// The Grand Inquisitor invokes their office, once per game, before a
+    /// ballot/runoff closes: forces exactly 2 Cast-Outs (the top two
+    /// vote-getters) regardless of the standard headcount-scaled execution
+    /// count (rules.md §5: "a one-time override of a single Denouncement's
+    /// outcome"). Applies to whichever tally is open when armed -- the
+    /// original ballot, or a runoff if one is already underway -- the same
+    /// "arm before it closes" convention as Potion Maker/the double
+    /// vote/the vote-shield.
+    ActivateGrandInquisitor { player: PlayerId },
+
     // --- Phase 2: Normal Uprising's reactive safety-net (rules.md §3.2)
     // ---
     /// Arms a standing shield negating one vote cast against `player` at

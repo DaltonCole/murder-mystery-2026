@@ -218,4 +218,17 @@ pub enum DomainEvent {
     VoteShieldArmed {
         player: PlayerId,
     },
+
+    // --- Phase 3: Denouncement procedural modifiers ---
+    DuelistChallengeIssued {
+        player: PlayerId,
+        target: PlayerId,
+    },
+    AgitatorRedirectIssued {
+        player: PlayerId,
+        target: PlayerId,
+    },
+    GrandInquisitorInvoked {
+        player: PlayerId,
+    },
 }

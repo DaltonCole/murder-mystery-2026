@@ -144,6 +144,9 @@ pub struct AbilityStatus {
     /// Magistrate or Firebrand -- whichever the viewer actually is.
     pub double_vote_available: Option<bool>,
     pub vote_shield_available: Option<bool>,
+    pub duelist_available: Option<bool>,
+    pub agitator_available: Option<bool>,
+    pub grand_inquisitor_available: Option<bool>,
 }
 
 /// One delivered info-check result, kept so `view_for` can show a querier
