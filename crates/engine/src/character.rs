@@ -37,8 +37,9 @@ pub enum Character {
     /// Ton, protect family: once per Cult recruitment window, protects one
     /// person from conversion.
     PriestPriestess,
-    /// Ton, protect family: once per game, grants round-wide
-    /// execution-immunity.
+    /// Ton, protect family: once per game, protects one named target from
+    /// this Denouncement's Cast-Out resolution -- the same shape as
+    /// Doctor/Medic, just a once-per-game budget instead of once-per-round.
     PotionMaker,
     /// Ton, vote-weight: once per game, their ballot counts as two votes.
     Magistrate,

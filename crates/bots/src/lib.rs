@@ -31,6 +31,7 @@ pub use protocol::{ClientMsg, Conn, ConnError, ServerMsg};
 
 use engine::{Faction, PlayerId, PlayerStatus, RosterEntry, Round};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -71,6 +72,12 @@ pub async fn run_full_automated_game(
     // -- see that method's doc comment for why the Intermission opt-in pool
     // can't just be read back off the wire the way everything else is.
     let intermission_pool: Arc<Mutex<BTreeSet<PlayerId>>> = Arc::new(Mutex::new(BTreeSet::new()));
+    // Flipped `true` only once `setup_game` has fully returned -- see
+    // `PlayerBot::react`'s doc comment on why bots must stay silent before
+    // then: `setup_game` itself relies on `do_cmd_sequential`'s "nothing
+    // else is concurrently mutating state" assumption, which an early
+    // ability activation or Intermission opt-in would violate.
+    let setup_complete = Arc::new(AtomicBool::new(false));
 
     let mut handles = Vec::with_capacity(player_count);
     for i in 0..player_count {
@@ -78,8 +85,9 @@ pub async fn run_full_automated_game(
         let name = format!("Bot{i}");
         let bot_seed = seed.wrapping_add(i as u64 * 7_919 + 1);
         let pool = Arc::clone(&intermission_pool);
+        let setup_complete = Arc::clone(&setup_complete);
         handles.push(tokio::spawn(async move {
-            let bot = PlayerBot::join(&url, &name, bot_seed, pool).await?;
+            let bot = PlayerBot::join(&url, &name, bot_seed, pool, setup_complete).await?;
             bot.run().await
         }));
     }
@@ -89,6 +97,7 @@ pub async fn run_full_automated_game(
         .wait_for_roster(player_count, Duration::from_secs(15))
         .await?;
     let roles = host.setup_game(&roster, seed).await?;
+    setup_complete.store(true, Ordering::Relaxed);
     host.run_round_one_tasks(&roster, seed, phase_wait).await?;
     // The literal late-arrival Servants earn their first point right away
     // -- see `Roles::servants`'s doc comment on why the Host has to track

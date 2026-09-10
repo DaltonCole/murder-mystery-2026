@@ -255,13 +255,18 @@ pub enum Command {
         lands: bool,
     },
 
-    /// Potion Maker activates round-wide execution-immunity (rules.md
-    /// §3.1) -- whoever the vote selects this Denouncement survives
-    /// instead of being Cast Out (Dalton's resolution of the
-    /// named-target-vs-blanket ambiguity: this is blanket, no target
-    /// choice). Once per game; must be armed before the ballot/runoff
-    /// that it protects actually closes.
-    ActivatePotionImmunity { player: PlayerId },
+    /// Potion Maker protects `target` from this Denouncement's Cast-Out
+    /// resolution (rules.md §3.1) -- Dalton's follow-up ruling on the
+    /// named-target-vs-blanket ambiguity, replacing the original blanket
+    /// design so it can coexist with the Grand Inquisitor's forced-2-slots
+    /// override within the same round (see `state::consume_ballot_modifiers`)
+    /// instead of discarding the whole tally outright. Mechanically the
+    /// same shape as `MedicProtect`: if `target` would otherwise be Cast
+    /// Out, their name is removed from the resolved list before slots are
+    /// filled, letting the next-highest vote-getter backfill the freed
+    /// slot. Once per game; must be armed before the ballot/runoff that it
+    /// protects actually closes.
+    ActivatePotionImmunity { player: PlayerId, target: PlayerId },
 
     // --- Phase 2: vote-weight pair (rules.md §3.1/§3.2) ---
     /// The Magistrate or the Firebrand arms their once-per-game double

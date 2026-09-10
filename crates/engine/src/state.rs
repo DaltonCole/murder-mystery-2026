@@ -139,10 +139,13 @@ pub struct GameState {
     /// whether this round's single use has already been spent.
     drunk_this_round: BTreeSet<PlayerId>,
     bartender_used_this_round: bool,
-    /// Potion Maker: armed for the *current* Denouncement, consumed
-    /// (regardless of outcome) the moment a ballot/runoff actually closes
-    /// while armed.
-    potion_immunity_armed: bool,
+    /// Potion Maker: a named target, armed for the *current* Denouncement,
+    /// consumed (regardless of whether the target was actually selected)
+    /// the moment a ballot/runoff actually closes while armed. Mechanically
+    /// the same "protect family" shape as Doctor/Medic (Dalton's follow-up
+    /// ruling replacing the original blanket, no-target design) -- see
+    /// `activate_potion_immunity`'s doc comment.
+    potion_immunity_target: Option<PlayerId>,
     potion_maker_used: bool,
 
     // --- Phase 2: vote-weight pair (rules.md §3.1/§3.2) ---
@@ -269,7 +272,7 @@ impl Default for GameState {
             medic_protected_last_round: None,
             drunk_this_round: BTreeSet::new(),
             bartender_used_this_round: false,
-            potion_immunity_armed: false,
+            potion_immunity_target: None,
             potion_maker_used: false,
             magistrate_double_vote_armed: false,
             magistrate_double_vote_used: false,
@@ -868,7 +871,9 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             target,
             lands,
         } => bartender_target(state, player, target, lands)?,
-        Command::ActivatePotionImmunity { player } => activate_potion_immunity(state, player)?,
+        Command::ActivatePotionImmunity { player, target } => {
+            activate_potion_immunity(state, player, target)?
+        }
 
         Command::ActivateDoubleVote { player } => activate_double_vote(state, player)?,
 
@@ -1558,23 +1563,6 @@ fn close_ballot(
         _ => return Err(GameError::BallotNotOpen),
     };
 
-    // Potion Maker's blanket round-wide execution-immunity (rules.md §3.1,
-    // Dalton's "blanket, no target choice" resolution): whoever the vote
-    // would have selected survives instead, so short-circuit before even
-    // tallying -- nothing about who "won" the vote can matter once nobody
-    // this Denouncement is going to be Cast Out regardless. The double
-    // vote/vote-shield/Grand Inquisitor are left un-consumed in this branch
-    // (see `consume_ballot_modifiers`'s doc comment) since a discarded
-    // tally never decided anything.
-    if state.potion_immunity_armed {
-        state.potion_immunity_armed = false;
-        state.potion_maker_used = true;
-        close_denouncement(state);
-        return Ok(vec![DomainEvent::BallotClosed {
-            cast_out: Vec::new(),
-        }]);
-    }
-
     let mut tally = tally_ballots(state, &surfaced, &ballots);
     // The Grand Inquisitor's override (rules.md §5): forces exactly 2
     // Cast-Outs regardless of the headcount-scaled formula. Computed
@@ -1586,12 +1574,23 @@ fn close_ballot(
     };
     consume_ballot_modifiers(state);
 
-    // Doctor/Medic's protection (rules.md §3.2): the protected player is
-    // pulled out of the tally entirely -- not merely spared -- so the
-    // next-highest vote-getter backfills the freed slot (Dalton's "backfill
-    // from the next candidate" resolution) rather than the slot going
-    // unfilled.
+    // Doctor/Medic's protection (rules.md §3.2) and the Potion Maker's
+    // named-target immunity (rules.md §3.1, mechanically the same "protect
+    // family" shape since Dalton's follow-up ruling): each protected
+    // player is pulled out of the tally entirely -- not merely spared --
+    // so the next-highest vote-getter backfills the freed slot (Dalton's
+    // "backfill from the next candidate" resolution) rather than the slot
+    // going unfilled.
     if let Some(protected) = state.medic_protected_this_round {
+        tally.remove(&protected);
+    }
+    // Cleared here, not in `consume_ballot_modifiers` (which already ran
+    // above) -- that function only flips `potion_maker_used`, since
+    // clearing the target there would happen *before* this removal ever
+    // reads it. Left un-cleared, this same stale target would silently
+    // keep getting pulled out of every future Denouncement's tally too,
+    // reintroducing the exact carryover bug this whole redesign fixes.
+    if let Some(protected) = state.potion_immunity_target.take() {
         tally.remove(&protected);
     }
 
@@ -1668,22 +1667,6 @@ fn close_runoff(
             _ => return Err(GameError::RunoffNotOpen),
         };
 
-    // See the identical Potion Maker short-circuit in `close_ballot` -- the
-    // same reasoning applies here: nobody at all is Cast Out from this
-    // Denouncement, including anyone already locked in from the *original*
-    // ballot before the tie -- nothing has actually been removed from the
-    // game yet at this point (see `resolve_cast_out`'s callers), so blanket
-    // immunity covers the whole batch, not just the runoff's own slots.
-    if state.potion_immunity_armed {
-        state.potion_immunity_armed = false;
-        state.potion_maker_used = true;
-        close_denouncement(state);
-        return Ok(vec![DomainEvent::RunoffClosed {
-            cast_out: Vec::new(),
-            unfilled_slot: false,
-        }]);
-    }
-
     let mut tally = tally_ballots(state, &candidates, &ballots);
     // Same override as `close_ballot` -- applies to whichever tally is
     // open when the Grand Inquisitor is invoked, the runoff included. The
@@ -1702,13 +1685,25 @@ fn close_runoff(
     if let Some(protected) = state.medic_protected_this_round {
         tally.remove(&protected);
     }
-    // The Medic can also target someone already locked in from the
-    // *original* ballot (before the tie) during the runoff window -- no
-    // ranked backfill is possible for an already-decided list like this, so
-    // the protected player is simply saved and that slot goes unfilled.
+    // Read once via `.take()` (clearing it), not `consume_ballot_modifiers`
+    // (which already ran above and only flips `potion_maker_used`) -- both
+    // this removal and the `already_locked_in` filter below need the same
+    // value, and leaving it un-cleared would silently keep protecting this
+    // same target in every future Denouncement for the rest of the game.
+    let potion_immunity_target = state.potion_immunity_target.take();
+    if let Some(protected) = potion_immunity_target {
+        tally.remove(&protected);
+    }
+    // The Medic (or the Potion Maker) can also target someone already
+    // locked in from the *original* ballot (before the tie) during the
+    // runoff window -- no ranked backfill is possible for an
+    // already-decided list like this, so the protected player is simply
+    // saved and that slot goes unfilled.
     let already_locked_in: Vec<PlayerId> = already_locked_in
         .into_iter()
-        .filter(|&id| Some(id) != state.medic_protected_this_round)
+        .filter(|&id| {
+            Some(id) != state.medic_protected_this_round && Some(id) != potion_immunity_target
+        })
         .collect();
 
     let resolution = resolve_ballot(&tally, slots_remaining);
@@ -2384,14 +2379,22 @@ fn bartender_target(
 }
 
 /// Arms the Potion Maker's once-per-game blanket execution-immunity.
-/// `potion_maker_used` is deliberately NOT set here -- see its doc comment
-/// on `GameState`: it's consumed only when a ballot/runoff actually closes
-/// while armed (`close_ballot`/`close_runoff`), not at activation, so
-/// re-arming before anything has closed is a harmless no-op rather than a
-/// wasted use.
+/// Arms the Potion Maker's once-per-game named-target immunity (rules.md
+/// §3.1, "protect family" -- Dalton's follow-up ruling replacing the
+/// original blanket, no-target design so it can coexist with the Grand
+/// Inquisitor's forced-2-slots override within the same round instead of
+/// discarding the whole tally). A standing choice, changeable at any time
+/// before it's consumed -- the same shape as `MedicProtect`. `target` must
+/// currently be active; `potion_maker_used` is deliberately NOT set here --
+/// see its doc comment on `GameState`: it's consumed only when a
+/// ballot/runoff actually closes while armed (`close_ballot`/`close_runoff`
+/// via `consume_ballot_modifiers`), not at activation, so re-arming (even
+/// with a different target) before anything has closed is a harmless
+/// replace rather than a wasted use.
 fn activate_potion_immunity(
     state: &mut GameState,
     player: PlayerId,
+    target: PlayerId,
 ) -> Result<Vec<DomainEvent>, GameError> {
     require_character(state, player, Character::PotionMaker)?;
     if state.potion_maker_used {
@@ -2399,8 +2402,14 @@ fn activate_potion_immunity(
             character: Character::PotionMaker,
         });
     }
-    state.potion_immunity_armed = true;
-    Ok(vec![DomainEvent::PotionImmunityActivated { player }])
+    if !state.is_active(target) {
+        return Err(GameError::NotActive(target));
+    }
+    state.potion_immunity_target = Some(target);
+    Ok(vec![DomainEvent::PotionImmunityActivated {
+        player,
+        target,
+    }])
 }
 
 /// The Magistrate and Firebrand share one command since `player`'s own
@@ -2550,12 +2559,14 @@ fn activate_grand_inquisitor(
 }
 
 /// Consumes whichever Phase 2/3 ballot-modifying abilities actually applied
-/// to a tally that just ran (the double vote, the vote-shield, and the
-/// Grand Inquisitor's forced-2-slots override) -- called once per real
-/// tally-and-resolve (both `close_ballot` and `close_runoff`), but
-/// deliberately skipped on the Potion Maker's blanket-immunity
-/// short-circuit in both, since a discarded tally never really "decided"
-/// anything any of these could be credited (or charged) for.
+/// to a tally that just ran (the double vote, the vote-shield, the Grand
+/// Inquisitor's forced-2-slots override, and the Potion Maker's named-target
+/// immunity) -- called once per real tally-and-resolve (both `close_ballot`
+/// and `close_runoff`), *before* `resolve_ballot` runs. This is also what
+/// keeps an armed-but-never-triggered ability from silently carrying into a
+/// later, unrelated Denouncement: every one of these flags is unconditionally
+/// cleared here the moment a tally it was armed for actually closes,
+/// regardless of whether it ended up mattering to that tally's outcome.
 fn consume_ballot_modifiers(state: &mut GameState) {
     if state.magistrate_double_vote_armed {
         state.magistrate_double_vote_armed = false;
@@ -2571,6 +2582,9 @@ fn consume_ballot_modifiers(state: &mut GameState) {
     if state.grand_inquisitor_armed {
         state.grand_inquisitor_armed = false;
         state.grand_inquisitor_used = true;
+    }
+    if state.potion_immunity_target.is_some() {
+        state.potion_maker_used = true;
     }
 }
 
@@ -6550,6 +6564,140 @@ mod tests {
     }
 
     #[test]
+    fn potion_immunity_saves_an_already_locked_in_candidate_during_a_runoff_with_no_backfill() {
+        // Same shape as the Medic's equivalent test above -- Potion
+        // Maker's redesigned named-target immunity is mechanically the
+        // Medic's protect family, so it needs the exact same two-removal
+        // treatment during a runoff: pulled from the runoff's own tally,
+        // *and* filtered out of `already_locked_in` (the original ballot's
+        // clean winner from before the tie), since no ranked backfill is
+        // possible for an already-decided list.
+        let (mut state, p) = setup_phase2_game();
+        add_player(&mut state, "Extra", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        assert_eq!(state.competing_player_count(), 21);
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.oracle,
+                nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.almanac,
+                nominee: p.prince_princess,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.priest,
+                nominee: p.spymaster,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        for voter in [p.oracle, p.almanac, p.priest, p.potion_maker, p.magistrate] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.king_queen),
+                },
+            )
+            .unwrap();
+        }
+        for voter in [p.spymaster, p.bartender, p.medic] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.prince_princess),
+                },
+            )
+            .unwrap();
+        }
+        for voter in [p.firebrand, p.cell_leader, p.leader] {
+            apply_command(
+                &mut state,
+                Command::CastBallot {
+                    voter,
+                    ballot: Ballot::For(p.spymaster),
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DomainEvent::RunoffOpened { .. })),
+            "expected a runoff for the tied 2nd slot: {events:?}"
+        );
+
+        // Armed *during* the runoff window, targeting King/Queen -- who's
+        // already locked in from the *original* ballot, before the tie.
+        apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity {
+                player: p.potion_maker,
+                target: p.king_queen,
+            },
+        )
+        .unwrap();
+
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: p.oracle,
+                ballot: Ballot::For(p.prince_princess),
+            },
+        )
+        .unwrap();
+        let runoff_events = apply_command(
+            &mut state,
+            Command::CloseRunoff {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.player(p.king_queen).unwrap().status,
+            PlayerStatus::Active,
+            "the potion-immunity-protected already-locked-in candidate should survive"
+        );
+        assert_eq!(
+            state.player(p.prince_princess).unwrap().status,
+            PlayerStatus::CastOut
+        );
+        match &runoff_events[0] {
+            DomainEvent::RunoffClosed { cast_out, .. } => {
+                assert!(!cast_out.contains(&p.king_queen));
+                assert!(cast_out.contains(&p.prince_princess));
+            }
+            other => panic!("expected RunoffClosed, got {other:?}"),
+        }
+        assert!(state.potion_immunity_target.is_none());
+        assert!(state.potion_maker_used);
+    }
+
+    #[test]
     fn bartender_makes_the_target_drunk_when_it_lands() {
         let (mut state, p) = setup_phase2_game();
         let events = apply_command(
@@ -6697,7 +6845,10 @@ mod tests {
         let (mut state, p) = setup_phase2_game();
         let result = apply_command(
             &mut state,
-            Command::ActivatePotionImmunity { player: p.oracle },
+            Command::ActivatePotionImmunity {
+                player: p.oracle,
+                target: p.king_queen,
+            },
         );
         assert_eq!(
             result,
@@ -6709,12 +6860,34 @@ mod tests {
     }
 
     #[test]
-    fn potion_immunity_saves_everyone_the_ballot_would_have_cast_out() {
+    fn activate_potion_immunity_rejects_an_inactive_target() {
+        let (mut state, p) = setup_phase2_game();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: p.normal_ton,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity {
+                player: p.potion_maker,
+                target: p.normal_ton,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(p.normal_ton)));
+    }
+
+    #[test]
+    fn potion_immunity_saves_its_named_target_from_the_ballot() {
         let (mut state, p) = setup_phase2_game();
         apply_command(
             &mut state,
             Command::ActivatePotionImmunity {
                 player: p.potion_maker,
+                target: p.king_queen,
             },
         )
         .unwrap();
@@ -6754,7 +6927,7 @@ mod tests {
         assert!(
             matches!(&events[0], DomainEvent::BallotClosed { cast_out } if cast_out.is_empty())
         );
-        assert!(!state.potion_immunity_armed);
+        assert!(state.potion_immunity_target.is_none());
         assert!(state.potion_maker_used);
     }
 
@@ -6765,6 +6938,7 @@ mod tests {
             &mut state,
             Command::ActivatePotionImmunity {
                 player: p.potion_maker,
+                target: p.king_queen,
             },
         )
         .unwrap();
@@ -6799,6 +6973,7 @@ mod tests {
             &mut state,
             Command::ActivatePotionImmunity {
                 player: p.potion_maker,
+                target: p.king_queen,
             },
         );
         assert_eq!(
@@ -7493,7 +7668,13 @@ mod tests {
     }
 
     #[test]
-    fn potion_immunity_leaves_an_armed_double_vote_unconsumed() {
+    fn potion_immunity_and_an_armed_double_vote_both_apply_in_the_same_round() {
+        // Regression test: under the old blanket-immunity design, Potion
+        // Maker short-circuited the whole tally, leaving the double vote
+        // (and every other ballot modifier) un-consumed. Now the tally
+        // always genuinely runs -- Potion Maker just pulls its one named
+        // target out of it, like Medic -- so the double vote is properly
+        // consumed even though King/Queen (the only candidate) survives.
         let (mut state, p) = setup_phase2_game();
         apply_command(
             &mut state,
@@ -7506,6 +7687,7 @@ mod tests {
             &mut state,
             Command::ActivatePotionImmunity {
                 player: p.potion_maker,
+                target: p.king_queen,
             },
         )
         .unwrap();
@@ -7529,7 +7711,7 @@ mod tests {
             },
         )
         .unwrap();
-        apply_command(
+        let events = apply_command(
             &mut state,
             Command::CloseBallot {
                 fallback_replacement: None,
@@ -7538,14 +7720,16 @@ mod tests {
         .unwrap();
 
         assert!(
-            state.magistrate_double_vote_armed,
-            "a discarded tally never decided anything, so the double vote shouldn't be consumed"
+            matches!(&events[0], DomainEvent::BallotClosed { cast_out } if cast_out.is_empty())
         );
-        assert!(!state.magistrate_double_vote_used);
+        assert!(!state.magistrate_double_vote_armed);
+        assert!(state.magistrate_double_vote_used);
+        assert!(state.potion_immunity_target.is_none());
+        assert!(state.potion_maker_used);
     }
 
     #[test]
-    fn potion_immunity_leaves_an_armed_vote_shield_unconsumed() {
+    fn potion_immunity_and_an_armed_vote_shield_both_apply_in_the_same_round() {
         let (mut state, p) = setup_phase2_game();
         apply_command(
             &mut state,
@@ -7558,6 +7742,7 @@ mod tests {
             &mut state,
             Command::ActivatePotionImmunity {
                 player: p.potion_maker,
+                target: p.normal_uprising,
             },
         )
         .unwrap();
@@ -7589,8 +7774,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(state.vote_shield_armed.contains(&p.normal_uprising));
-        assert!(!state.vote_shield_used.contains(&p.normal_uprising));
+        assert!(state.vote_shield_used.contains(&p.normal_uprising));
+        assert!(state.vote_shield_armed.is_empty());
+        assert!(state.potion_immunity_target.is_none());
+        assert!(state.potion_maker_used);
     }
 
     #[test]
@@ -8340,7 +8527,16 @@ mod tests {
     }
 
     #[test]
-    fn potion_immunity_leaves_an_armed_grand_inquisitor_unconsumed() {
+    fn grand_inquisitor_and_potion_immunity_both_apply_in_the_same_round() {
+        // Regression test for the exact carryover bug a 3-agent review
+        // flagged: under the old blanket-immunity design, Potion Maker's
+        // activation short-circuited the whole tally, leaving Grand
+        // Inquisitor's forced-2-slots override armed but unconsumed -- so
+        // it would silently carry into a *later*, unrelated Denouncement
+        // instead of applying to the round it was actually armed for. Now
+        // the tally always genuinely runs: Grand Inquisitor forces 2 slots
+        // this round, and Potion Maker independently protects its one
+        // named target from among whoever gets selected.
         let (mut state, p) = setup_phase2_game();
         apply_command(
             &mut state,
@@ -8353,6 +8549,7 @@ mod tests {
             &mut state,
             Command::ActivatePotionImmunity {
                 player: p.potion_maker,
+                target: p.king_queen,
             },
         )
         .unwrap();
@@ -8363,6 +8560,14 @@ mod tests {
             Command::Nominate {
                 voter: p.oracle,
                 nominee: p.king_queen,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: p.spymaster,
+                nominee: p.prince_princess,
             },
         )
         .unwrap();
@@ -8378,14 +8583,37 @@ mod tests {
         .unwrap();
         apply_command(
             &mut state,
+            Command::CastBallot {
+                voter: p.spymaster,
+                ballot: Ballot::For(p.prince_princess),
+            },
+        )
+        .unwrap();
+        let events = apply_command(
+            &mut state,
             Command::CloseBallot {
                 fallback_replacement: None,
             },
         )
         .unwrap();
 
-        assert!(state.grand_inquisitor_armed);
-        assert!(!state.grand_inquisitor_used);
+        // Grand Inquisitor forced 2 slots this round, but Potion Maker
+        // pulled King/Queen out of the tally entirely -- only
+        // Prince/Princess (the one remaining candidate with any votes)
+        // actually gets Cast Out; the second forced slot has nobody left
+        // to fill it.
+        assert!(matches!(
+            &events[0],
+            DomainEvent::BallotClosed { cast_out } if cast_out == &vec![p.prince_princess]
+        ));
+        assert_eq!(
+            state.player(p.king_queen).unwrap().status,
+            PlayerStatus::Active
+        );
+        assert!(!state.grand_inquisitor_armed);
+        assert!(state.grand_inquisitor_used);
+        assert!(state.potion_immunity_target.is_none());
+        assert!(state.potion_maker_used);
     }
 
     // --- Phase 3: contest rounds + the Leader's Confidants ---

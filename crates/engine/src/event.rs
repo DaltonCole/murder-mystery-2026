@@ -211,6 +211,7 @@ pub enum DomainEvent {
     },
     PotionImmunityActivated {
         player: PlayerId,
+        target: PlayerId,
     },
 
     // --- Phase 2: vote-weight pair ---

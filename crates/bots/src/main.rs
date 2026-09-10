@@ -101,6 +101,13 @@ async fn main() {
     // every other bot it opts in alongside.
     let intermission_pool: Arc<Mutex<std::collections::BTreeSet<engine::PlayerId>>> =
         Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+    // No orchestrator drives setup here -- you do, from your own /host tab
+    // -- so there's no "setup_game just returned" moment to wait for the
+    // way `run_full_automated_game` has. Bots start reacting immediately;
+    // see `PlayerBot::react`'s doc comment on why that's unsafe for the
+    // *sequential* setup flow specifically, which doesn't apply to a real
+    // browser-driven host console.
+    let setup_complete = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut handles = Vec::with_capacity(args.bots);
 
     for i in 0..args.bots {
@@ -109,9 +116,10 @@ async fn main() {
         let bot_seed = args.seed.wrapping_add(i as u64 * 7_919 + 1);
         let joined = Arc::clone(&joined);
         let pool = Arc::clone(&intermission_pool);
+        let setup_complete = Arc::clone(&setup_complete);
         let handle_name = name.clone();
         handles.push(tokio::spawn(async move {
-            match PlayerBot::join(&url, &name, bot_seed, pool).await {
+            match PlayerBot::join(&url, &name, bot_seed, pool, setup_complete).await {
                 Ok(bot) => {
                     joined.lock().unwrap().insert(handle_name, true);
                     if let Err(e) = bot.run().await {

@@ -588,10 +588,14 @@ fn AbilityPanel(
                     }
                 },
                 Character::PotionMaker => rsx! {
+                    {target_picker}
                     button {
-                        disabled: !abilities.potion_maker_available.unwrap_or(false),
-                        onclick: move |_| on_command.call(Command::ActivatePotionImmunity { player: my_id }),
-                        "Activate execution immunity",
+                        disabled: !abilities.potion_maker_available.unwrap_or(false) || target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command.call(Command::ActivatePotionImmunity { player: my_id, target: PlayerId(t) });
+                        },
+                        "Protect from execution",
                     }
                 },
                 Character::Magistrate | Character::Firebrand => rsx! {

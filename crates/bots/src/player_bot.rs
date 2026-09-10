@@ -31,6 +31,7 @@ use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
 use rand::{RngExt, SeedableRng};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// How many blind guesses `DesignateSuccessor`/`TransferKingQueen` will
@@ -49,6 +50,10 @@ pub struct PlayerBot {
     /// Intermission draw -- see `HostDriver::draw_intermission_entrants`'s
     /// doc comment for why this can't just be read back off the wire.
     intermission_pool: Arc<Mutex<BTreeSet<PlayerId>>>,
+    /// Set by the orchestrator once `HostDriver::setup_game` has fully
+    /// returned -- see the doc comment on `react`'s guard for why this is
+    /// necessary at all, not just a nice-to-have.
+    setup_complete: Arc<AtomicBool>,
     opted_into_intermission: bool,
     submitted_gallery_prediction: bool,
     /// Reset to `false` whenever no Denouncement is open -- `MedicProtect`
@@ -68,6 +73,7 @@ impl PlayerBot {
         name: &str,
         seed: u64,
         intermission_pool: Arc<Mutex<BTreeSet<PlayerId>>>,
+        setup_complete: Arc<AtomicBool>,
     ) -> Result<Self, ConnError> {
         let mut conn = Conn::connect(url).await?;
         let id = conn.join(name).await?;
@@ -77,6 +83,7 @@ impl PlayerBot {
             conn,
             rng: StdRng::seed_from_u64(seed),
             intermission_pool,
+            setup_complete,
             opted_into_intermission: false,
             submitted_gallery_prediction: false,
             medic_declared_this_denouncement: false,
@@ -121,8 +128,22 @@ impl PlayerBot {
                 }
             }
         }
-        self.react_to_abilities(view).await?;
-        self.react_to_standing_choices(view).await?;
+        // `react_to_denouncement`/the task loop above are naturally safe
+        // during setup (no Denouncement or task exists yet to react to),
+        // but `react_to_abilities`/`react_to_standing_choices` are not:
+        // `AbilityStatus` fields like `grand_inquisitor_available` go
+        // `Some(true)` the instant a character is assigned, with no
+        // phase-gating of their own, and `OptIntoIntermission` only needs
+        // `Active` status, which every joined player already has. Without
+        // this gate, a bot could fire a command mid-setup and race
+        // `HostDriver::setup_game`'s own `do_cmd_sequential` calls, which
+        // assume nothing else can be concurrently mutating state --
+        // confirmed to actually happen under real load, producing
+        // "player already has character X" rejections.
+        if self.setup_complete.load(Ordering::Relaxed) {
+            self.react_to_abilities(view).await?;
+            self.react_to_standing_choices(view).await?;
+        }
         Ok(())
     }
 
@@ -302,8 +323,13 @@ impl PlayerBot {
             }
         }
         if a.potion_maker_available == Some(true) {
-            self.send(Command::ActivatePotionImmunity { player: self.id })
+            if let Some(target) = active_others(&view.roster, self.id).choose(&mut self.rng) {
+                self.send(Command::ActivatePotionImmunity {
+                    player: self.id,
+                    target: target.id,
+                })
                 .await?;
+            }
         }
         if a.double_vote_available == Some(true) {
             self.send(Command::ActivateDoubleVote { player: self.id })
