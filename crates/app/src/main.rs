@@ -49,12 +49,10 @@ mod game_server;
 
 use dioxus::fullstack::{use_websocket, WebSocketOptions, Websocket};
 use dioxus::prelude::*;
-#[cfg(feature = "server")]
-use engine::DomainEvent;
 use engine::{
     pascal_case, AbilityStatus, Ballot, Bio, Character, Command, ContestCategory, DenouncementView,
-    Faction, GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind, PlayerId,
-    PlayerStatus, PlayerView, RosterEntry, Round, TaskTier, TaskView, Viewer,
+    DomainEvent, Faction, GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind,
+    PlayerId, PlayerStatus, PlayerView, RosterEntry, Round, TaskTier, TaskView, Viewer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -274,6 +272,23 @@ fn Play() -> Element {
         }
         if !v.my_confidants.is_empty() {
             p { "These people now know you're the Revolutionary Leader: {names(&v.my_confidants, &v.roster)}." }
+        }
+        if let Some(message) = &v.martyrdom_message {
+            p { style: "font-style: italic; color: #7a1f1f;", "{message}" }
+        }
+        if !v.finale_cast_out_reveal.is_empty() {
+            div {
+                h4 { "The Last Denouncement -- revealed" }
+                for p in v.finale_cast_out_reveal.iter().cloned() {
+                    p {
+                        key: "{p.id.0}",
+                        strong { "{p.name}" }
+                        ": {p.true_faction:?}"
+                        if let Some(c) = p.character { ", {c:?}" }
+                        if p.converted { " (secretly converted to the Cult)" }
+                    }
+                }
+            }
         }
         div {
             h4 { "Intermission" }
@@ -1029,6 +1044,7 @@ fn Host() -> Element {
     let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
     let winner = view().and_then(|v| v.winner);
     let task_candidates = view().map(|v| v.task_candidates).unwrap_or_default();
+    let finale_reveal = view().and_then(|v| v.finale_reveal);
 
     rsx! {
         h1 { "Host Console" }
@@ -1412,7 +1428,108 @@ fn Host() -> Element {
                 }
             }
         }
+        if let Some(r) = finale_reveal {
+            div {
+                h3 { "Finale reveal (for Dalton to narrate)" }
+                p { "rules.md §4: \"Dalton walks through all three win conditions and reveals everything that happened privately all game.\"" }
+                p {
+                    strong {
+                        if r.winner.cult_wins { "The Cult wins." }
+                        else if r.winner.ton_wins { "The Ton wins." }
+                        else if r.winner.uprising_wins { "The Uprising wins." }
+                        else { "Nobody's win condition was met." }
+                    }
+                    if !r.winner.cult_paths.is_empty() {
+                        " (Cult paths satisfied: {r.winner.cult_paths:?})"
+                    }
+                }
+                h4 { "Everyone's true identity" }
+                ul {
+                    for p in r.everyone.clone() {
+                        li {
+                            key: "{p.id.0}",
+                            "{p.name}: {p.true_faction:?}"
+                            if let Some(c) = p.character { ", {c:?}" }
+                            if p.converted { " (converted)" }
+                        }
+                    }
+                }
+                h4 { "What happened privately" }
+                ul {
+                    for (i , event) in r.key_events.iter().enumerate() {
+                        li { key: "{i}", "{describe_key_event(event, &r.everyone)}" }
+                    }
+                }
+            }
+        }
         RosterList { roster }
+    }
+}
+
+/// Plain-English narration for `Host`'s Finale reveal panel -- the same
+/// spirit as `describe_check` elsewhere in this file, translating a raw
+/// `DomainEvent` into something Dalton can actually read aloud.
+fn describe_key_event(event: &DomainEvent, everyone: &[engine::PlayerReveal]) -> String {
+    let name = |id: PlayerId| {
+        everyone
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| format!("player {}", id.0))
+    };
+    match event {
+        DomainEvent::Converted { converter, target } => {
+            format!(
+                "{} converted {} to the Cult.",
+                name(*converter),
+                name(*target)
+            )
+        }
+        DomainEvent::KingQueenConversionCascade {
+            old_king_queen,
+            new_king_queen,
+            ..
+        } => {
+            format!(
+                "King/Queen {} was converted; the crown passed to {}.",
+                name(*old_king_queen),
+                new_king_queen
+                    .map(name)
+                    .unwrap_or_else(|| "no one -- none remained".into())
+            )
+        }
+        DomainEvent::KingQueenCastOutCascade {
+            old_king_queen,
+            new_king_queen,
+            ..
+        } => {
+            format!(
+                "King/Queen {} was Cast Out; the crown passed to {}.",
+                name(*old_king_queen),
+                new_king_queen
+                    .map(name)
+                    .unwrap_or_else(|| "no one -- none remained".into())
+            )
+        }
+        DomainEvent::RevolutionaryLeaderSucceeded {
+            old_leader,
+            new_leader,
+        } => {
+            format!(
+                "Revolutionary Leader {} fell; the title passed to {}.",
+                name(*old_leader),
+                new_leader
+                    .map(name)
+                    .unwrap_or_else(|| "no one -- the line was exhausted".into())
+            )
+        }
+        DomainEvent::MartyrdomTriggered { cult_leader } => {
+            format!(
+                "Cult Leader {} was Cast Out, triggering martyrdom.",
+                name(*cult_leader)
+            )
+        }
+        other => format!("{other:?}"),
     }
 }
 
@@ -1456,6 +1573,20 @@ fn Display() -> Element {
         }
         for task in v.open_tasks.iter().cloned() {
             p { key: "{task.id.0}", "{task.prompt} ({task.tier:?})" }
+        }
+        if !v.finale_cast_out_reveal.is_empty() {
+            div {
+                h2 { "The Last Denouncement -- revealed" }
+                for p in v.finale_cast_out_reveal.iter().cloned() {
+                    p {
+                        key: "{p.id.0}",
+                        strong { "{p.name}" }
+                        ": {p.true_faction:?}"
+                        if let Some(c) = p.character { ", {c:?}" }
+                        if p.converted { " (secretly converted to the Cult)" }
+                    }
+                }
+            }
         }
         if !v.whistledown.is_empty() {
             div {

@@ -34,7 +34,7 @@ pub enum CultPath {
 /// `ton_wins`/`uprising_wins`/`cult_wins` is ever `true` at once -- see the
 /// module-level doc comment for why an overlap is structurally possible and
 /// how it's resolved (Dalton's ruling: the Cult always has priority).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameOutcome {
     pub ton_wins: bool,
     pub uprising_wins: bool,

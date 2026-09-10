@@ -3,6 +3,7 @@ use crate::bio::{Bio, TaskCandidate};
 use crate::character::{Character, PlayerStatus};
 use crate::contest::ContestCategory;
 use crate::denouncement::DenouncementPhase;
+use crate::finale_reveal::{self, FinaleReveal, PlayerReveal};
 use crate::player::{Faction, PlayerId};
 use crate::round::Round;
 use crate::state::GameState;
@@ -182,6 +183,23 @@ pub struct PlayerView {
     /// `contest_results` -- a client-visible pool would spoil the
     /// mingling the task itself is supposed to require.
     pub task_candidates: Vec<(TaskTier, Vec<TaskCandidate>)>,
+    /// The full post-Finale walkthrough (rules.md §4) -- `Viewer::Host`
+    /// ONLY, and `None` until the Last Denouncement has actually closed.
+    /// See `finale_reveal::reveal`'s doc comment: this is the one
+    /// deliberate exception to "no ambient god-view," not a relaxation of
+    /// it generally.
+    pub finale_reveal: Option<FinaleReveal>,
+    /// The full identities of whoever was actually Cast Out at the Last
+    /// Denouncement -- unlike `finale_reveal` above, this is public to
+    /// every viewer kind (rules.md §4: "revealed publicly on a shared
+    /// screen"), and only ever this specific subset, not everyone's.
+    /// Empty until the Finale's own Denouncement closes.
+    pub finale_cast_out_reveal: Vec<PlayerReveal>,
+    /// rules.md §6's martyrdom message -- the viewer's own only, `None`
+    /// unless they're the currently-converted title-holder who triggered
+    /// it. See `finale_reveal::martyrdom_message_for`'s doc comment: unlike
+    /// `finale_reveal` above, this isn't gated to the Finale at all.
+    pub martyrdom_message: Option<String>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -292,6 +310,22 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     } else {
         Vec::new()
     };
+    let finale_reveal_data = finale_reveal::reveal(state);
+    let finale_reveal_for_host = if matches!(viewer, Viewer::Host) {
+        finale_reveal_data.clone()
+    } else {
+        None
+    };
+    let finale_cast_out_reveal = finale_reveal_data
+        .map(|r| {
+            r.everyone
+                .into_iter()
+                .filter(|p| r.cast_out_this_denouncement.contains(&p.id))
+                .collect()
+        })
+        .unwrap_or_default();
+    let martyrdom_message =
+        viewer_id.and_then(|id| finale_reveal::martyrdom_message_for(state, id));
 
     PlayerView {
         roster,
@@ -316,6 +350,9 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         whistledown: crate::whistledown::posts(state),
         own_bio,
         task_candidates,
+        finale_reveal: finale_reveal_for_host,
+        finale_cast_out_reveal,
+        martyrdom_message,
     }
 }
 
@@ -1626,5 +1663,147 @@ mod tests {
             .task_candidates
             .is_empty());
         assert!(view_for(&state, Viewer::Display).task_candidates.is_empty());
+    }
+
+    #[test]
+    fn finale_reveal_fields_are_scoped_correctly_across_viewer_kinds() {
+        let mut state = GameState::new();
+        let cult_leader = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "CultLeader".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: cult_leader,
+                faction: Faction::Cult,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: cult_leader,
+                character: Character::CultLeader,
+            },
+        )
+        .unwrap();
+        let king_queen = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "King".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: king_queen,
+                faction: Faction::Ton,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: king_queen,
+                character: Character::KingQueen,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, slot
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: king_queen,
+            },
+        )
+        .unwrap();
+        for _ in 0..4 {
+            apply_command(&mut state, Command::AdvanceRound).unwrap();
+        }
+
+        // Martyrdom hasn't triggered yet -- no message for anyone.
+        assert_eq!(
+            view_for(&state, Viewer::Player(king_queen)).martyrdom_message,
+            None
+        );
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: king_queen,
+                nominee: cult_leader,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+
+        // Still open -- finale_reveal/finale_cast_out_reveal stay empty
+        // for everyone, Host included.
+        assert!(view_for(&state, Viewer::Host).finale_reveal.is_none());
+        assert!(view_for(&state, Viewer::Host)
+            .finale_cast_out_reveal
+            .is_empty());
+
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: king_queen,
+                ballot: crate::denouncement::Ballot::For(cult_leader),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+
+        // finale_reveal: Host only.
+        assert!(view_for(&state, Viewer::Host).finale_reveal.is_some());
+        assert!(view_for(&state, Viewer::Player(king_queen))
+            .finale_reveal
+            .is_none());
+        assert!(view_for(&state, Viewer::Display).finale_reveal.is_none());
+
+        // finale_cast_out_reveal: public to every viewer kind, and it's
+        // specifically the Cult Leader (converted status doesn't apply to
+        // them, but their true faction/character are now visible).
+        for viewer in [Viewer::Host, Viewer::Player(king_queen), Viewer::Display] {
+            let reveal = view_for(&state, viewer).finale_cast_out_reveal;
+            assert_eq!(reveal.len(), 1);
+            assert_eq!(reveal[0].id, cult_leader);
+            assert_eq!(reveal[0].true_faction, Faction::Cult);
+            assert_eq!(reveal[0].character, Some(Character::CultLeader));
+        }
+
+        // martyrdom_message: the converted, still-titled King/Queen only.
+        assert!(view_for(&state, Viewer::Player(king_queen))
+            .martyrdom_message
+            .is_some());
+        assert_eq!(view_for(&state, Viewer::Host).martyrdom_message, None);
+        assert_eq!(view_for(&state, Viewer::Display).martyrdom_message, None);
     }
 }

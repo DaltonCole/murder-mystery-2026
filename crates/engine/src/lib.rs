@@ -17,6 +17,7 @@ mod contest;
 mod denouncement;
 mod error;
 mod event;
+mod finale_reveal;
 mod player;
 mod recruitment;
 mod round;
@@ -35,6 +36,9 @@ pub use contest::ContestCategory;
 pub use denouncement::{Ballot, DenouncementPhase};
 pub use error::GameError;
 pub use event::DomainEvent;
+pub use finale_reveal::{
+    martyrdom_message_for, reveal as finale_reveal, FinaleReveal, PlayerReveal,
+};
 pub use player::{Faction, Player, PlayerId};
 pub use recruitment::recruitment_window_size;
 pub use round::Round;
