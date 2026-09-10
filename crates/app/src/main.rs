@@ -71,9 +71,15 @@ fn main() {
     dioxus::launch(App);
 }
 
+// System-font-stack theming only -- see `assets/main.css`'s own doc
+// comment for why this app never reaches for a Google Fonts (or any
+// other external) stylesheet.
+const MAIN_CSS: Asset = asset!("/assets/main.css");
+
 #[component]
 fn App() -> Element {
     rsx! {
+        document::Link { rel: "stylesheet", href: MAIN_CSS }
         Router::<Route> {}
     }
 }
@@ -274,7 +280,7 @@ fn Play() -> Element {
             p { "These people now know you're the Revolutionary Leader: {names(&v.my_confidants, &v.roster)}." }
         }
         if let Some(message) = &v.martyrdom_message {
-            p { style: "font-style: italic; color: #7a1f1f;", "{message}" }
+            p { class: "martyrdom-message", "{message}" }
         }
         if !v.finale_cast_out_reveal.is_empty() {
             div {
@@ -372,7 +378,7 @@ fn Play() -> Element {
                 for post in v.whistledown.iter().rev().cloned() {
                     p {
                         key: "{post.round:?}",
-                        style: "font-style: italic;",
+                        class: "whistledown-post",
                         "{post.text}"
                     }
                 }
@@ -1554,48 +1560,52 @@ fn Display() -> Element {
     });
 
     let Some(v) = view() else {
-        return rsx! { h1 { "Murder Mystery 2026" } };
+        return rsx! {
+            div { class: "route-display", h1 { "Murder Mystery 2026" } }
+        };
     };
 
     rsx! {
-        h1 { "Murder Mystery 2026" }
-        h2 { "Round: {v.current_round:?}" }
-        RosterList { roster: v.roster.clone() }
-        match &v.denouncement {
-            Some(DenouncementView::Nomination { .. }) => rsx! { p { "Nomination is open." } },
-            Some(DenouncementView::Discussion { surfaced }) => rsx! {
-                p { "Up for the Denouncement: {names(surfaced, &v.roster)}" }
-            },
-            Some(DenouncementView::Ballot { candidates, .. } | DenouncementView::Runoff { candidates, .. }) => rsx! {
-                p { "Ballot open for: {names(candidates, &v.roster)}" }
-            },
-            None => rsx! { p { "No Denouncement in progress." } },
-        }
-        for task in v.open_tasks.iter().cloned() {
-            p { key: "{task.id.0}", "{task.prompt} ({task.tier:?})" }
-        }
-        if !v.finale_cast_out_reveal.is_empty() {
-            div {
-                h2 { "The Last Denouncement -- revealed" }
-                for p in v.finale_cast_out_reveal.iter().cloned() {
-                    p {
-                        key: "{p.id.0}",
-                        strong { "{p.name}" }
-                        ": {p.true_faction:?}"
-                        if let Some(c) = p.character { ", {c:?}" }
-                        if p.converted { " (secretly converted to the Cult)" }
+        div { class: "route-display",
+            h1 { "Murder Mystery 2026" }
+            h2 { "Round: {v.current_round:?}" }
+            RosterList { roster: v.roster.clone() }
+            match &v.denouncement {
+                Some(DenouncementView::Nomination { .. }) => rsx! { p { "Nomination is open." } },
+                Some(DenouncementView::Discussion { surfaced }) => rsx! {
+                    p { "Up for the Denouncement: {names(surfaced, &v.roster)}" }
+                },
+                Some(DenouncementView::Ballot { candidates, .. } | DenouncementView::Runoff { candidates, .. }) => rsx! {
+                    p { "Ballot open for: {names(candidates, &v.roster)}" }
+                },
+                None => rsx! { p { "No Denouncement in progress." } },
+            }
+            for task in v.open_tasks.iter().cloned() {
+                p { key: "{task.id.0}", "{task.prompt} ({task.tier:?})" }
+            }
+            if !v.finale_cast_out_reveal.is_empty() {
+                div {
+                    h2 { "The Last Denouncement -- revealed" }
+                    for p in v.finale_cast_out_reveal.iter().cloned() {
+                        p {
+                            key: "{p.id.0}",
+                            strong { "{p.name}" }
+                            ": {p.true_faction:?}"
+                            if let Some(c) = p.character { ", {c:?}" }
+                            if p.converted { " (secretly converted to the Cult)" }
+                        }
                     }
                 }
             }
-        }
-        if !v.whistledown.is_empty() {
-            div {
-                h2 { "Lady Whistledown's Society Papers" }
-                for post in v.whistledown.iter().rev().cloned() {
-                    p {
-                        key: "{post.round:?}",
-                        style: "font-style: italic;",
-                        "{post.text}"
+            if !v.whistledown.is_empty() {
+                div {
+                    h2 { "Lady Whistledown's Society Papers" }
+                    for post in v.whistledown.iter().rev().cloned() {
+                        p {
+                            key: "{post.round:?}",
+                            class: "whistledown-post",
+                            "{post.text}"
+                        }
                     }
                 }
             }

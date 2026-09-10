@@ -1,0 +1,228 @@
+/* Murder Mystery 2026 -- Bridgerton-Season-4/masquerade theme (rules.md's
+ * own framing: "Regency aesthetic, fluffy dresses and tuxes, actual
+ * masquerade masks").
+ *
+ * Fonts are deliberately system-stack only, no web-font download -- this
+ * app is self-hosted specifically so it works with no internet dependency
+ * on the night (see the implementation plan's "self-hosted web app/PWA"
+ * decision); a Google Fonts <link> would silently break the moment the
+ * venue's own wifi has no real internet path out, which is exactly the
+ * scenario this architecture exists to survive.
+ *
+ * No new classes were added to most of main.rs's markup -- `:has()` lets
+ * this style sheet "card-ify" every existing `div > h3/h4` section
+ * without touching the component structure at all. A handful of specific
+ * elements (Whistledown posts, the martyrdom message) do use a real class,
+ * since those need a distinct look `:has()` can't cleanly express.
+ */
+
+:root {
+  --color-bg: #f3e9d2;
+  --color-bg-card: #fffaf0;
+  --color-text: #2b1d14;
+  --color-primary: #6b1f2a;
+  --color-primary-dark: #4a1620;
+  --color-accent: #b8860b;
+  --color-accent-light: #ddb548;
+  --color-secondary: #1f4b3f;
+  --color-border: #c9a876;
+  --color-danger: #7a1f1f;
+  --font-heading: "Playfair Display", Georgia, "Palatino Linotype", Palatino, serif;
+  --font-body: Georgia, "Palatino Linotype", "Book Antiqua", Palatino, serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 0.75rem;
+  max-width: 720px;
+  margin-inline: auto;
+  background-color: var(--color-bg);
+  background-image: radial-gradient(circle at top, #fffaf0 0%, var(--color-bg) 70%);
+  background-attachment: fixed;
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-heading);
+  color: var(--color-primary-dark);
+  letter-spacing: 0.02em;
+  margin-top: 0;
+}
+
+h1 {
+  text-align: center;
+  font-size: 1.8rem;
+  border-bottom: 2px solid var(--color-accent);
+  padding-bottom: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+h1::before,
+h1::after {
+  content: "\2727";
+  color: var(--color-accent);
+  font-size: 1rem;
+  margin: 0 0.5rem;
+}
+
+h2 {
+  font-size: 1.3rem;
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: 0.3rem;
+}
+
+h3 {
+  font-size: 1.15rem;
+}
+
+h4 {
+  font-size: 1.05rem;
+  color: var(--color-primary);
+}
+
+p {
+  margin: 0.5rem 0;
+}
+
+/* Every existing "section" div (one whose first job is grouping a header
+ * with its controls) gets a soft card treatment, without needing a class
+ * added at every call site in main.rs. */
+div:has(> h3),
+div:has(> h4) {
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 0.9rem 1.1rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 2px 6px rgba(43, 29, 20, 0.12);
+}
+
+button {
+  font-family: var(--font-heading);
+  font-size: 1rem;
+  background: linear-gradient(180deg, var(--color-accent-light), var(--color-accent));
+  color: var(--color-text);
+  border: 1px solid var(--color-primary-dark);
+  border-radius: 6px;
+  padding: 0.5rem 1rem;
+  margin: 0.2rem 0.35rem 0.2rem 0;
+  cursor: pointer;
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+
+button:hover:not(:disabled) {
+  box-shadow: 0 2px 10px rgba(184, 134, 11, 0.5);
+  transform: translateY(-1px);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+input,
+select {
+  font-family: var(--font-body);
+  font-size: 1rem;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--color-text);
+  margin: 0.2rem 0.35rem 0.2rem 0;
+  max-width: 100%;
+}
+
+input:focus,
+select:focus {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+input[type="radio"],
+input[type="checkbox"] {
+  width: auto;
+  margin-right: 0.35rem;
+  accent-color: var(--color-primary);
+}
+
+label {
+  display: inline-flex;
+  align-items: center;
+  margin: 0.2rem 0.75rem 0.2rem 0;
+}
+
+ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.5rem 0;
+}
+
+li {
+  padding: 0.35rem 0.2rem;
+  border-bottom: 1px dashed var(--color-border);
+}
+
+li:last-child {
+  border-bottom: none;
+}
+
+strong {
+  color: var(--color-primary-dark);
+}
+
+/* Lady Whistledown's Society Papers -- styled like a printed gossip
+ * column: an ornate initial-letter-adjacent left rule and italic serif,
+ * distinct from the plain functional copy everywhere else. */
+.whistledown-post {
+  font-family: var(--font-heading);
+  font-style: italic;
+  background: #fdf6e3;
+  border-left: 3px solid var(--color-accent);
+  border-radius: 0 6px 6px 0;
+  padding: 0.6rem 1rem;
+  margin: 0.5rem 0;
+  color: var(--color-primary-dark);
+}
+
+/* rules.md §6's private martyrdom message -- a deliberately somber,
+ * different color from Whistledown's lighter gossip-column tone. */
+.martyrdom-message {
+  font-family: var(--font-heading);
+  font-style: italic;
+  background: #f5e6e6;
+  border-left: 3px solid var(--color-danger);
+  border-radius: 0 6px 6px 0;
+  padding: 0.6rem 1rem;
+  margin: 0.5rem 0;
+  color: var(--color-danger);
+}
+
+/* /display is read on a shared screen/projector from across a room --
+ * everything scales up a notch. */
+.route-display {
+  font-size: 1.2rem;
+}
+
+.route-display h1 {
+  font-size: 2.4rem;
+}
