@@ -75,11 +75,25 @@ fn main() {
 // comment for why this app never reaches for a Google Fonts (or any
 // other external) stylesheet.
 const MAIN_CSS: Asset = asset!("/assets/main.css");
+// `assets/manifest.json` embeds its own icon as an inline base64 data URI
+// rather than referencing a separate `asset!()`-served file -- `dx` gives
+// every `asset!()` file a content-hashed filename but doesn't rewrite
+// references *inside* another static file to match (the same reason
+// game-changer's own `main.rs` inlines its `@font-face` rule instead of
+// putting it in its CSS file), so a plain `"icons": [{"src": "/icon.svg"}]`
+// would silently 404 the moment the hash changes on a rebuild. The data
+// URI sidesteps that entirely: the icon lives inside the one file that
+// references it, with nothing else to go stale.
+const MANIFEST: Asset = asset!("/assets/manifest.json");
+const ICON: Asset = asset!("/assets/icon.svg");
 
 #[component]
 fn App() -> Element {
     rsx! {
         document::Link { rel: "stylesheet", href: MAIN_CSS }
+        document::Link { rel: "manifest", href: MANIFEST }
+        document::Link { rel: "icon", href: ICON, r#type: "image/svg+xml" }
+        document::Meta { name: "theme-color", content: "#4a1620" }
         Router::<Route> {}
     }
 }

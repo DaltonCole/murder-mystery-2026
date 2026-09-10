@@ -1,0 +1,24 @@
+{
+  "name": "Murder Mystery 2026",
+  "short_name": "Murder Mystery",
+  "description": "A live, app-assisted masquerade social-deduction party game.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f3e9d2",
+  "theme_color": "#4a1620",
+  "icons": [
+    {
+      "src": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj4KICA8cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgcng9Ijk2IiBmaWxsPSIjNGExNjIwIi8+CiAgPHBhdGggZD0iTTk2IDIxNiBDOTYgMTUwIDE2OCAxMTAgMjU2IDExMCBDMzQ0IDExMCA0MTYgMTUwIDQxNiAyMTYgQzQxNiAyNjAgMzg4IDI2OCAzNjAgMjU4IEMzNDQgMzAwIDMwMCAzMjAgMjU2IDMwMCBDMjEyIDMyMCAxNjggMzAwIDE1MiAyNTggQzEyNCAyNjggOTYgMjYwIDk2IDIxNiBaIgogICAgICAgIGZpbGw9IiNmM2U5ZDIiIHN0cm9rZT0iI2I4ODYwYiIgc3Ryb2tlLXdpZHRoPSIxMCIvPgogIDxjaXJjbGUgY3g9IjE4OCIgY3k9IjIwNSIgcj0iMjYiIGZpbGw9IiM0YTE2MjAiLz4KICA8Y2lyY2xlIGN4PSIzMjQiIGN5PSIyMDUiIHI9IjI2IiBmaWxsPSIjNGExNjIwIi8+CiAgPHBhdGggZD0iTTI0NCAyNTAgUTI1NiAyNjIgMjY4IDI1MCIgc3Ryb2tlPSIjNGExNjIwIiBzdHJva2Utd2lkdGg9IjgiIGZpbGw9Im5vbmUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxwYXRoIGQ9Ik05NiAyMTYgTDQ4IDE5NiBNNDE2IDIxNiBMNDY0IDE5NiIgc3Ryb2tlPSIjYjg4NjBiIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KPC9zdmc+Cg==",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj4KICA8cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgcng9Ijk2IiBmaWxsPSIjNGExNjIwIi8+CiAgPHBhdGggZD0iTTk2IDIxNiBDOTYgMTUwIDE2OCAxMTAgMjU2IDExMCBDMzQ0IDExMCA0MTYgMTUwIDQxNiAyMTYgQzQxNiAyNjAgMzg4IDI2OCAzNjAgMjU4IEMzNDQgMzAwIDMwMCAzMjAgMjU2IDMwMCBDMjEyIDMyMCAxNjggMzAwIDE1MiAyNTggQzEyNCAyNjggOTYgMjYwIDk2IDIxNiBaIgogICAgICAgIGZpbGw9IiNmM2U5ZDIiIHN0cm9rZT0iI2I4ODYwYiIgc3Ryb2tlLXdpZHRoPSIxMCIvPgogIDxjaXJjbGUgY3g9IjE4OCIgY3k9IjIwNSIgcj0iMjYiIGZpbGw9IiM0YTE2MjAiLz4KICA8Y2lyY2xlIGN4PSIzMjQiIGN5PSIyMDUiIHI9IjI2IiBmaWxsPSIjNGExNjIwIi8+CiAgPHBhdGggZD0iTTI0NCAyNTAgUTI1NiAyNjIgMjY4IDI1MCIgc3Ryb2tlPSIjNGExNjIwIiBzdHJva2Utd2lkdGg9IjgiIGZpbGw9Im5vbmUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxwYXRoIGQ9Ik05NiAyMTYgTDQ4IDE5NiBNNDE2IDIxNiBMNDY0IDE5NiIgc3Ryb2tlPSIjYjg4NjBiIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KPC9zdmc+Cg==",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
