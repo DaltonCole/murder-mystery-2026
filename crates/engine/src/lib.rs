@@ -19,6 +19,7 @@ mod error;
 mod event;
 mod finale_reveal;
 mod player;
+mod raffle;
 mod recruitment;
 mod round;
 mod servant;
@@ -40,6 +41,10 @@ pub use finale_reveal::{
     martyrdom_message_for, reveal as finale_reveal, FinaleReveal, PlayerReveal,
 };
 pub use player::{Faction, Player, PlayerId};
+pub use raffle::{
+    raffle_priority, raffle_winners, ticket_count, ticket_slots, MAX_INTEREST_LEVEL,
+    MIN_INTEREST_LEVEL, RAFFLED_ROLES,
+};
 pub use recruitment::recruitment_window_size;
 pub use round::Round;
 pub use servant::GalleryPrediction;

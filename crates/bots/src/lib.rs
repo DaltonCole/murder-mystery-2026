@@ -48,12 +48,17 @@ pub struct GameSummary {
 }
 
 /// Runs one entire game end to end against `url` (a real, already-running
-/// server) with `player_count` bots: joins them all, sets up factions and
-/// titles, runs Round 1's tasks, then Denouncements at Round 3, Round 5,
-/// and the Finale, advancing rounds in between -- the full Rounds 1+3+5+
-/// finale playable slice per the implementation plan's Phase 1 scope
-/// (rounds 2/4 are host-run-manually contest placeholders, nothing for
-/// this harness to drive).
+/// server) with `player_count` bots total: joins them, runs the setup
+/// raffle, Round 1's tasks, then Denouncements at Round 3, Round 5, and
+/// the Finale, advancing rounds in between -- the full Rounds 1+3+5+finale
+/// playable slice per the implementation plan's Phase 1 scope (rounds 2/4
+/// are host-run-manually contest placeholders, nothing for this harness to
+/// drive).
+///
+/// Rules.md §1: "late arrivals become Servants" -- a `(player_count / 10)`
+/// slice of `player_count` (at least 1) joins only *after* the raffle
+/// closes, exercising that path for real rather than leaving it
+/// theoretical; everyone else is an on-time raffle candidate.
 ///
 /// `phase_wait` is how long each Denouncement/task phase stays open before
 /// the host closes it -- long enough for every bot's reactive loop to see
@@ -68,6 +73,9 @@ pub async fn run_full_automated_game(
     seed: u64,
     phase_wait: Duration,
 ) -> Result<GameSummary, ConnError> {
+    let late_count = (player_count / 10).max(1);
+    let on_time_count = player_count - late_count;
+
     // Shared with every bot and read by `HostDriver::draw_intermission_entrants`
     // -- see that method's doc comment for why the Intermission opt-in pool
     // can't just be read back off the wire the way everything else is.
@@ -76,33 +84,64 @@ pub async fn run_full_automated_game(
     // `PlayerBot::react`'s doc comment on why bots must stay silent before
     // then: `setup_game` itself relies on `do_cmd_sequential`'s "nothing
     // else is concurrently mutating state" assumption, which an early
-    // ability activation or Intermission opt-in would violate.
+    // ability activation or Intermission opt-in would violate. A bot's own
+    // `SubmitInterestLevel` is the one exception -- see `PlayerBot::react`.
     let setup_complete = Arc::new(AtomicBool::new(false));
 
+    let spawn_bot =
+        |i: usize,
+         setup_complete: Arc<AtomicBool>,
+         handles: &mut Vec<tokio::task::JoinHandle<Result<(), ConnError>>>| {
+            let url = url.to_string();
+            let name = format!("Bot{i}");
+            let bot_seed = seed.wrapping_add(i as u64 * 7_919 + 1);
+            let pool = Arc::clone(&intermission_pool);
+            handles.push(tokio::spawn(async move {
+                let bot = PlayerBot::join(&url, &name, bot_seed, pool, setup_complete).await?;
+                bot.run().await
+            }));
+        };
+
     let mut handles = Vec::with_capacity(player_count);
-    for i in 0..player_count {
-        let url = url.to_string();
-        let name = format!("Bot{i}");
-        let bot_seed = seed.wrapping_add(i as u64 * 7_919 + 1);
-        let pool = Arc::clone(&intermission_pool);
-        let setup_complete = Arc::clone(&setup_complete);
-        handles.push(tokio::spawn(async move {
-            let bot = PlayerBot::join(&url, &name, bot_seed, pool, setup_complete).await?;
-            bot.run().await
-        }));
+    for i in 0..on_time_count {
+        spawn_bot(i, Arc::clone(&setup_complete), &mut handles);
     }
 
     let mut host = HostDriver::connect(url).await?;
     let roster = host
+        .wait_for_roster(on_time_count, Duration::from_secs(15))
+        .await?;
+    host.setup_game(&roster, seed).await?;
+
+    // Late arrivals join now, right after `setup_game`'s `CloseRaffle` --
+    // but *before* `setup_complete` flips, deliberately: every on-time bot
+    // starts firing `SubmitBio`/ability reactions the instant it flips
+    // (see `PlayerBot::react`), and with `on_time_count` bots all doing
+    // that at once, the resulting broadcast storm made the next
+    // `wait_for_roster` below miss the roster actually growing --
+    // confirmed by reproducing it at 30 players. Joining while things are
+    // still quiet (matching the proven pre-setup regime the first
+    // `wait_for_roster` above already relies on) avoids that. A late bot
+    // itself stays silent on everything but its own (harmless, ignored)
+    // interest-level submission until `setup_complete` flips too, so
+    // spawning it early doesn't let it race `setup_game`'s own commands.
+    for i in on_time_count..player_count {
+        spawn_bot(i, Arc::clone(&setup_complete), &mut handles);
+    }
+    let full_roster = host
         .wait_for_roster(player_count, Duration::from_secs(15))
         .await?;
-    let roles = host.setup_game(&roster, seed).await?;
+    let late_arrivals: Vec<PlayerId> = full_roster
+        .iter()
+        .copied()
+        .filter(|id| !roster.contains(id))
+        .collect();
     setup_complete.store(true, Ordering::Relaxed);
-    host.run_round_one_tasks(&roster, seed, phase_wait).await?;
-    // The literal late-arrival Servants earn their first point right away
-    // -- see `Roles::servants`'s doc comment on why the Host has to track
-    // this itself rather than reading it back from `PlayerView`.
-    host.award_servant_points(roles.servants.iter().copied())
+
+    host.run_round_one_tasks(&full_roster, seed, phase_wait)
+        .await?;
+    // The literal late-arrival Servants earn their first point right away.
+    host.award_servant_points(late_arrivals.iter().copied())
         .await?;
 
     host.advance_round_to(Round::Two).await?;

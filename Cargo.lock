@@ -39,6 +39,7 @@ dependencies = [
  "bots",
  "dioxus",
  "engine",
+ "rand 0.10.2",
  "serde",
  "tokio",
 ]

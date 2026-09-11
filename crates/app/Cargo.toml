@@ -12,11 +12,16 @@ dioxus = { version = "=0.7.9", features = ["router", "fullstack"] }
 serde = { version = "1", features = ["derive"] }
 engine = { path = "../engine" }
 tokio = { version = "1.53.1", features = ["sync", "macros"], optional = true }
+# Only pulled in server-side (see the `server` feature below) -- the setup
+# raffle's one genuinely random step (`game_server::run_raffle`) needs a
+# real RNG, and `game_server` itself only compiles under this feature.
+# Same version `bots`/`sim` already pin.
+rand = { version = "0.10.2", optional = true }
 
 [features]
 default = ["web"]
 web = ["dioxus/web"]
-server = ["dioxus/server", "dep:tokio"]
+server = ["dioxus/server", "dep:tokio", "dep:rand"]
 
 # `bots` drives a real, spawned `app` server binary over its actual
 # websocket protocol for `tests/full_game_with_bots.rs` -- see that file

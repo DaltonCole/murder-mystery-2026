@@ -114,6 +114,12 @@ enum ClientMsg {
     Watch(Viewer),
     /// Any other game command.
     Do(Command),
+    /// `/host` only: runs rules.md §1's weighted setup raffle over the
+    /// current roster and finalizes setup. Not a plain `Command` -- unlike
+    /// everything else here, this needs a real RNG (see
+    /// `game_server::run_raffle`'s doc comment on "randomness at the
+    /// boundary"), which only exists server-side.
+    RunRaffle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +178,20 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                             socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
                         }
                         ClientMsg::Do(cmd) => match game_server::apply(cmd) {
+                            Ok(_) => {
+                                drain_self_echo(&mut changed);
+                                if let Some(v) = viewer {
+                                    socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
+                                } else {
+                                    true
+                                }
+                            }
+                            Err(e) => socket
+                                .send(ServerMsg::Failed { error: e.to_string() })
+                                .await
+                                .is_ok(),
+                        },
+                        ClientMsg::RunRaffle => match game_server::run_raffle() {
                             Ok(_) => {
                                 drain_self_echo(&mut changed);
                                 if let Some(v) = viewer {
@@ -398,6 +418,13 @@ fn Play() -> Element {
                 }
             }
         }
+        if v.own_character.is_none() {
+            InterestLevelForm {
+                my_id: id,
+                own_interest_level: v.own_interest_level,
+                on_command: send_cmd,
+            }
+        }
         BioForm {
             my_id: id,
             own_bio: v.own_bio.clone(),
@@ -427,6 +454,57 @@ fn Play() -> Element {
                 task,
                 roster: v.roster.clone(),
                 on_command: send_cmd,
+            }
+        }
+    }
+}
+
+/// rules.md §1's signup interest rating -- only shown before the setup
+/// raffle has given the viewer a character (`own_character` still `None`
+/// in `Play`'s caller); once it has, there's nothing left to rate. A
+/// standing choice like `SubmitBio` -- resubmitting silently replaces (see
+/// `Command::SubmitInterestLevel`'s doc comment), so this doesn't need a
+/// separate "already submitted, lock it in" state.
+#[component]
+fn InterestLevelForm(
+    my_id: PlayerId,
+    own_interest_level: Option<u8>,
+    on_command: EventHandler<Command>,
+) -> Element {
+    let mut level = use_signal(|| own_interest_level.unwrap_or(5));
+    rsx! {
+        div {
+            h4 { "How involved do you want to be tonight?" }
+            p {
+                "Rate your interest 1-10 -- a higher rating gives you more tickets in the raffle for a major role (rules.md §1). The host runs the raffle once everyone's rated themselves."
+            }
+            input {
+                r#type: "number",
+                min: "1",
+                max: "10",
+                value: "{level}",
+                oninput: move |e| {
+                    if let Ok(n) = e.value().parse::<u8>() {
+                        level.set(n.clamp(1, 10));
+                    }
+                },
+            }
+            button {
+                onclick: move |_| {
+                    on_command
+                        .call(Command::SubmitInterestLevel {
+                            player: my_id,
+                            level: level(),
+                        });
+                },
+                if own_interest_level.is_some() {
+                    "Update my interest"
+                } else {
+                    "Submit my interest"
+                }
+            }
+            if let Some(submitted) = own_interest_level {
+                p { "You rated your interest: {submitted}. Waiting for the host to run the raffle." }
             }
         }
     }
@@ -1040,6 +1118,12 @@ fn Host() -> Element {
             let _ = socket.send(ClientMsg::Do(cmd)).await;
         });
     };
+    let run_raffle = move || {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::RunRaffle).await;
+        });
+    };
 
     let mut new_name = use_signal(String::new);
     let mut faction_player = use_signal(|| None::<u32>);
@@ -1061,6 +1145,7 @@ fn Host() -> Element {
     let mut gallery_winner = use_signal(|| Faction::Ton);
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
+    let interest_levels = view().map(|v| v.interest_levels).unwrap_or_default();
     let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
     let winner = view().and_then(|v| v.winner);
     let task_candidates = view().map(|v| v.task_candidates).unwrap_or_default();
@@ -1087,6 +1172,16 @@ fn Host() -> Element {
                     }
                 },
                 "Add player"
+            }
+            p {
+                "{interest_levels.len()} of {roster.len()} players have rated their interest so far (rules.md §1)."
+            }
+            button {
+                onclick: move |_| run_raffle(),
+                "Run the raffle"
+            }
+            p {
+                "Running the raffle assigns every named role by weighted ticket (higher interest = more tickets), splits everyone else across Ton/Uprising, then finalizes setup -- anyone added afterward joins as a Servant automatically. The controls below are for a manual fix-up afterward, or for designating the Deceiver mid-game."
             }
             div {
                 select {
@@ -1156,7 +1251,7 @@ fn Host() -> Element {
                     "Assign title"
                 }
             }
-            p { "Assign a faction to every player first, assign the four titles above to their holders, then Finalize -- everyone else gets a generic character automatically." }
+            p { "Manual path (skip this if you used \"Run the raffle\" above): assign a faction to every player first, assign the four titles above to their holders, then Finalize -- everyone else gets a generic character automatically." }
             button { onclick: move |_| do_cmd(Command::FinalizeSetup), "Finalize setup" }
         }
         div {

@@ -22,13 +22,44 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Registers a new player during setup. Assigns the next `PlayerId` in
-    /// join order; the caller does not choose the ID.
+    /// join order; the caller does not choose the ID. Rules.md §1: "late
+    /// arrivals become Servants" -- once [`Command::CloseRaffle`] has run,
+    /// every subsequently-added player is auto-assigned `Faction::Servant`
+    /// immediately, rather than landing `Unassigned` like an on-time
+    /// joiner does.
     AddPlayer { name: String },
 
-    /// Assigns a player's faction. Setup-only for now — Phase 1 will route
-    /// this through the raffle-ticket weighting in rules.md §2 rather than
-    /// taking the faction directly, but the underlying mutation (one player,
-    /// one faction, once) stays the same.
+    /// A player's signup interest rating (rules.md §1: "every player rates
+    /// their desired involvement 1-10 at signup"), 1-10. A standing choice
+    /// like `SubmitBio` -- resubmitting silently replaces the previous
+    /// value, so a misclick before the raffle runs isn't permanent.
+    /// Rejected if `level` is outside 1-10. Feeds `raffle::ticket_count`;
+    /// the caller (not the engine -- see "randomness at the boundary" on
+    /// `crate::raffle`) uses it to run the actual weighted draw and then
+    /// commits the winners via `AssignCharacter` below.
+    SubmitInterestLevel { player: PlayerId, level: u8 },
+
+    /// Marks the setup raffle's signup window closed (rules.md §1): every
+    /// player added *before* this point is a normal raffle candidate,
+    /// while every player `AddPlayer`'d afterward is a "late arrival" and
+    /// gets auto-Servanted (see `AddPlayer`'s doc comment) instead. A
+    /// distinct, explicit moment from [`Command::FinalizeSetup`] on
+    /// purpose: `FinalizeSetup` stays freely repeatable while the roster is
+    /// still growing (its own doc comment: "safe to call again after
+    /// adding more players"), so it can't double as this signal without
+    /// breaking that. Call this once, right after committing the raffle's
+    /// winners via `AssignCharacter`/`AssignFaction`, and before the final
+    /// `FinalizeSetup` that fills in everyone's catch-all character.
+    CloseRaffle,
+
+    /// Assigns a player's faction directly. Once the setup raffle has run,
+    /// this is only for the leftover players who didn't win a named role in
+    /// it (splitting them across Ton/Uprising per rules.md §1's ~60/40
+    /// target) -- everyone who *did* win a role gets their faction from
+    /// `AssignCharacter` instead (see its own doc comment), since rules.md
+    /// §1 assigns roles before factions specifically so raffle interest
+    /// (not a manual faction pick) is what decides who can become Cult
+    /// Leader.
     AssignFaction { player: PlayerId, faction: Faction },
 
     /// Assigns a named character to a player -- the four major titles
@@ -37,17 +68,24 @@ pub enum Command {
     /// ...), including *mid-game*: rules.md §3.3 has the Cult Leader
     /// designate which recruited Cultist holds the Deceiver title "at the
     /// moment of recruitment or any point after," so this command must
-    /// stay usable after setup too, not just during it. Rejects a player
-    /// whose faction doesn't match the character (checked against
-    /// `true_faction()` for a Cult-required character, so a secretly
-    /// recruited Cultist qualifies even though their apparent faction
-    /// never changes), and rejects a character that's already held by
-    /// someone else. A generic catch-all (`NormalTon`/`NormalUprising`/
-    /// `Cultist`) already assigned to the player -- whether by
-    /// [`Command::FinalizeSetup`] or by `Convert`'s own auto-stamp -- can
-    /// always be upgraded to a specific named role; any other existing
-    /// character is a hard rejection. Everyone who ends setup with no
-    /// character at all gets a catch-all from
+    /// stay usable after setup too, not just during it.
+    ///
+    /// If the player's faction is still `Unassigned`, assigning them a
+    /// character that requires a faction (every named role except the
+    /// catch-alls) assigns that required faction to them too, in the same
+    /// step -- this is what lets the setup raffle (`crate::raffle`) hand
+    /// out roles *before* factions exist at all: winning a role is what
+    /// determines a player's faction, not the other way around. If the
+    /// player already has a faction, this instead rejects a mismatch
+    /// (checked against `true_faction()` for a Cult-required character, so
+    /// a secretly recruited Cultist qualifies even though their apparent
+    /// faction never changes) exactly as before. Also rejects a character
+    /// that's already held by someone else. A generic catch-all
+    /// (`NormalTon`/`NormalUprising`/`Cultist`) already assigned to the
+    /// player -- whether by [`Command::FinalizeSetup`] or by `Convert`'s
+    /// own auto-stamp -- can always be upgraded to a specific named role;
+    /// any other existing character is a hard rejection. Everyone who ends
+    /// setup with no character at all gets a catch-all from
     /// [`Command::FinalizeSetup`], not this.
     AssignCharacter {
         player: PlayerId,
@@ -57,8 +95,11 @@ pub enum Command {
     /// Setup-only: fills in the catch-all character (`NormalTon`,
     /// `NormalUprising`, or `Cultist`) for every Ton/Uprising/Cult player
     /// who doesn't already have one from `AssignCharacter`. Servants and
-    /// still-`Unassigned` players are left alone. Idempotent -- safe to
-    /// call again after adding more players.
+    /// still-`Unassigned` players are left alone. Also closes the setup
+    /// raffle (see `AddPlayer`'s doc comment) -- idempotent, so safe to
+    /// call again after adding more players, but a player added *after* the
+    /// first call becomes a late-arrival Servant rather than an
+    /// `Unassigned` raffle candidate.
     FinalizeSetup,
 
     /// A player's character sheet (rules.md §1: "Character Name, Real

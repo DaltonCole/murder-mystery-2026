@@ -13,8 +13,11 @@
 //! 20-30 player, single-process, one-event-at-a-time party game.
 
 use engine::{
-    apply_command, view_for, Command, DomainEvent, GameError, GameState, PlayerView, Viewer,
+    apply_command, raffle_priority, raffle_winners, ticket_count, ticket_slots, view_for, Command,
+    DomainEvent, Faction, GameError, GameState, PlayerId, PlayerView, Viewer,
 };
+use rand::seq::SliceRandom;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::broadcast;
 
@@ -49,6 +52,81 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
         let _ = server().changed.send(());
     }
     result
+}
+
+/// Runs rules.md §1's weighted setup raffle over the current roster and
+/// finalizes setup, all under one lock acquisition -- the Host console's
+/// "Run the raffle" button is the only caller. This is where the one
+/// genuinely random step actually happens (see `engine::raffle`'s module
+/// doc comment on "randomness at the boundary": the engine only computes,
+/// it never generates its own randomness) -- this function runs natively
+/// on the server, so a plain `rand::rng()` is a real OS-backed source,
+/// unlike the WASM client half of this same binary.
+///
+/// Mirrors `bots::HostDriver::setup_game` step for step (ticket-weighted
+/// draw, `AssignCharacter` for every winner, ~60/40 Ton/Uprising split for
+/// the leftovers, then `CloseRaffle`/`FinalizeSetup`) -- that's the
+/// network-driven equivalent of this same sequence for the bot test
+/// harness; this is the real one a live host actually presses.
+pub fn run_raffle() -> Result<Vec<DomainEvent>, GameError> {
+    let mut events = Vec::new();
+    {
+        let mut state = lock_state();
+        let roster: Vec<PlayerId> = state.players().map(|p| p.id).collect();
+
+        let mut tickets = BTreeMap::new();
+        let mut low_interest = Vec::new();
+        for &id in &roster {
+            let level = state.interest_level(id).unwrap_or(0);
+            let count = ticket_count(level);
+            if count > 0 {
+                tickets.insert(id, count);
+            } else {
+                low_interest.push(id);
+            }
+        }
+        let mut rng = rand::rng();
+        let mut slots = ticket_slots(&tickets);
+        slots.shuffle(&mut rng);
+        low_interest.shuffle(&mut rng);
+        let priority = raffle_priority(&slots, &low_interest);
+        let winners = raffle_winners(&priority);
+
+        for (character, player) in winners.iter().copied() {
+            events.extend(apply_command(
+                &mut state,
+                Command::AssignCharacter { player, character },
+            )?);
+        }
+
+        let won_a_role: BTreeSet<PlayerId> = winners.iter().map(|&(_, player)| player).collect();
+        let mut remaining: Vec<PlayerId> = roster
+            .iter()
+            .copied()
+            .filter(|id| !won_a_role.contains(id))
+            .collect();
+        remaining.shuffle(&mut rng);
+        let ton_count = (remaining.len() as f64 * 0.6).round() as usize;
+        let (ton, uprising) = remaining.split_at(ton_count);
+        for (group, faction) in [(ton, Faction::Ton), (uprising, Faction::Uprising)] {
+            for &id in group {
+                events.extend(apply_command(
+                    &mut state,
+                    Command::AssignFaction {
+                        player: id,
+                        faction,
+                    },
+                )?);
+            }
+        }
+
+        events.extend(apply_command(&mut state, Command::CloseRaffle)?);
+        events.extend(apply_command(&mut state, Command::FinalizeSetup)?);
+    }
+    // Same reasoning as `apply` above: nobody subscribed is a fine outcome
+    // to ignore, there's just nobody waiting to be told.
+    let _ = server().changed.send(());
+    Ok(events)
 }
 
 /// The single read path every route uses -- never hands out a raw

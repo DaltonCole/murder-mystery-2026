@@ -112,6 +112,7 @@ pub struct PlayerBot {
     /// returned -- see the doc comment on `react`'s guard for why this is
     /// necessary at all, not just a nice-to-have.
     setup_complete: Arc<AtomicBool>,
+    submitted_interest_level: bool,
     submitted_bio: bool,
     opted_into_intermission: bool,
     submitted_gallery_prediction: bool,
@@ -143,6 +144,7 @@ impl PlayerBot {
             rng: StdRng::seed_from_u64(seed),
             intermission_pool,
             setup_complete,
+            submitted_interest_level: false,
             submitted_bio: false,
             opted_into_intermission: false,
             submitted_gallery_prediction: false,
@@ -170,6 +172,23 @@ impl PlayerBot {
     }
 
     async fn react(&mut self, view: &PlayerView) -> Result<(), ConnError> {
+        // Unlike everything gated below, this has to fire *before*
+        // `setup_complete` -- the Host can't run the setup raffle
+        // (`HostDriver::setup_game`) until every on-time bot's interest
+        // level is in. Safe to leave ungated: submitting your own interest
+        // level only ever touches that one player's own entry in a map
+        // keyed by `PlayerId`, so unlike `AssignCharacter`/`AssignFaction`
+        // there's no shared title/faction state for concurrent bot
+        // activity to race.
+        if !self.submitted_interest_level {
+            self.submitted_interest_level = true;
+            let level = self.rng.random_range(1..=10);
+            self.send(Command::SubmitInterestLevel {
+                player: self.id,
+                level,
+            })
+            .await?;
+        }
         if let Some(phase) = &view.denouncement {
             self.react_to_denouncement(view, phase).await?;
         } else {

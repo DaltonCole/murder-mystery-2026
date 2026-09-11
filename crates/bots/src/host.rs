@@ -12,46 +12,66 @@
 //! concurrently uses `Conn::do_cmd_until` with a predicate on the Host's
 //! own view, not the simpler "assume the next reply is mine" approach --
 //! see that method's doc comment for why the latter is unsound once N
-//! bots are simultaneously nominating/voting/attempting tasks. Setup
-//! (before anyone has anything to react to yet) uses the simpler
-//! `do_cmd_sequential` since no concurrent activity is possible there.
+//! bots are simultaneously nominating/voting/attempting tasks.
+//!
+//! The raffle-commit sequence inside `setup_game` (`AssignCharacter` for
+//! every winner, `AssignFaction` for the leftovers, `CloseRaffle`,
+//! `FinalizeSetup`) uses the simpler `do_cmd_sequential` instead -- but,
+//! critically, over a *fresh* connection opened just for that sequence,
+//! not `self.conn`. Every on-time bot fires its own `SubmitInterestLevel`
+//! the instant it joins (see `PlayerBot::react`), and `self.conn` has been
+//! subscribed to Host broadcasts since `connect()` -- so by the time
+//! `setup_game` runs, it can already be sitting on a backlog of those
+//! bots' broadcast pushes. `do_cmd_sequential` on a connection with a
+//! backlog is exactly the unsound case its own doc comment warns about:
+//! confirmed by reproducing "a late arrival's own `AddPlayer` gets applied
+//! before `CloseRaffle` does" this way, under real load, at 30 players. A
+//! brand-new connection has no such backlog (broadcasts are pushed to
+//! already-subscribed connections in real time, never replayed to a new
+//! subscriber), so `do_cmd_sequential` is genuinely safe on it regardless
+//! of what any bot is doing concurrently.
 
 use crate::protocol::{Conn, ConnError};
 use engine::{
-    Character, Command, ContestCategory, DenouncementView, Faction, PlayerId, PlayerView, Round,
-    TaskTier, Viewer,
+    raffle_priority, raffle_winners, ticket_count, ticket_slots, Character, Command,
+    ContestCategory, DenouncementView, Faction, PlayerId, PlayerView, Round, TaskTier, Viewer,
 };
 use rand::rngs::StdRng;
 use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{RngExt, SeedableRng};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct HostDriver {
     conn: Conn,
+    url: String,
 }
 
-/// The four titled players a setup pass installed, plus everyone else --
-/// enough for a caller to sanity-check the split without re-deriving it.
+/// The four raffle-won titles, for a caller to sanity-check the setup
+/// raffle's outcome without re-deriving it. `None` only in a pathologically
+/// tiny on-time pool (fewer than 4 players) that couldn't fill every major
+/// role -- `setup_game` still runs to completion in that case, matching how
+/// `Command::FinalizeSetup` already treats "not enough named-role
+/// candidates" as a normal small-game outcome rather than an error. Late
+/// arrivals are deliberately absent here -- see `Command::AddPlayer`'s doc
+/// comment: they're auto-`Faction::Servant`'d the instant they join, so
+/// there's no setup-time list of them for this struct to hand back.
 pub struct Roles {
-    pub king_queen: PlayerId,
-    pub prince_princess: PlayerId,
-    pub revolutionary_leader: PlayerId,
-    pub cult_leader: PlayerId,
-    /// The literal `Faction::Servant` late-arrivals -- kept here because
-    /// nothing in `PlayerView` ever reveals a player's faction, not even to
-    /// the Host (see `view::view_for`'s "no ambient god-view" design note),
-    /// so this is the only way anything downstream can award them Servant
-    /// points by literal faction rather than only by Cast-Out status.
-    pub servants: Vec<PlayerId>,
+    pub king_queen: Option<PlayerId>,
+    pub prince_princess: Option<PlayerId>,
+    pub revolutionary_leader: Option<PlayerId>,
+    pub cult_leader: Option<PlayerId>,
 }
 
 impl HostDriver {
     pub async fn connect(url: &str) -> Result<Self, ConnError> {
         let mut conn = Conn::connect(url).await?;
         conn.watch(Viewer::Host).await?;
-        Ok(HostDriver { conn })
+        Ok(HostDriver {
+            conn,
+            url: url.to_string(),
+        })
     }
 
     /// Polls the host's own view until the roster reaches `count`
@@ -79,47 +99,120 @@ impl HostDriver {
         }
     }
 
-    /// Assigns factions (rules.md §2: Servants ~10%, Cult seeded with just
-    /// the Cult Leader, remaining ~60/40 Ton/Uprising) and the four titles
-    /// to an already-joined roster, then finalizes setup -- the same
-    /// ratios `sim::setup_game` uses, just issued as real commands instead
-    /// of direct `apply_command` calls. Uses `do_cmd_sequential`: nothing
-    /// else is happening yet (bots have nothing to react to before any
-    /// faction/character/Denouncement/task exists), so there's no
-    /// concurrent broadcast traffic to misattribute a reply from.
+    /// Polls the host's own view until every one of `count` on-time
+    /// players has submitted an interest level (rules.md §1), or `timeout`
+    /// elapses -- the setup raffle can't run before then.
+    pub async fn wait_for_interest_levels(
+        &mut self,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<(), ConnError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let view = self.conn.watch(Viewer::Host).await?;
+            if view.interest_levels.len() >= count {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ConnError::Timeout(
+                    "every on-time player submitting an interest level",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Runs rules.md §1's weighted setup raffle over `player_ids` (the
+    /// on-time roster -- anyone who joins later is a separate "late
+    /// arrival" the caller handles outside this method, see
+    /// `Command::AddPlayer`'s doc comment) and finalizes setup:
+    ///
+    /// 1. Waits for every on-time player's `SubmitInterestLevel`.
+    /// 2. Computes each player's tickets (`engine::ticket_count`), expands
+    ///    them into a flat ticket list, and shuffles it with `seed` -- the
+    ///    one genuinely random step, which has to happen here rather than
+    ///    in `engine` (see `raffle`'s module doc comment on "randomness at
+    ///    the boundary"). Players with zero tickets go into a separately-
+    ///    shuffled low-interest fallback pool instead, for rules.md's
+    ///    "unless the pool is otherwise underfilled" clause.
+    /// 3. Awards every named role (`engine::raffle_winners`) via
+    ///    `AssignCharacter`, which auto-assigns the matching faction too
+    ///    (see its own doc comment) -- rules.md §1 assigns roles *before*
+    ///    factions specifically so raffle interest, not a manual pick,
+    ///    decides who can become Cult Leader.
+    /// 4. Splits everyone who didn't win a role across Ton/Uprising
+    ///    (~60/40, rules.md §1) via `AssignFaction`.
+    /// 5. Closes the raffle (`Command::CloseRaffle`) and finalizes setup.
+    ///
+    /// Steps 3-5 use `do_cmd_sequential` over a fresh connection opened
+    /// just for them, not `self.conn` -- see the module doc comment for
+    /// why `self.conn` (already subscribed to Host broadcasts since it can
+    /// have been watching since before every on-time bot's own
+    /// interest-level submission) isn't safe for this anymore.
     pub async fn setup_game(
         &mut self,
         player_ids: &[PlayerId],
         seed: u64,
     ) -> Result<Roles, ConnError> {
+        self.wait_for_interest_levels(player_ids.len(), Duration::from_secs(15))
+            .await?;
+        let view = self.conn.watch(Viewer::Host).await?;
+        let submitted: BTreeMap<PlayerId, u8> = view.interest_levels.iter().copied().collect();
+
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut ids = player_ids.to_vec();
-        ids.shuffle(&mut rng);
+        let mut tickets = BTreeMap::new();
+        let mut low_interest = Vec::new();
+        for &id in player_ids {
+            let level = submitted.get(&id).copied().unwrap_or(0);
+            let count = ticket_count(level);
+            if count > 0 {
+                tickets.insert(id, count);
+            } else {
+                low_interest.push(id);
+            }
+        }
+        let mut slots = ticket_slots(&tickets);
+        slots.shuffle(&mut rng);
+        low_interest.shuffle(&mut rng);
+        let priority = raffle_priority(&slots, &low_interest);
+        let winners = raffle_winners(&priority);
 
-        let n = ids.len();
-        let servant_count = (n as f64 * 0.10).round() as usize;
-        let cult_count = 1;
-        let remaining = n.saturating_sub(servant_count + cult_count);
-        let ton_count = ((remaining as f64) * 0.6).round() as usize;
-        let uprising_count = remaining - ton_count;
+        // See the module doc comment: a brand-new connection here (not
+        // `self.conn`) has no broadcast backlog to misattribute a reply
+        // from, unlike the long-lived, already-subscribed Host connection.
+        let mut setup_conn = Conn::connect(&self.url).await?;
+        setup_conn.watch(Viewer::Host).await?;
 
-        let mut cursor = 0;
-        let servants = &ids[cursor..cursor + servant_count];
-        cursor += servant_count;
-        let cult = &ids[cursor..cursor + cult_count];
-        cursor += cult_count;
-        let ton = &ids[cursor..cursor + ton_count];
-        cursor += ton_count;
-        let uprising = &ids[cursor..cursor + uprising_count];
+        for &(character, player) in &winners {
+            setup_conn
+                .do_cmd_sequential(Command::AssignCharacter { player, character })
+                .await?;
+        }
+        let title_winner = |wanted: Character| {
+            winners
+                .iter()
+                .find(|&&(character, _)| character == wanted)
+                .map(|&(_, player)| player)
+        };
+        let roles = Roles {
+            king_queen: title_winner(Character::KingQueen),
+            prince_princess: title_winner(Character::PrincePrincess),
+            revolutionary_leader: title_winner(Character::RevolutionaryLeader),
+            cult_leader: title_winner(Character::CultLeader),
+        };
 
-        for (group, faction) in [
-            (servants, Faction::Servant),
-            (cult, Faction::Cult),
-            (ton, Faction::Ton),
-            (uprising, Faction::Uprising),
-        ] {
+        let won_a_role: BTreeSet<PlayerId> = winners.iter().map(|&(_, player)| player).collect();
+        let mut remaining: Vec<PlayerId> = player_ids
+            .iter()
+            .copied()
+            .filter(|id| !won_a_role.contains(id))
+            .collect();
+        remaining.shuffle(&mut rng);
+        let ton_count = (remaining.len() as f64 * 0.6).round() as usize;
+        let (ton, uprising) = remaining.split_at(ton_count);
+        for (group, faction) in [(ton, Faction::Ton), (uprising, Faction::Uprising)] {
             for &id in group {
-                self.conn
+                setup_conn
                     .do_cmd_sequential(Command::AssignFaction {
                         player: id,
                         faction,
@@ -128,64 +221,8 @@ impl HostDriver {
             }
         }
 
-        let roles = Roles {
-            king_queen: ton[0],
-            prince_princess: ton[1],
-            revolutionary_leader: uprising[0],
-            cult_leader: cult[0],
-            servants: servants.to_vec(),
-        };
-        for (player, character) in [
-            (roles.king_queen, Character::KingQueen),
-            (roles.prince_princess, Character::PrincePrincess),
-            (roles.revolutionary_leader, Character::RevolutionaryLeader),
-            (roles.cult_leader, Character::CultLeader),
-        ] {
-            self.conn
-                .do_cmd_sequential(Command::AssignCharacter { player, character })
-                .await?;
-        }
-
-        // Everyone else who fits gets one of the remaining Phase 2/3 named
-        // roles too (rather than falling back to the generic NormalTon/
-        // NormalUprising `FinalizeSetup` gives out) -- otherwise none of
-        // these commands would ever have anyone able to issue them.
-        // `.zip()` naturally caps at whichever is shorter, so a small game
-        // just gets fewer named roles and leaves the remainder generic,
-        // exactly like `FinalizeSetup` already expects to handle. Deceiver
-        // is deliberately absent here -- it requires a Cult-faction holder,
-        // and the only Cult member at setup is the Cult Leader itself; see
-        // `PlayerBot`'s handling of a live `Convert` for how it gets
-        // assigned mid-game instead.
-        const TON_NAMED_ROLES: [Character; 7] = [
-            Character::Oracle,
-            Character::Almanac,
-            Character::PriestPriestess,
-            Character::PotionMaker,
-            Character::Magistrate,
-            Character::Duelist,
-            Character::GrandInquisitor,
-        ];
-        const UPRISING_NAMED_ROLES: [Character; 6] = [
-            Character::Spymaster,
-            Character::Bartender,
-            Character::DoctorMedic,
-            Character::Firebrand,
-            Character::CellLeader,
-            Character::Agitator,
-        ];
-        for (&player, &character) in ton[2..].iter().zip(TON_NAMED_ROLES.iter()) {
-            self.conn
-                .do_cmd_sequential(Command::AssignCharacter { player, character })
-                .await?;
-        }
-        for (&player, &character) in uprising[1..].iter().zip(UPRISING_NAMED_ROLES.iter()) {
-            self.conn
-                .do_cmd_sequential(Command::AssignCharacter { player, character })
-                .await?;
-        }
-
-        self.conn.do_cmd_sequential(Command::FinalizeSetup).await?;
+        setup_conn.do_cmd_sequential(Command::CloseRaffle).await?;
+        setup_conn.do_cmd_sequential(Command::FinalizeSetup).await?;
         Ok(roles)
     }
 

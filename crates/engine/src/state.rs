@@ -31,6 +31,17 @@ pub struct GameState {
     /// than a field on `Player`. See `bio::task_candidates` for the
     /// consumer this exists for.
     bios: BTreeMap<PlayerId, Bio>,
+    /// rules.md §1's signup interest rating, keyed like `bios` rather than
+    /// living on `Player` -- submitted before faction/character exist at
+    /// all. See `raffle::ticket_count` for the consumer this exists for.
+    interest_levels: BTreeMap<PlayerId, u8>,
+    /// True forever once `Command::CloseRaffle` has run -- a distinct,
+    /// explicit moment from `FinalizeSetup` (which stays safely repeatable
+    /// while players are still trickling in on time). A player
+    /// `AddPlayer`'d after this point is a rules.md §1 "late arrival" and
+    /// is auto-assigned `Faction::Servant` on the spot rather than landing
+    /// `Unassigned`. See `AddPlayer`'s doc comment.
+    raffle_closed: bool,
 
     current_round: Round,
 
@@ -249,6 +260,8 @@ impl Default for GameState {
             next_player_id: 0,
             event_log: Vec::new(),
             bios: BTreeMap::new(),
+            interest_levels: BTreeMap::new(),
+            raffle_closed: false,
             current_round: Round::One,
             king_queen: None,
             king_queen_transfer_used: false,
@@ -327,6 +340,14 @@ impl GameState {
 
     pub(crate) fn bios(&self) -> impl Iterator<Item = (PlayerId, &Bio)> {
         self.bios.iter().map(|(&id, bio)| (id, bio))
+    }
+
+    pub fn interest_level(&self, id: PlayerId) -> Option<u8> {
+        self.interest_levels.get(&id).copied()
+    }
+
+    pub(crate) fn interest_levels(&self) -> impl Iterator<Item = (PlayerId, u8)> + '_ {
+        self.interest_levels.iter().map(|(&id, &level)| (id, level))
     }
 
     pub fn event_log(&self) -> &[DomainEvent] {
@@ -759,7 +780,27 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             let id = PlayerId(state.next_player_id);
             state.next_player_id += 1;
             state.players.insert(id, Player::new(id, name.clone()));
-            vec![DomainEvent::PlayerAdded { id, name }]
+            let mut events = vec![DomainEvent::PlayerAdded { id, name }];
+            // Rules.md §1: "late arrivals become Servants" -- the raffle
+            // has already closed, so this player never gets a shot at a
+            // named role; see `Command::AddPlayer`'s doc comment.
+            if state.raffle_closed {
+                state.players.get_mut(&id).unwrap().faction = Faction::Servant;
+                events.push(DomainEvent::FactionAssigned {
+                    player: id,
+                    faction: Faction::Servant,
+                });
+            }
+            events
+        }
+
+        Command::SubmitInterestLevel { player, level } => {
+            submit_interest_level(state, player, level)?
+        }
+
+        Command::CloseRaffle => {
+            state.raffle_closed = true;
+            vec![DomainEvent::RaffleClosed]
         }
 
         Command::AssignFaction { player, faction } => {
@@ -945,6 +986,7 @@ fn assign_character(
         .players
         .get(&player)
         .ok_or(GameError::UnknownPlayer(player))?;
+    let mut faction_to_assign = None;
     if let Some(required) = GameState::required_faction(character) {
         // A secretly-recruited Cultist's *apparent* `faction` never changes
         // (see `Player::true_faction`'s doc comment) -- only `true_faction`
@@ -961,7 +1003,13 @@ fn assign_character(
         } else {
             p.faction
         };
-        if actual != required {
+        if actual == Faction::Unassigned {
+            // The setup raffle (`crate::raffle`) assigns roles *before*
+            // factions exist -- see `Command::AssignCharacter`'s doc
+            // comment. Winning a role determines the faction, rather than
+            // requiring one up front.
+            faction_to_assign = Some(required);
+        } else if actual != required {
             return Err(GameError::WrongFactionForCharacter {
                 player,
                 character,
@@ -1031,8 +1079,14 @@ fn assign_character(
         }
     }
 
+    let mut events = Vec::new();
+    if let Some(faction) = faction_to_assign {
+        state.players.get_mut(&player).unwrap().faction = faction;
+        events.push(DomainEvent::FactionAssigned { player, faction });
+    }
     state.players.get_mut(&player).unwrap().character = Some(character);
-    Ok(vec![DomainEvent::CharacterAssigned { player, character }])
+    events.push(DomainEvent::CharacterAssigned { player, character });
+    Ok(events)
 }
 
 fn finalize_setup(state: &mut GameState) -> Vec<DomainEvent> {
@@ -1075,6 +1129,25 @@ fn finalize_setup(state: &mut GameState) -> Vec<DomainEvent> {
     }
 
     vec![DomainEvent::SetupFinalized]
+}
+
+/// Records or replaces `player`'s signup interest rating (rules.md §1) --
+/// see `Command::SubmitInterestLevel`'s doc comment for why re-submission
+/// silently replaces rather than being rejected as a duplicate, matching
+/// `submit_bio`'s standing-choice shape.
+fn submit_interest_level(
+    state: &mut GameState,
+    player: PlayerId,
+    level: u8,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.players.contains_key(&player) {
+        return Err(GameError::UnknownPlayer(player));
+    }
+    if !(crate::raffle::MIN_INTEREST_LEVEL..=crate::raffle::MAX_INTEREST_LEVEL).contains(&level) {
+        return Err(GameError::InterestLevelOutOfRange(level));
+    }
+    state.interest_levels.insert(player, level);
+    Ok(vec![DomainEvent::InterestLevelSubmitted { player, level }])
 }
 
 /// Records or replaces `player`'s bio (rules.md §1). A standing choice --
@@ -2829,6 +2902,54 @@ mod tests {
     }
 
     #[test]
+    fn assign_character_auto_assigns_the_required_faction_when_unassigned() {
+        // The setup raffle (rules.md §1) hands out roles *before* factions
+        // exist -- winning a role determines the faction, not the other
+        // way around. See `Command::AssignCharacter`'s doc comment.
+        let mut state = GameState::new();
+        let p = add_player(&mut state, "Winner", Faction::Unassigned);
+        let events = apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: p,
+                character: Character::Oracle,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.player(p).unwrap().faction, Faction::Ton);
+        assert_eq!(state.player(p).unwrap().character, Some(Character::Oracle));
+        assert_eq!(
+            events,
+            vec![
+                DomainEvent::FactionAssigned {
+                    player: p,
+                    faction: Faction::Ton,
+                },
+                DomainEvent::CharacterAssigned {
+                    player: p,
+                    character: Character::Oracle,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn assign_character_auto_assigns_cult_faction_for_the_cult_leader_raffle_winner() {
+        let mut state = GameState::new();
+        let p = add_player(&mut state, "Winner", Faction::Unassigned);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: p,
+                character: Character::CultLeader,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.player(p).unwrap().faction, Faction::Cult);
+        assert_eq!(state.cult_leader(), Some(p));
+    }
+
+    #[test]
     fn assign_character_rejects_a_title_already_held_by_someone_else() {
         let mut state = GameState::new();
         let king1 = add_player(&mut state, "King1", Faction::Ton);
@@ -2949,6 +3070,83 @@ mod tests {
         let before = state.player(PlayerId(0)).unwrap().character;
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
         assert_eq!(state.player(PlayerId(0)).unwrap().character, before);
+    }
+
+    #[test]
+    fn a_player_added_before_the_raffle_closes_starts_unassigned() {
+        let mut state = GameState::new();
+        let events = apply_command(
+            &mut state,
+            Command::AddPlayer {
+                name: "OnTime".into(),
+            },
+        )
+        .unwrap();
+        let id = match events[0] {
+            DomainEvent::PlayerAdded { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(state.player(id).unwrap().faction, Faction::Unassigned);
+    }
+
+    #[test]
+    fn adding_more_players_after_finalize_setup_alone_does_not_servant_them() {
+        // `FinalizeSetup` alone is NOT the "raffle closed" signal -- its own
+        // doc comment promises it stays safe to call again while the
+        // roster is still growing, and plenty of existing tests build a
+        // small scenario via `setup_full_game()` (which calls
+        // `FinalizeSetup`) and then add more on-time players afterward.
+        // Only `CloseRaffle` should trigger late-arrival auto-Servanting.
+        let mut state = GameState::new();
+        add_player(&mut state, "OnTime", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        let still_on_time = add_player(&mut state, "AlsoOnTime", Faction::Uprising);
+        assert_eq!(
+            state.player(still_on_time).unwrap().faction,
+            Faction::Uprising
+        );
+    }
+
+    #[test]
+    fn a_player_added_after_close_raffle_becomes_a_servant_automatically() {
+        // Rules.md §1: "late arrivals become Servants" -- once the raffle
+        // has closed, a newly-joined player shouldn't sit `Unassigned`
+        // forever with no way to participate; they're auto-servanted on
+        // the spot.
+        let mut state = GameState::new();
+        add_player(&mut state, "OnTime", Faction::Ton);
+        apply_command(&mut state, Command::CloseRaffle).unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::AddPlayer {
+                name: "Late".into(),
+            },
+        )
+        .unwrap();
+        let late = match events[0] {
+            DomainEvent::PlayerAdded { id, .. } => id,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            events,
+            vec![
+                DomainEvent::PlayerAdded {
+                    id: late,
+                    name: "Late".into(),
+                },
+                DomainEvent::FactionAssigned {
+                    player: late,
+                    faction: Faction::Servant,
+                },
+            ]
+        );
+        assert_eq!(state.player(late).unwrap().faction, Faction::Servant);
+        // A late arrival gets no character at all (matching how
+        // `finalize_setup` already treats every other Servant).
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        assert_eq!(state.player(late).unwrap().character, None);
     }
 
     fn setup_full_game() -> (GameState, PlayerId, PlayerId, PlayerId, PlayerId) {
@@ -3074,6 +3272,86 @@ mod tests {
             })
         );
         assert!(state.bio(king_queen).is_none());
+    }
+
+    #[test]
+    fn submit_interest_level_records_it_and_is_readable_back() {
+        let mut state = GameState::new();
+        let alice = add_player(&mut state, "Alice", Faction::Unassigned);
+        apply_command(
+            &mut state,
+            Command::SubmitInterestLevel {
+                player: alice,
+                level: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.interest_level(alice), Some(7));
+    }
+
+    #[test]
+    fn submit_interest_level_rejects_an_unknown_player() {
+        let mut state = GameState::new();
+        let result = apply_command(
+            &mut state,
+            Command::SubmitInterestLevel {
+                player: PlayerId(0),
+                level: 7,
+            },
+        );
+        assert_eq!(result, Err(GameError::UnknownPlayer(PlayerId(0))));
+    }
+
+    #[test]
+    fn submit_interest_level_rejects_zero() {
+        let mut state = GameState::new();
+        let alice = add_player(&mut state, "Alice", Faction::Unassigned);
+        let result = apply_command(
+            &mut state,
+            Command::SubmitInterestLevel {
+                player: alice,
+                level: 0,
+            },
+        );
+        assert_eq!(result, Err(GameError::InterestLevelOutOfRange(0)));
+        assert_eq!(state.interest_level(alice), None);
+    }
+
+    #[test]
+    fn submit_interest_level_rejects_above_ten() {
+        let mut state = GameState::new();
+        let alice = add_player(&mut state, "Alice", Faction::Unassigned);
+        let result = apply_command(
+            &mut state,
+            Command::SubmitInterestLevel {
+                player: alice,
+                level: 11,
+            },
+        );
+        assert_eq!(result, Err(GameError::InterestLevelOutOfRange(11)));
+    }
+
+    #[test]
+    fn resubmitting_an_interest_level_silently_replaces_the_earlier_one() {
+        let mut state = GameState::new();
+        let alice = add_player(&mut state, "Alice", Faction::Unassigned);
+        apply_command(
+            &mut state,
+            Command::SubmitInterestLevel {
+                player: alice,
+                level: 3,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitInterestLevel {
+                player: alice,
+                level: 9,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.interest_level(alice), Some(9));
     }
 
     #[test]

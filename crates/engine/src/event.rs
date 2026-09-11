@@ -45,6 +45,13 @@ pub enum DomainEvent {
         player: PlayerId,
         bio: Bio,
     },
+    /// rules.md §1's signup interest rating -- feeds `raffle::ticket_count`.
+    InterestLevelSubmitted {
+        player: PlayerId,
+        level: u8,
+    },
+    /// See `Command::CloseRaffle`'s doc comment.
+    RaffleClosed,
     Converted {
         converter: PlayerId,
         target: PlayerId,

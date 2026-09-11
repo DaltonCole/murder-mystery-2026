@@ -175,6 +175,20 @@ pub struct PlayerView {
     /// `task_candidates` below -- is the only thing that actually needs
     /// to surface bio content to other people.
     pub own_bio: Option<Bio>,
+    /// The viewer's own signup interest rating (rules.md §1), once
+    /// submitted -- never another player's, and never populated for
+    /// Host/Display. Lets `/play` show a player what they rated themselves
+    /// before the raffle runs.
+    pub own_interest_level: Option<u8>,
+    /// Every player's signup interest rating submitted so far, as
+    /// `(PlayerId, level)` pairs -- `Viewer::Host` ONLY, always empty for
+    /// `Viewer::Player`/`Viewer::Display`. This is the raw input the Host
+    /// needs to actually run the setup raffle (`crate::raffle`): compute
+    /// tickets, draw winners, then commit them via `AssignCharacter`. Not
+    /// exposed to players -- rules.md never asks for interest ratings to be
+    /// public, and revealing them would tip off who's angling for which
+    /// role before the raffle even runs.
+    pub interest_levels: Vec<(PlayerId, u8)>,
     /// The bio-derived task pool (`bio::task_candidates`), one list per
     /// tier -- `Viewer::Host` ONLY. Round 1's "exactly 2 fixed tasks"
     /// (rules.md §4) don't come from here; this is for Rounds 3/5's
@@ -302,6 +316,12 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     };
     let gallery_resolved = matches!(viewer, Viewer::Host) && state.gallery_resolved();
     let own_bio = viewer_id.and_then(|id| state.bio(id)).cloned();
+    let own_interest_level = viewer_id.and_then(|id| state.interest_level(id));
+    let interest_levels = if matches!(viewer, Viewer::Host) {
+        state.interest_levels().collect()
+    } else {
+        Vec::new()
+    };
     let task_candidates = if matches!(viewer, Viewer::Host) {
         [TaskTier::Easy, TaskTier::Medium, TaskTier::Hard]
             .into_iter()
@@ -349,6 +369,8 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         gallery_resolved,
         whistledown: crate::whistledown::posts(state),
         own_bio,
+        own_interest_level,
+        interest_levels,
         task_candidates,
         finale_reveal: finale_reveal_for_host,
         finale_cast_out_reveal,
@@ -1618,6 +1640,74 @@ mod tests {
         );
         assert_eq!(view_for(&state, Viewer::Host).own_bio, None);
         assert_eq!(view_for(&state, Viewer::Display).own_bio, None);
+    }
+
+    #[test]
+    fn own_interest_level_is_visible_only_to_its_own_player() {
+        let mut state = GameState::new();
+        let alice = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Alice".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+        apply_command(
+            &mut state,
+            Command::SubmitInterestLevel {
+                player: alice,
+                level: 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            view_for(&state, Viewer::Player(alice)).own_interest_level,
+            Some(8)
+        );
+        assert_eq!(view_for(&state, Viewer::Host).own_interest_level, None);
+        assert_eq!(view_for(&state, Viewer::Display).own_interest_level, None);
+    }
+
+    #[test]
+    fn interest_levels_are_visible_to_the_host_only() {
+        let mut state = GameState::new();
+        let alice = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Alice".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+        apply_command(
+            &mut state,
+            Command::SubmitInterestLevel {
+                player: alice,
+                level: 9,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            view_for(&state, Viewer::Host).interest_levels,
+            vec![(alice, 9)]
+        );
+        assert!(view_for(&state, Viewer::Player(alice))
+            .interest_levels
+            .is_empty());
+        assert!(view_for(&state, Viewer::Display).interest_levels.is_empty());
     }
 
     #[test]

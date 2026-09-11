@@ -179,4 +179,7 @@ pub enum GameError {
 
     #[error("bio field {field} is {len} characters, over rules.md's 32-character cap")]
     BioFieldTooLong { field: &'static str, len: usize },
+
+    #[error("interest level {0} is outside rules.md §1's 1-10 range")]
+    InterestLevelOutOfRange(u8),
 }
