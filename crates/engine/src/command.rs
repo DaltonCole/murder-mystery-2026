@@ -218,10 +218,16 @@ pub enum Command {
     /// prompt -- never sent to any client, only consulted inside
     /// `attempt_task`. Assigns the next `TaskId` in creation order; the
     /// caller does not choose the ID.
+    ///
+    /// `expected_code`, if set, makes this a *location* task instead (see
+    /// `TaskDef`'s doc comment): `qualifying_players` should be left empty
+    /// in that case, and the task is completed via `AttemptLocationTask`
+    /// rather than `AttemptTask`.
     PushTask {
         prompt: String,
         tier: TaskTier,
         qualifying_players: BTreeSet<PlayerId>,
+        expected_code: Option<String>,
     },
 
     /// Locks every currently-open task against further attempts (rules.md
@@ -242,6 +248,31 @@ pub enum Command {
         player: PlayerId,
         task: TaskId,
         named: [PlayerId; 3],
+    },
+
+    /// `player`'s attempt at a *location* task (rules.md §4: a medium task
+    /// states the location plainly, a hard task riddles it) -- credited
+    /// only if `code` matches (trimmed, case-insensitive) the code
+    /// physically placed at that location. Rejected outright if `task`
+    /// isn't a location task at all (use `AttemptTask` for those). One
+    /// attempt per player per task, same as `AttemptTask`, and the same
+    /// "one shot" shape by design: *any* submitted code -- right or wrong
+    /// -- consumes it, rather than allowing free retries, so a wrong guess
+    /// is final exactly like a wrong `named` guess already is.
+    ///
+    /// The correct code is never derived from anything the engine can see
+    /// -- it's supplied whole by the caller when the task is pushed
+    /// (`PushTask`'s `expected_code`), and that caller (`app`) keeps it
+    /// out of reach of the client bundle entirely, not merely off the
+    /// wire: unlike `qualifying_players` (safe to compute engine-side from
+    /// bios already in `GameState`), a location's code is authored,
+    /// physical content that must never be compiled into the WASM served
+    /// to every player's browser -- see `game_server`'s location-task
+    /// handling in the `app` crate.
+    AttemptLocationTask {
+        player: PlayerId,
+        task: TaskId,
+        code: String,
     },
 
     // --- Phase 2: info-check family + the Deceiver's falsify pipeline

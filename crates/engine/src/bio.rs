@@ -366,6 +366,7 @@ mod tests {
                 prompt: chess.prompt.clone(),
                 tier: TaskTier::Medium,
                 qualifying_players: chess.qualifying_players.iter().copied().collect(),
+                expected_code: None,
             },
         )
         .unwrap();

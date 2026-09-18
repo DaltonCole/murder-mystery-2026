@@ -166,6 +166,7 @@ impl PlayerBot {
                 Some(ServerMsg::View(view)) => self.react(&view).await?,
                 Some(ServerMsg::Failed { .. }) => {}
                 Some(ServerMsg::Joined { .. }) => {}
+                Some(ServerMsg::LocationTaskTemplates(_)) => {}
                 None => return Ok(()),
             }
         }
@@ -195,16 +196,43 @@ impl PlayerBot {
             self.medic_declared_this_denouncement = false;
         }
         for task in &view.open_tasks {
-            if task.my_outcome.is_none() {
-                if let Some(named) = pick_three_others(&view.roster, self.id, &mut self.rng) {
-                    self.conn
-                        .send(&ClientMsg::Do(Command::AttemptTask {
-                            player: self.id,
-                            task: task.id,
-                            named,
-                        }))
-                        .await?;
-                }
+            if task.my_outcome.is_some() {
+                continue;
+            }
+            if task.is_location_task {
+                // Real coverage of `AttemptLocationTask`, not a blind
+                // guess: this crate knows its own `TEST_LOCATION_TASKS`
+                // list (matched by prompt, since that's public -- see its
+                // own doc comment for why the code itself is still safe to
+                // keep right there, unlike the real app's). ~20% submit a
+                // deliberately wrong code instead, so the suite exercises
+                // the `credited: false` / one-shot-consumed path too, not
+                // just the happy one.
+                let Some(&(_, _, code)) = crate::host::TEST_LOCATION_TASKS
+                    .iter()
+                    .find(|&&(_, prompt, _)| prompt == task.prompt)
+                else {
+                    continue;
+                };
+                let submitted = if self.rng.random_range(0..5) == 0 {
+                    "deliberately wrong code".to_string()
+                } else {
+                    code.to_string()
+                };
+                self.send(Command::AttemptLocationTask {
+                    player: self.id,
+                    task: task.id,
+                    code: submitted,
+                })
+                .await?;
+            } else if let Some(named) = pick_three_others(&view.roster, self.id, &mut self.rng) {
+                self.conn
+                    .send(&ClientMsg::Do(Command::AttemptTask {
+                        player: self.id,
+                        task: task.id,
+                        named,
+                    }))
+                    .await?;
             }
         }
         // `react_to_denouncement`/the task loop above are naturally safe

@@ -48,6 +48,31 @@ pub struct HostDriver {
     url: String,
 }
 
+/// This crate's own stand-in for rules.md §4's location tasks (medium:
+/// location stated plainly; hard: a riddle) -- `(tier, prompt, code)`,
+/// deliberately separate content from the real app's own
+/// `game_server::LOCATION_TASKS`, mirroring how `SAMPLE_HOBBIES` etc. in
+/// `player_bot.rs` are this crate's own test content, not real game
+/// content. Safe to keep the code right here (unlike the real app's,
+/// which is server-only specifically to keep it out of the WASM client
+/// bundle -- see that constant's doc comment): this crate is a native
+/// test/dev tool no player's browser ever loads, so there's no bundle for
+/// it to leak into. `PlayerBot::react_to_standing_choices` reads this same
+/// list to submit the correct code, exercising `AttemptLocationTask` for
+/// real over the wire.
+pub(crate) const TEST_LOCATION_TASKS: &[(TaskTier, &str, &str)] = &[
+    (
+        TaskTier::Medium,
+        "Find the code taped under the coat check counter.",
+        "TESTCODE-COATCHECK",
+    ),
+    (
+        TaskTier::Hard,
+        "Where the night's first drink was poured, but the bottles never empty -- what's on the inside of the cabinet door?",
+        "TESTCODE-BAR",
+    ),
+];
+
 /// The four raffle-won titles, for a caller to sanity-check the setup
 /// raffle's outcome without re-deriving it. `None` only in a pathologically
 /// tiny on-time pool (fewer than 4 players) that couldn't fill every major
@@ -252,6 +277,7 @@ impl HostDriver {
                         prompt: prompt.into(),
                         tier,
                         qualifying_players: qualifier.into_iter().collect(),
+                        expected_code: None,
                     },
                     |v| v.open_tasks.len() >= pushed,
                     Duration::from_secs(10),
@@ -293,6 +319,30 @@ impl HostDriver {
                         prompt: candidate.prompt,
                         tier,
                         qualifying_players: candidate.qualifying_players.into_iter().collect(),
+                        expected_code: None,
+                    },
+                    |v| v.open_tasks.len() >= pushed,
+                    Duration::from_secs(10),
+                    "task count increasing after PushTask",
+                )
+                .await?;
+        }
+        // rules.md §4's location tasks (medium: location stated plainly;
+        // hard: a riddle), pushed alongside the bio-derived ones rather
+        // than replacing them -- extra content in the same task-phase
+        // window. `PlayerBot::react_to_standing_choices` knows this same
+        // list (bots crate only -- it never ships to the real WASM client,
+        // see `TEST_LOCATION_TASKS`'s own doc comment) to submit the
+        // correct code for real coverage of `AttemptLocationTask`.
+        for &(tier, prompt, code) in TEST_LOCATION_TASKS {
+            pushed += 1;
+            self.conn
+                .do_cmd_until(
+                    Command::PushTask {
+                        prompt: prompt.into(),
+                        tier,
+                        qualifying_players: BTreeSet::new(),
+                        expected_code: Some(code.into()),
                     },
                     |v| v.open_tasks.len() >= pushed,
                     Duration::from_secs(10),

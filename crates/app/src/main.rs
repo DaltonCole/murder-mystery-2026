@@ -25,7 +25,8 @@
 //!   `CloseBallot`, `CloseRunoff`, `PushTask`, `CloseTasks`) can be issued
 //!   from a raw connection to `/api/ws` regardless of which route it came
 //!   through -- nothing distinguishes a Host console's socket from a
-//!   Player's.
+//!   Player's. The same is true of the two host-only `ClientMsg` variants
+//!   that aren't plain `Command`s either (`RunRaffle`, `PushLocationTask`).
 //!
 //! Real per-player join tokens and a real Host credential (see the plan's
 //! "Session" section) must land before this runs at a real event over
@@ -120,13 +121,29 @@ enum ClientMsg {
     /// `game_server::run_raffle`'s doc comment on "randomness at the
     /// boundary"), which only exists server-side.
     RunRaffle,
+    /// `/host` only: pushes `game_server::LOCATION_TASKS[index]` as a real
+    /// task. Not a plain `Command` either -- the code that task carries
+    /// only exists server-side (see `game_server::push_location_task`'s
+    /// doc comment), so the Host browser can only ever refer to a template
+    /// by index, never construct the `PushTask` itself.
+    PushLocationTask { index: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ServerMsg {
-    Joined { player: PlayerId },
+    Joined {
+        player: PlayerId,
+    },
     View(PlayerView),
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
+    /// `/host` only, sent once right after a `Watch(Viewer::Host)`
+    /// succeeds: the safe (tier, prompt) subset of every pre-authored
+    /// location task template, for the Host's "push" picker -- see
+    /// `game_server::location_task_templates`'s doc comment for why the
+    /// code itself never rides along.
+    LocationTaskTemplates(Vec<(usize, TaskTier, String)>),
 }
 
 #[get("/api/ws")]
@@ -175,7 +192,23 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         }
                         ClientMsg::Watch(v) => {
                             viewer = Some(v);
-                            socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
+                            let sent_view = socket.send(ServerMsg::View(game_server::view(v))).await.is_ok();
+                            // The Host's location-task picker needs the safe
+                            // template metadata once, right after it starts
+                            // watching -- see `ServerMsg::LocationTaskTemplates`'s
+                            // doc comment for why this doesn't ride along
+                            // inside `PlayerView` itself.
+                            let sent_templates = if matches!(v, Viewer::Host) {
+                                socket
+                                    .send(ServerMsg::LocationTaskTemplates(
+                                        game_server::location_task_templates(),
+                                    ))
+                                    .await
+                                    .is_ok()
+                            } else {
+                                true
+                            };
+                            sent_view && sent_templates
                         }
                         ClientMsg::Do(cmd) => match game_server::apply(cmd) {
                             Ok(_) => {
@@ -205,6 +238,22 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                 .await
                                 .is_ok(),
                         },
+                        ClientMsg::PushLocationTask { index } => {
+                            match game_server::push_location_task(index) {
+                                Ok(_) => {
+                                    drain_self_echo(&mut changed);
+                                    if let Some(v) = viewer {
+                                        socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
+                                    } else {
+                                        true
+                                    }
+                                }
+                                Err(e) => socket
+                                    .send(ServerMsg::Failed { error: e })
+                                    .await
+                                    .is_ok(),
+                            }
+                        }
                     };
                     if !sent_ok {
                         break;
@@ -241,6 +290,10 @@ fn Play() -> Element {
                     error.set(None);
                 }
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
+                // `/play` never watches as `Viewer::Host`, so this never
+                // actually arrives here -- see `ServerMsg::LocationTaskTemplates`'s
+                // doc comment.
+                Ok(ServerMsg::LocationTaskTemplates(_)) => {}
                 Err(_) => break,
             }
         }
@@ -448,12 +501,21 @@ fn Play() -> Element {
             on_command: send_cmd,
         }
         for task in v.open_tasks.clone() {
-            TaskAttemptForm {
-                key: "{task.id.0}",
-                my_id: id,
-                task,
-                roster: v.roster.clone(),
-                on_command: send_cmd,
+            if task.is_location_task {
+                LocationTaskAttemptForm {
+                    key: "{task.id.0}",
+                    my_id: id,
+                    task,
+                    on_command: send_cmd,
+                }
+            } else {
+                TaskAttemptForm {
+                    key: "{task.id.0}",
+                    my_id: id,
+                    task,
+                    roster: v.roster.clone(),
+                    on_command: send_cmd,
+                }
             }
         }
     }
@@ -1082,12 +1144,57 @@ fn TaskAttemptForm(
     }
 }
 
+/// rules.md §4's location tasks (medium: the location stated plainly;
+/// hard: a riddle as to where it is) -- credited once the player enters
+/// the code physically placed there (`Command::AttemptLocationTask`,
+/// checked trimmed/case-insensitive). Doesn't take a `roster` the way
+/// `TaskAttemptForm` does -- there's no one to name, just a code to type.
+#[component]
+fn LocationTaskAttemptForm(
+    my_id: PlayerId,
+    task: TaskView,
+    on_command: EventHandler<Command>,
+) -> Element {
+    if let Some(credited) = task.my_outcome {
+        return rsx! {
+            div {
+                h4 { "{task.prompt} ({task.tier:?})" }
+                p { if credited { "Correct code -- completed!" } else { "Wrong code -- that attempt is used up." } }
+            }
+        };
+    }
+
+    let mut code = use_signal(String::new);
+    let task_id = task.id;
+
+    rsx! {
+        div {
+            h4 { "{task.prompt} ({task.tier:?})" }
+            p { "Find the code at the location and enter it below. You only get one attempt, so double-check it before submitting." }
+            input {
+                placeholder: "Code",
+                value: "{code}",
+                oninput: move |e| code.set(e.value()),
+            }
+            button {
+                disabled: code().trim().is_empty(),
+                onclick: move |_| {
+                    let code = code.peek().trim().to_string();
+                    on_command.call(Command::AttemptLocationTask { player: my_id, task: task_id, code });
+                },
+                "Submit code"
+            }
+        }
+    }
+}
+
 // --- /host -----------------------------------------------------------------
 
 #[component]
 fn Host() -> Element {
     let mut view = use_signal(|| None::<PlayerView>);
     let mut error = use_signal(|| None::<String>);
+    let mut location_task_templates = use_signal(Vec::<(usize, TaskTier, String)>::new);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
@@ -1100,6 +1207,9 @@ fn Host() -> Element {
                 }
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
                 Ok(ServerMsg::Joined { .. }) => {}
+                Ok(ServerMsg::LocationTaskTemplates(templates)) => {
+                    location_task_templates.set(templates);
+                }
                 // The connection is gone -- stop polling it. Without this,
                 // a closed socket makes `recv()` return `Err` immediately
                 // on every call forever, spinning this loop with no yield
@@ -1122,6 +1232,12 @@ fn Host() -> Element {
         let socket = socket;
         spawn(async move {
             let _ = socket.send(ClientMsg::RunRaffle).await;
+        });
+    };
+    let push_location_task = move |index: usize| {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::PushLocationTask { index }).await;
         });
     };
 
@@ -1293,12 +1409,22 @@ fn Host() -> Element {
                                         prompt: candidate.prompt.clone(),
                                         tier,
                                         qualifying_players: candidate.qualifying_players.iter().copied().collect(),
+                                        expected_code: None,
                                     });
                                 }
                             },
                             "{candidate.prompt}"
                         }
                     }
+                }
+            }
+            h4 { "Location tasks (rules.md §4: talk to someone at a place)" }
+            p { "Medium states the location plainly; hard is a riddle -- both are credited once the player enters the code you've physically placed there." }
+            for (index , tier , prompt) in location_task_templates() {
+                button {
+                    key: "{index}",
+                    onclick: move |_| push_location_task(index),
+                    "[{tier:?}] {prompt}"
                 }
             }
             h4 { "Manual entry (Round 1's fixed tasks, or a fallback)" }
@@ -1335,6 +1461,7 @@ fn Host() -> Element {
                         prompt,
                         tier: task_tier(),
                         qualifying_players: [PlayerId(qualifier)].into_iter().collect(),
+                        expected_code: None,
                     });
                     task_prompt.set(String::new());
                 },
@@ -1660,7 +1787,11 @@ fn Display() -> Element {
         loop {
             match socket.recv().await {
                 Ok(ServerMsg::View(v)) => view.set(Some(v)),
-                Ok(ServerMsg::Failed { .. } | ServerMsg::Joined { .. }) => {}
+                Ok(
+                    ServerMsg::Failed { .. }
+                    | ServerMsg::Joined { .. }
+                    | ServerMsg::LocationTaskTemplates(_),
+                ) => {}
                 // See the identical comment in `Host` -- without this, a
                 // closed connection spins this loop forever with no yield.
                 Err(_) => break,

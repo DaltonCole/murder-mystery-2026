@@ -73,7 +73,8 @@ pub enum DenouncementView {
 }
 
 /// A viewer-safe projection of one open task. Never carries
-/// `qualifying_players` -- see the doc comment on [`crate::task::TaskDef`].
+/// `qualifying_players` or `expected_code` -- see the doc comment on
+/// [`crate::task::TaskDef`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
     pub id: TaskId,
@@ -83,6 +84,13 @@ pub struct TaskView {
     /// attempted this task; `None` if not yet attempted. Always `None` for
     /// Host/Display, who don't attempt tasks themselves.
     pub my_outcome: Option<bool>,
+    /// Which command completes this task: `true` for `AttemptLocationTask`
+    /// (enter the code found at the location), `false` for the ordinary
+    /// `AttemptTask` (name 3 people you talked to). Safe to expose --
+    /// unlike the code/qualifying-set themselves, knowing *which kind* of
+    /// task this is reveals nothing a player doesn't already see in
+    /// `prompt` once it's pushed.
+    pub is_location_task: bool,
 }
 
 /// What a single connection is allowed to see, fully pre-filtered
@@ -277,6 +285,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
             prompt: def.prompt.clone(),
             tier: def.tier,
             my_outcome: viewer_id.and_then(|viewer_id| state.task_attempt(viewer_id, def.id)),
+            is_location_task: def.expected_code.is_some(),
         })
         .collect();
 
@@ -792,6 +801,7 @@ mod tests {
                 prompt: "Talk to someone wearing red".into(),
                 tier: crate::task::TaskTier::Easy,
                 qualifying_players: [PlayerId(1)].into_iter().collect(),
+                expected_code: None,
             },
         )
         .unwrap();
@@ -841,6 +851,7 @@ mod tests {
                 prompt: "Talk to someone wearing red".into(),
                 tier: crate::task::TaskTier::Easy,
                 qualifying_players: [PlayerId(1)].into_iter().collect(),
+                expected_code: None,
             },
         )
         .unwrap();
@@ -857,6 +868,53 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn location_tasks_are_flagged_in_the_view_but_never_leak_the_code() {
+        let mut state = three_player_state();
+        apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "Talk to someone wearing red".into(),
+                tier: crate::task::TaskTier::Easy,
+                qualifying_players: [PlayerId(1)].into_iter().collect(),
+                expected_code: None,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "Find the code at the bar".into(),
+                tier: crate::task::TaskTier::Hard,
+                qualifying_players: std::collections::BTreeSet::new(),
+                expected_code: Some("SUPER SECRET CODE".into()),
+            },
+        )
+        .unwrap();
+
+        let view = view_for(&state, Viewer::Player(PlayerId(0)));
+        let talk_task = view
+            .open_tasks
+            .iter()
+            .find(|t| t.prompt == "Talk to someone wearing red")
+            .unwrap();
+        let location_task = view
+            .open_tasks
+            .iter()
+            .find(|t| t.prompt == "Find the code at the bar")
+            .unwrap();
+        assert!(!talk_task.is_location_task);
+        assert!(location_task.is_location_task);
+
+        for viewer in [Viewer::Player(PlayerId(0)), Viewer::Host, Viewer::Display] {
+            let serialized = serde_json::to_string(&view_for(&state, viewer)).unwrap();
+            assert!(
+                !serialized.contains("SUPER SECRET CODE"),
+                "a view leaked the location task's code: {serialized}"
+            );
+        }
     }
 
     // --- Phase 2 ---

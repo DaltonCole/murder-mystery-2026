@@ -14,7 +14,7 @@
 
 use engine::{
     apply_command, raffle_priority, raffle_winners, ticket_count, ticket_slots, view_for, Command,
-    DomainEvent, Faction, GameError, GameState, PlayerId, PlayerView, Viewer,
+    DomainEvent, Faction, GameError, GameState, PlayerId, PlayerView, TaskTier, Viewer,
 };
 use rand::seq::SliceRandom;
 use std::collections::{BTreeMap, BTreeSet};
@@ -127,6 +127,63 @@ pub fn run_raffle() -> Result<Vec<DomainEvent>, GameError> {
     // to ignore, there's just nobody waiting to be told.
     let _ = server().changed.send(());
     Ok(events)
+}
+
+/// rules.md §4's pre-authored location tasks (medium: the location stated
+/// plainly; hard: a riddle as to where it is) -- `(tier, prompt, code)`.
+///
+/// *** EDIT THIS before game night *** with the real venue's locations,
+/// riddles, and the codes physically placed there -- these are placeholder
+/// examples, not real content.
+///
+/// Deliberately lives *only* here, server-only (`game_server` is compiled
+/// under the `server` feature alone -- see `main.rs`'s module doc
+/// comment), never in `engine` or anywhere `main.rs`'s `web` feature build
+/// reaches: `engine` is a dependency of the WASM client bundle served to
+/// every player's browser, so any code stored there would ship straight
+/// into that bundle, trivially extractable via devtools -- defeating the
+/// entire point of a *physical* location task. The Host browser only ever
+/// learns the safe subset (tier + prompt, via `location_task_templates`)
+/// and pushes by index (`push_location_task`); the code itself never
+/// leaves this server process.
+const LOCATION_TASKS: &[(TaskTier, &str, &str)] = &[
+    (
+        TaskTier::Medium,
+        "Head to the coat check and find the code taped underneath the counter.",
+        "CHANGE_ME_COATCHECK",
+    ),
+    (
+        TaskTier::Hard,
+        "Where the night's first drink was poured, but the bottles never empty -- what's written on the inside of the cabinet door?",
+        "CHANGE_ME_BAR",
+    ),
+];
+
+/// The safe subset of `LOCATION_TASKS` for the Host browser to render a
+/// picker from -- index (to push by) plus tier and prompt, never the code.
+pub fn location_task_templates() -> Vec<(usize, TaskTier, String)> {
+    LOCATION_TASKS
+        .iter()
+        .enumerate()
+        .map(|(i, &(tier, prompt, _code))| (i, tier, prompt.to_string()))
+        .collect()
+}
+
+/// Pushes `LOCATION_TASKS[index]` as a real, open `TaskDef` (via the
+/// ordinary `Command::PushTask`, same as every other task) -- the Host
+/// console's per-template "push" button. `String` error (not `GameError`)
+/// since an out-of-range index is an app-level mistake, not a domain one.
+pub fn push_location_task(index: usize) -> Result<Vec<DomainEvent>, String> {
+    let &(tier, prompt, code) = LOCATION_TASKS
+        .get(index)
+        .ok_or_else(|| format!("no location task at index {index}"))?;
+    apply(Command::PushTask {
+        prompt: prompt.to_string(),
+        tier,
+        qualifying_players: BTreeSet::new(),
+        expected_code: Some(code.to_string()),
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// The single read path every route uses -- never hands out a raw

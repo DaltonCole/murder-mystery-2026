@@ -182,4 +182,10 @@ pub enum GameError {
 
     #[error("interest level {0} is outside rules.md §1's 1-10 range")]
     InterestLevelOutOfRange(u8),
+
+    #[error("task {0:?} is a location task -- use AttemptLocationTask, not AttemptTask")]
+    NotATalkTask(TaskId),
+
+    #[error("task {0:?} is not a location task -- use AttemptTask, not AttemptLocationTask")]
+    NotALocationTask(TaskId),
 }

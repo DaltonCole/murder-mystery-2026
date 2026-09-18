@@ -911,7 +911,8 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             prompt,
             tier,
             qualifying_players,
-        } => push_task(state, prompt, tier, qualifying_players),
+            expected_code,
+        } => push_task(state, prompt, tier, qualifying_players, expected_code),
 
         Command::CloseTasks => close_tasks(state),
 
@@ -920,6 +921,10 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             task,
             named,
         } => attempt_task(state, player, task, named)?,
+
+        Command::AttemptLocationTask { player, task, code } => {
+            attempt_location_task(state, player, task, code)?
+        }
 
         Command::UseOracle { player, target } => use_oracle(state, player, target)?,
         Command::UseAlmanac { player } => use_almanac(state, player)?,
@@ -1862,6 +1867,7 @@ fn push_task(
     prompt: String,
     tier: TaskTier,
     qualifying_players: BTreeSet<PlayerId>,
+    expected_code: Option<String>,
 ) -> Vec<DomainEvent> {
     let id = TaskId(state.next_task_id);
     state.next_task_id += 1;
@@ -1872,6 +1878,7 @@ fn push_task(
             prompt: prompt.clone(),
             tier,
             qualifying_players,
+            expected_code,
         },
     );
     state.open_tasks.insert(id);
@@ -2158,6 +2165,9 @@ fn attempt_task(
         return Err(GameError::NotActive(player));
     }
     let def = state.tasks.get(&task).ok_or(GameError::UnknownTask(task))?;
+    if def.expected_code.is_some() {
+        return Err(GameError::NotATalkTask(task));
+    }
     if !state.open_tasks.contains(&task) {
         return Err(GameError::TaskNotOpen(task));
     }
@@ -2177,19 +2187,8 @@ fn attempt_task(
         }
     }
 
-    let mut credited = named.iter().any(|id| def.qualifying_players.contains(id));
-
-    // Normal Ton's reactive safety-net (rules.md §3.1): a failed attempt is
-    // silently upgraded to a success once per game, rather than the player
-    // having to invoke a separate command -- there's no "declare I'm using
-    // my auto-succeed" moment in rules.md, just an automatic backstop.
-    if !credited
-        && state.players.get(&player).and_then(|p| p.character) == Some(Character::NormalTon)
-        && !state.normal_ton_auto_succeed_used.contains(&player)
-    {
-        credited = true;
-        state.normal_ton_auto_succeed_used.insert(player);
-    }
+    let credited = named.iter().any(|id| def.qualifying_players.contains(id));
+    let credited = apply_normal_ton_auto_succeed(state, player, credited);
 
     state.task_attempts.insert((player, task), credited);
     Ok(vec![DomainEvent::TaskAttempted {
@@ -2197,6 +2196,59 @@ fn attempt_task(
         task,
         credited,
     }])
+}
+
+/// `AttemptLocationTask`'s validation + credit -- the same shape as
+/// `attempt_task` (active player, task exists/open, one attempt per
+/// player-task) minus the named-players machinery, plus the location
+/// task's own precondition and comparison. See `Command::AttemptLocationTask`'s
+/// doc comment for why *any* submitted code, right or wrong, is final.
+fn attempt_location_task(
+    state: &mut GameState,
+    player: PlayerId,
+    task: TaskId,
+    code: String,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    let def = state.tasks.get(&task).ok_or(GameError::UnknownTask(task))?;
+    let Some(expected) = def.expected_code.as_deref() else {
+        return Err(GameError::NotALocationTask(task));
+    };
+    if !state.open_tasks.contains(&task) {
+        return Err(GameError::TaskNotOpen(task));
+    }
+    if state.task_attempts.contains_key(&(player, task)) {
+        return Err(GameError::AlreadyAttemptedTask { player, task });
+    }
+
+    let credited = code.trim().eq_ignore_ascii_case(expected.trim());
+    let credited = apply_normal_ton_auto_succeed(state, player, credited);
+
+    state.task_attempts.insert((player, task), credited);
+    Ok(vec![DomainEvent::TaskAttempted {
+        player,
+        task,
+        credited,
+    }])
+}
+
+/// Normal Ton's reactive safety-net (rules.md §3.1): a failed task attempt
+/// is silently upgraded to a success once per game, rather than the player
+/// having to invoke a separate command -- there's no "declare I'm using my
+/// auto-succeed" moment in rules.md, just an automatic backstop. Shared
+/// between `attempt_task` and `attempt_location_task` since the rule
+/// doesn't care which task mechanic just failed.
+fn apply_normal_ton_auto_succeed(state: &mut GameState, player: PlayerId, credited: bool) -> bool {
+    if !credited
+        && state.players.get(&player).and_then(|p| p.character) == Some(Character::NormalTon)
+        && !state.normal_ton_auto_succeed_used.contains(&player)
+    {
+        state.normal_ton_auto_succeed_used.insert(player);
+        return true;
+    }
+    credited
 }
 
 /// Shared precondition for every Phase 2 ability command: the actor must be
@@ -5236,6 +5288,7 @@ mod tests {
                 prompt: prompt.into(),
                 tier,
                 qualifying_players: qualifying.iter().copied().collect(),
+                expected_code: None,
             },
         )
         .unwrap();
@@ -5243,6 +5296,277 @@ mod tests {
             [DomainEvent::TaskPushed { id, .. }] => *id,
             other => panic!("expected a single TaskPushed event, got {other:?}"),
         }
+    }
+
+    fn push_location_task(
+        state: &mut GameState,
+        prompt: &str,
+        tier: TaskTier,
+        code: &str,
+    ) -> TaskId {
+        let events = apply_command(
+            state,
+            Command::PushTask {
+                prompt: prompt.into(),
+                tier,
+                qualifying_players: BTreeSet::new(),
+                expected_code: Some(code.into()),
+            },
+        )
+        .unwrap();
+        match events.as_slice() {
+            [DomainEvent::TaskPushed { id, .. }] => *id,
+            other => panic!("expected a single TaskPushed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attempt_location_task_credits_on_the_exact_code() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let task = push_location_task(
+            &mut state,
+            "Find the code at the bar",
+            TaskTier::Hard,
+            "OPEN SESAME",
+        );
+        let events = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task,
+                code: "OPEN SESAME".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![DomainEvent::TaskAttempted {
+                player: everyone[0],
+                task,
+                credited: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn attempt_location_task_code_comparison_is_trimmed_and_case_insensitive() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let task = push_location_task(
+            &mut state,
+            "Find the code at the bar",
+            TaskTier::Medium,
+            "Open Sesame",
+        );
+        let events = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task,
+                code: "  open sesame  ".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![DomainEvent::TaskAttempted {
+                player: everyone[0],
+                task,
+                credited: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn attempt_location_task_does_not_credit_a_wrong_code() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let task = push_location_task(
+            &mut state,
+            "Find the code at the bar",
+            TaskTier::Hard,
+            "OPEN SESAME",
+        );
+        let events = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task,
+                code: "wrong guess".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![DomainEvent::TaskAttempted {
+                player: everyone[0],
+                task,
+                credited: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn attempt_location_task_is_one_shot_even_on_a_wrong_guess() {
+        // Matches `AttemptTask`'s existing one-shot shape exactly: any
+        // submitted code, right or wrong, consumes the attempt -- no free
+        // retries.
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let task = push_location_task(
+            &mut state,
+            "Find the code at the bar",
+            TaskTier::Hard,
+            "OPEN SESAME",
+        );
+        apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task,
+                code: "wrong guess".into(),
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task,
+                code: "OPEN SESAME".into(),
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AlreadyAttemptedTask {
+                player: everyone[0],
+                task
+            })
+        );
+    }
+
+    #[test]
+    fn attempt_location_task_rejects_an_ordinary_talk_task() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
+        let result = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task,
+                code: "anything".into(),
+            },
+        );
+        assert_eq!(result, Err(GameError::NotALocationTask(task)));
+    }
+
+    #[test]
+    fn attempt_task_rejects_a_location_task() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let task = push_location_task(
+            &mut state,
+            "Find the code at the bar",
+            TaskTier::Hard,
+            "OPEN SESAME",
+        );
+        let result = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[0],
+                task,
+                named: [everyone[1], everyone[2], everyone[3]],
+            },
+        );
+        assert_eq!(result, Err(GameError::NotATalkTask(task)));
+    }
+
+    #[test]
+    fn attempt_location_task_rejects_an_inactive_player() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let task = push_location_task(
+            &mut state,
+            "Find the code at the bar",
+            TaskTier::Hard,
+            "OPEN SESAME",
+        );
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: everyone[0],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task,
+                code: "OPEN SESAME".into(),
+            },
+        );
+        assert_eq!(result, Err(GameError::NotActive(everyone[0])));
+    }
+
+    #[test]
+    fn attempt_location_task_rejects_an_unknown_task() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let result = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task: TaskId(9999),
+                code: "anything".into(),
+            },
+        );
+        assert_eq!(result, Err(GameError::UnknownTask(TaskId(9999))));
+    }
+
+    #[test]
+    fn attempt_location_task_rejects_a_closed_task() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let task = push_location_task(
+            &mut state,
+            "Find the code at the bar",
+            TaskTier::Hard,
+            "OPEN SESAME",
+        );
+        apply_command(&mut state, Command::CloseTasks).unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task,
+                code: "OPEN SESAME".into(),
+            },
+        );
+        assert_eq!(result, Err(GameError::TaskNotOpen(task)));
+    }
+
+    #[test]
+    fn attempt_location_task_lets_normal_ton_auto_succeed_once() {
+        let (mut state, p) = setup_phase2_game();
+        let task = push_location_task(
+            &mut state,
+            "Find the code at the bar",
+            TaskTier::Hard,
+            "OPEN SESAME",
+        );
+        let events = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: p.normal_ton,
+                task,
+                code: "wrong guess".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![DomainEvent::TaskAttempted {
+                player: p.normal_ton,
+                task,
+                credited: true,
+            }]
+        );
+        assert!(state.normal_ton_auto_succeed_used.contains(&p.normal_ton));
     }
 
     #[test]
@@ -7776,6 +8100,7 @@ mod tests {
                 prompt: "test".into(),
                 tier: TaskTier::Easy,
                 qualifying_players: BTreeSet::new(),
+                expected_code: None,
             },
         )
         .unwrap()[0]
@@ -7809,6 +8134,7 @@ mod tests {
                 prompt: "t1".into(),
                 tier: TaskTier::Easy,
                 qualifying_players: BTreeSet::new(),
+                expected_code: None,
             },
         )
         .unwrap()[0]
@@ -7822,6 +8148,7 @@ mod tests {
                 prompt: "t2".into(),
                 tier: TaskTier::Easy,
                 qualifying_players: BTreeSet::new(),
+                expected_code: None,
             },
         )
         .unwrap()[0]
@@ -7880,6 +8207,7 @@ mod tests {
                 prompt: "t".into(),
                 tier: TaskTier::Easy,
                 qualifying_players: BTreeSet::new(),
+                expected_code: None,
             },
         )
         .unwrap()[0]
@@ -9464,6 +9792,7 @@ mod tests {
                 prompt: "t".into(),
                 tier: TaskTier::Easy,
                 qualifying_players: BTreeSet::new(),
+                expected_code: None,
             },
         )
         .unwrap();
@@ -9500,6 +9829,7 @@ mod tests {
                 prompt: "t".into(),
                 tier: TaskTier::Easy,
                 qualifying_players: [member].into_iter().collect(),
+                expected_code: None,
             },
         )
         .unwrap()[0]
@@ -9554,6 +9884,7 @@ mod tests {
                 prompt: "t".into(),
                 tier: TaskTier::Easy,
                 qualifying_players: BTreeSet::new(),
+                expected_code: None,
             },
         )
         .unwrap();

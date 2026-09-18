@@ -11,7 +11,7 @@
 //! shows up immediately as a JSON deserialization failure at connect
 //! time, not a silent behavioral mismatch.
 
-use engine::{Command, PlayerId, PlayerView, Viewer};
+use engine::{Command, PlayerId, PlayerView, TaskTier, Viewer};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -28,9 +28,21 @@ pub enum ClientMsg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMsg {
-    Joined { player: PlayerId },
+    Joined {
+        player: PlayerId,
+    },
     View(PlayerView),
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
+    /// Mirrors `app`'s own `ServerMsg::LocationTaskTemplates`, sent
+    /// unconditionally once `HostDriver::connect` watches as `Viewer::Host`
+    /// -- this crate needs to at least *parse* it or every bots-driven
+    /// game's very first message would fail to deserialize, even though it
+    /// never actually reads the payload (it pushes location tasks straight
+    /// via `Command::PushTask` from its own `TEST_LOCATION_TASKS`, not the
+    /// real app's index-based picker).
+    LocationTaskTemplates(Vec<(usize, TaskTier, String)>),
 }
 
 #[derive(Debug)]
@@ -164,6 +176,9 @@ impl Conn {
                 }
                 Some(ServerMsg::Failed { error }) => return Err(ConnError::Rejected(error)),
                 Some(ServerMsg::Joined { .. }) => {}
+                // Never relevant to this crate -- see the variant's own
+                // doc comment for why it still has to be parseable.
+                Some(ServerMsg::LocationTaskTemplates(_)) => {}
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -182,6 +197,7 @@ impl Conn {
                 Some(ServerMsg::View(v)) => return Ok(v),
                 Some(ServerMsg::Failed { error }) => return Err(ConnError::Rejected(error)),
                 Some(ServerMsg::Joined { .. }) => continue,
+                Some(ServerMsg::LocationTaskTemplates(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -192,7 +208,9 @@ impl Conn {
         loop {
             match self.recv().await? {
                 Some(ServerMsg::View(v)) => return Ok(v),
-                Some(ServerMsg::Joined { .. }) | Some(ServerMsg::Failed { .. }) => continue,
+                Some(ServerMsg::Joined { .. })
+                | Some(ServerMsg::Failed { .. })
+                | Some(ServerMsg::LocationTaskTemplates(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -209,7 +227,7 @@ impl Conn {
             match self.recv().await? {
                 Some(ServerMsg::Joined { player }) => return Ok(player),
                 Some(ServerMsg::Failed { error }) => return Err(ConnError::Rejected(error)),
-                Some(ServerMsg::View(_)) => continue,
+                Some(ServerMsg::View(_)) | Some(ServerMsg::LocationTaskTemplates(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }

@@ -342,6 +342,7 @@ fn push_task(
             prompt: prompt.into(),
             tier,
             qualifying_players: qualifying.into_iter().collect(),
+            expected_code: None,
         },
     )?;
     match events.as_slice() {
