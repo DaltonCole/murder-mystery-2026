@@ -25,10 +25,10 @@ use tokio::sync::broadcast;
 struct GameServer {
     state: Mutex<GameState>,
     changed: broadcast::Sender<()>,
-    // Tracks which odd rounds' task phases have already been auto-pushed
-    // (see `auto_push_odd_round_tasks`) -- process-local, not persisted
-    // `GameState`, since it's purely an app-level "don't repeat this side
-    // effect" guard, not a fact about the game itself.
+    // Tracks which odd rounds' task phases have already been pushed (see
+    // `push_tasks_for_round`) -- process-local, not persisted `GameState`,
+    // since it's purely an app-level "don't repeat this side effect"
+    // guard, not a fact about the game itself.
     auto_tasks_pushed: Mutex<BTreeSet<Round>>,
 }
 
@@ -44,12 +44,12 @@ fn server() -> &'static GameServer {
     })
 }
 
-/// How many tasks to automatically push per tier -- `(easy, medium, hard)`
-/// -- when each odd round's task phase begins (rules.md §4: Rounds 1, 3, 5
-/// have tasks; 2 and 4 are contest rounds; see `auto_push_odd_round_tasks`).
-/// Round 1's count is fixed by rules.md itself ("exactly 2 fixed tasks, 1
-/// easy 1 medium"); Rounds 3 and 5 ramp up per Dalton's own game-night
-/// pacing call, not a rules.md quote.
+/// How many tasks to push per tier -- `(easy, medium, hard)` -- for each
+/// odd round's task phase (rules.md §4: Rounds 1, 3, 5 have tasks; 2 and 4
+/// are contest rounds; see `push_tasks_for_round`). Round 1's count is
+/// fixed by rules.md itself ("exactly 2 fixed tasks, 1 easy 1 medium");
+/// Rounds 3 and 5 ramp up per Dalton's own game-night pacing call, not a
+/// rules.md quote.
 ///
 /// *** EDIT THIS to retune pacing before game night -- no other code
 /// changes needed. ***
@@ -62,22 +62,12 @@ fn auto_task_counts(round: Round) -> (usize, usize, usize) {
     }
 }
 
-/// Automatically pushes each odd round's task phase (rules.md §4) the
-/// moment it begins, so the Host never has to hand-pick which bio-derived
-/// candidate to push from the "From player bios" panel -- a reliability/
-/// automation review found this was one of the last remaining points of
-/// necessary Host involvement in an otherwise-automated round flow. The
-/// manual per-candidate buttons and the free-text "Manual entry" fallback
-/// stay in the Host console regardless, for a live-event fix-up.
-///
-/// Triggered by scanning `events` (whatever command was just applied) for
-/// `DomainEvent::SetupFinalized` (Round 1) or `DomainEvent::RoundAdvanced`
-/// reaching `Round::Three`/`Round::Five` -- covers both ways
-/// `Command::FinalizeSetup` can be reached (`run_raffle`'s own internal
-/// call, or the Host's manual "Finalize setup" button) since both pass
-/// their resulting events through here. `pushed` guards against a
-/// legitimate repeat `FinalizeSetup` call (see that command's own doc
-/// comment) double-pushing Round 1's tasks.
+/// Pushes `round`'s configured tasks (see `auto_task_counts`), unless
+/// they've already been pushed (`pushed`, this process's own idempotency
+/// guard -- see `GameServer::auto_tasks_pushed`'s doc comment). Shared by
+/// both ways a round's tasks get pushed: automatically for Round 3/5 (see
+/// `auto_push_on_round_advance` below) and on-demand for Round 1 (see
+/// `start_round_one`).
 ///
 /// For each tier, shuffles `bio::task_candidates`'s pool with real,
 /// OS-backed entropy (the same "randomness at the boundary" shape as
@@ -86,21 +76,11 @@ fn auto_task_counts(round: Round) -> (usize, usize, usize) {
 /// however many distinct candidates actually exist, so a too-small bio
 /// pool (a tiny playtest game, or a tier nobody's bio happens to fill)
 /// just pushes fewer tasks rather than erroring.
-fn auto_push_odd_round_tasks(
+fn push_tasks_for_round(
     state: &mut GameState,
-    events: &[DomainEvent],
+    round: Round,
     pushed: &mut BTreeSet<Round>,
 ) -> Vec<DomainEvent> {
-    let round = events.iter().find_map(|e| match e {
-        DomainEvent::SetupFinalized => Some(Round::One),
-        DomainEvent::RoundAdvanced {
-            round: round @ (Round::Three | Round::Five),
-        } => Some(*round),
-        _ => None,
-    });
-    let Some(round) = round else {
-        return Vec::new();
-    };
     if !pushed.insert(round) {
         return Vec::new();
     }
@@ -132,6 +112,75 @@ fn auto_push_odd_round_tasks(
     new_events
 }
 
+/// Automatically pushes Round 3 or Round 5's task phase (rules.md §4) the
+/// moment `AdvanceRound` reaches it, so the Host never has to hand-pick
+/// which bio-derived candidate to push from the "From player bios" panel
+/// -- a reliability/automation review found this was one of the last
+/// remaining points of necessary Host involvement in an otherwise-
+/// automated round flow. The manual per-candidate buttons and the
+/// free-text "Manual entry" fallback stay in the Host console regardless,
+/// for a live-event fix-up.
+///
+/// Round 1 is deliberately NOT triggered from here -- see `start_round_one`
+/// for why it needs its own explicit trigger instead of firing the instant
+/// setup finalizes.
+///
+/// Triggered by scanning `events` (whatever command was just applied) for
+/// `DomainEvent::RoundAdvanced` reaching `Round::Three`/`Round::Five`.
+fn auto_push_on_round_advance(
+    state: &mut GameState,
+    events: &[DomainEvent],
+    pushed: &mut BTreeSet<Round>,
+) -> Vec<DomainEvent> {
+    let round = events.iter().find_map(|e| match e {
+        DomainEvent::RoundAdvanced {
+            round: round @ (Round::Three | Round::Five),
+        } => Some(*round),
+        _ => None,
+    });
+    let Some(round) = round else {
+        return Vec::new();
+    };
+    push_tasks_for_round(state, round, pushed)
+}
+
+/// Pushes Round 1's tasks (rules.md §4: "exactly 2 fixed tasks") on
+/// demand -- the Host console's "Start Round 1" button. Deliberately a
+/// separate, explicit trigger rather than firing automatically the instant
+/// `FinalizeSetup` succeeds (an earlier version of this automation did
+/// that): rules.md's own Round 1 sequence has Dalton give a live scripted
+/// intro and every player privately reveal their character *before* tasks
+/// get pushed, and setup can finish (the raffle run, roles/factions
+/// assigned) well before Dalton is actually ready to start that -- pushing
+/// tasks the instant setup finalizes closed that gap entirely. This keeps
+/// task *content* selection automatic (still random, still no admin
+/// picking which task) while leaving the *timing* of Round 1's actual
+/// start as a deliberate Host action, the same shape as every other phase
+/// transition in this app (`AdvanceRound`, `OpenDenouncement`, ...).
+///
+/// `String` error (not `GameError`) since both failure modes -- not
+/// currently at Round 1, or a double-click re-pushing -- are app-level UI
+/// mistakes, not domain rejections, matching `run_raffle`'s precedent.
+pub fn start_round_one() -> Result<Vec<DomainEvent>, String> {
+    let events;
+    {
+        let mut state = lock_state();
+        if state.current_round() != Round::One {
+            return Err("the game is not currently at Round 1".to_string());
+        }
+        let mut pushed = server()
+            .auto_tasks_pushed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pushed.contains(&Round::One) {
+            return Err("Round 1's tasks have already been pushed".to_string());
+        }
+        events = push_tasks_for_round(&mut state, Round::One, &mut pushed);
+    }
+    let _ = server().changed.send(());
+    Ok(events)
+}
+
 /// Applies one command against the single canonical `GameState`, holding
 /// the lock only for the mutation itself. The only place in the whole app
 /// allowed to call `engine::apply_command` -- every route-driven mutation
@@ -145,7 +194,7 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
             .auto_tasks_pushed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let auto_events = auto_push_odd_round_tasks(&mut state, &events, &mut pushed);
+        let auto_events = auto_push_on_round_advance(&mut state, &events, &mut pushed);
         events.extend(auto_events);
     }
     // Errors here just mean nobody's subscribed right now -- fine to
@@ -240,13 +289,10 @@ pub fn run_raffle() -> Result<Vec<DomainEvent>, String> {
         events.extend(apply_command(&mut state, Command::CloseRaffle).map_err(|e| e.to_string())?);
         events
             .extend(apply_command(&mut state, Command::FinalizeSetup).map_err(|e| e.to_string())?);
-
-        let mut pushed = server()
-            .auto_tasks_pushed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let auto_events = auto_push_odd_round_tasks(&mut state, &events, &mut pushed);
-        events.extend(auto_events);
+        // Round 1's own tasks deliberately do NOT get pushed here -- see
+        // `start_round_one`'s doc comment for why that needs its own
+        // explicit Host trigger instead of firing the instant setup
+        // finalizes.
     }
     // Same reasoning as `apply` above: nobody subscribed is a fine outcome
     // to ignore, there's just nobody waiting to be told.

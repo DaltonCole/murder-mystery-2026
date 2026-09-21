@@ -136,6 +136,12 @@ enum ClientMsg {
     /// `Viewer::Host` (see `game_server::draw_intermission_entrants`'s doc
     /// comment). The server reads `GameState` directly instead.
     DrawIntermissionEntrants,
+    /// `/host` only: pushes Round 1's randomly-selected tasks on demand.
+    /// Not a plain `Command` -- needs the same server-side real RNG as
+    /// `RunRaffle`. See `game_server::start_round_one`'s doc comment for
+    /// why this is a deliberate, separate Host trigger rather than firing
+    /// automatically the instant setup finalizes.
+    StartRoundOne,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +260,7 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         ClientMsg::DrawIntermissionEntrants => {
                             respond!(game_server::draw_intermission_entrants())
                         }
+                        ClientMsg::StartRoundOne => respond!(game_server::start_round_one()),
                     };
                     if !sent_ok {
                         break;
@@ -1304,6 +1311,12 @@ fn Host() -> Element {
             let _ = socket.send(ClientMsg::DrawIntermissionEntrants).await;
         });
     };
+    let start_round_one = move || {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::StartRoundOne).await;
+        });
+    };
 
     let mut new_name = use_signal(String::new);
     let mut faction_player = use_signal(|| None::<u32>);
@@ -1521,7 +1534,9 @@ fn Host() -> Element {
         }
         div {
             h3 { "Tasks" }
-            p { "Rounds 1, 3, and 5 each auto-push their own bio-derived tasks the moment that round's task phase begins -- no action needed here on a normal night. The controls below are for a manual top-up or fix-up only." }
+            p { "Rounds 3 and 5 each auto-push their own bio-derived tasks the moment that round's task phase begins -- no action needed there. Round 1's two tasks wait for you: click below once you've given the live intro and everyone's revealed their character." }
+            button { onclick: move |_| start_round_one(), "Start Round 1 (push tasks)" }
+            p { "The controls below are for a manual top-up or fix-up only." }
             h4 { "From player bios (rules.md §4, Rounds 3/5)" }
             for (tier , candidates) in task_candidates.clone() {
                 div {
