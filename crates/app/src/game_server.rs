@@ -13,9 +13,9 @@
 //! 20-30 player, single-process, one-event-at-a-time party game.
 
 use engine::{
-    apply_command, raffle_priority, raffle_winners, ticket_count, ticket_slots, view_for, Command,
-    DomainEvent, Faction, GameError, GameState, PlayerId, PlayerStatus, PlayerView, TaskTier,
-    Viewer,
+    apply_command, raffle_priority, raffle_winners, task_candidates, ticket_count, ticket_slots,
+    view_for, Command, DomainEvent, Faction, GameError, GameState, PlayerId, PlayerStatus,
+    PlayerView, Round, TaskTier, Viewer,
 };
 use rand::seq::SliceRandom;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,6 +25,11 @@ use tokio::sync::broadcast;
 struct GameServer {
     state: Mutex<GameState>,
     changed: broadcast::Sender<()>,
+    // Tracks which odd rounds' task phases have already been auto-pushed
+    // (see `auto_push_odd_round_tasks`) -- process-local, not persisted
+    // `GameState`, since it's purely an app-level "don't repeat this side
+    // effect" guard, not a fact about the game itself.
+    auto_tasks_pushed: Mutex<BTreeSet<Round>>,
 }
 
 fn server() -> &'static GameServer {
@@ -34,8 +39,97 @@ fn server() -> &'static GameServer {
         GameServer {
             state: Mutex::new(GameState::new()),
             changed,
+            auto_tasks_pushed: Mutex::new(BTreeSet::new()),
         }
     })
+}
+
+/// How many tasks to automatically push per tier -- `(easy, medium, hard)`
+/// -- when each odd round's task phase begins (rules.md §4: Rounds 1, 3, 5
+/// have tasks; 2 and 4 are contest rounds; see `auto_push_odd_round_tasks`).
+/// Round 1's count is fixed by rules.md itself ("exactly 2 fixed tasks, 1
+/// easy 1 medium"); Rounds 3 and 5 ramp up per Dalton's own game-night
+/// pacing call, not a rules.md quote.
+///
+/// *** EDIT THIS to retune pacing before game night -- no other code
+/// changes needed. ***
+fn auto_task_counts(round: Round) -> (usize, usize, usize) {
+    match round {
+        Round::One => (1, 1, 0),
+        Round::Three => (1, 1, 1),
+        Round::Five => (0, 2, 2),
+        _ => (0, 0, 0),
+    }
+}
+
+/// Automatically pushes each odd round's task phase (rules.md §4) the
+/// moment it begins, so the Host never has to hand-pick which bio-derived
+/// candidate to push from the "From player bios" panel -- a reliability/
+/// automation review found this was one of the last remaining points of
+/// necessary Host involvement in an otherwise-automated round flow. The
+/// manual per-candidate buttons and the free-text "Manual entry" fallback
+/// stay in the Host console regardless, for a live-event fix-up.
+///
+/// Triggered by scanning `events` (whatever command was just applied) for
+/// `DomainEvent::SetupFinalized` (Round 1) or `DomainEvent::RoundAdvanced`
+/// reaching `Round::Three`/`Round::Five` -- covers both ways
+/// `Command::FinalizeSetup` can be reached (`run_raffle`'s own internal
+/// call, or the Host's manual "Finalize setup" button) since both pass
+/// their resulting events through here. `pushed` guards against a
+/// legitimate repeat `FinalizeSetup` call (see that command's own doc
+/// comment) double-pushing Round 1's tasks.
+///
+/// For each tier, shuffles `bio::task_candidates`'s pool with real,
+/// OS-backed entropy (the same "randomness at the boundary" shape as
+/// `run_raffle`/`draw_intermission_entrants`) and pushes
+/// `auto_task_counts`'s configured count from the front -- capped at
+/// however many distinct candidates actually exist, so a too-small bio
+/// pool (a tiny playtest game, or a tier nobody's bio happens to fill)
+/// just pushes fewer tasks rather than erroring.
+fn auto_push_odd_round_tasks(
+    state: &mut GameState,
+    events: &[DomainEvent],
+    pushed: &mut BTreeSet<Round>,
+) -> Vec<DomainEvent> {
+    let round = events.iter().find_map(|e| match e {
+        DomainEvent::SetupFinalized => Some(Round::One),
+        DomainEvent::RoundAdvanced {
+            round: round @ (Round::Three | Round::Five),
+        } => Some(*round),
+        _ => None,
+    });
+    let Some(round) = round else {
+        return Vec::new();
+    };
+    if !pushed.insert(round) {
+        return Vec::new();
+    }
+
+    let (easy, medium, hard) = auto_task_counts(round);
+    let mut rng = rand::rng();
+    let mut new_events = Vec::new();
+    for (tier, count) in [
+        (TaskTier::Easy, easy),
+        (TaskTier::Medium, medium),
+        (TaskTier::Hard, hard),
+    ] {
+        let mut candidates = task_candidates(state, tier);
+        candidates.shuffle(&mut rng);
+        for candidate in candidates.into_iter().take(count) {
+            if let Ok(events) = apply_command(
+                state,
+                Command::PushTask {
+                    prompt: candidate.prompt,
+                    tier,
+                    qualifying_players: candidate.qualifying_players.into_iter().collect(),
+                    expected_code: None,
+                },
+            ) {
+                new_events.extend(events);
+            }
+        }
+    }
+    new_events
 }
 
 /// Applies one command against the single canonical `GameState`, holding
@@ -43,16 +137,21 @@ fn server() -> &'static GameServer {
 /// allowed to call `engine::apply_command` -- every route-driven mutation
 /// funnels through here.
 pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
-    let result = {
+    let mut events;
+    {
         let mut state = lock_state();
-        apply_command(&mut state, cmd)
-    };
-    if result.is_ok() {
-        // Errors here just mean nobody's subscribed right now -- fine to
-        // ignore, there's nobody waiting to be told.
-        let _ = server().changed.send(());
+        events = apply_command(&mut state, cmd)?;
+        let mut pushed = server()
+            .auto_tasks_pushed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let auto_events = auto_push_odd_round_tasks(&mut state, &events, &mut pushed);
+        events.extend(auto_events);
     }
-    result
+    // Errors here just mean nobody's subscribed right now -- fine to
+    // ignore, there's nobody waiting to be told.
+    let _ = server().changed.send(());
+    Ok(events)
 }
 
 /// Runs rules.md §1's weighted setup raffle over the current roster and
@@ -141,6 +240,13 @@ pub fn run_raffle() -> Result<Vec<DomainEvent>, String> {
         events.extend(apply_command(&mut state, Command::CloseRaffle).map_err(|e| e.to_string())?);
         events
             .extend(apply_command(&mut state, Command::FinalizeSetup).map_err(|e| e.to_string())?);
+
+        let mut pushed = server()
+            .auto_tasks_pushed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let auto_events = auto_push_odd_round_tasks(&mut state, &events, &mut pushed);
+        events.extend(auto_events);
     }
     // Same reasoning as `apply` above: nobody subscribed is a fine outcome
     // to ignore, there's just nobody waiting to be told.

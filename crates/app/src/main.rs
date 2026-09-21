@@ -1521,8 +1521,8 @@ fn Host() -> Element {
         }
         div {
             h3 { "Tasks" }
+            p { "Rounds 1, 3, and 5 each auto-push their own bio-derived tasks the moment that round's task phase begins -- no action needed here on a normal night. The controls below are for a manual top-up or fix-up only." }
             h4 { "From player bios (rules.md §4, Rounds 3/5)" }
-            p { "Round 1 uses 2 fixed tasks instead -- push those manually below." }
             for (tier , candidates) in task_candidates.clone() {
                 div {
                     key: "{tier:?}",
