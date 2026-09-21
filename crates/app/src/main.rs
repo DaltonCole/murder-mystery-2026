@@ -53,7 +53,8 @@ use dioxus::prelude::*;
 use engine::{
     pascal_case, AbilityStatus, Ballot, Bio, Character, Command, ContestCategory, DenouncementView,
     DomainEvent, Faction, GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind,
-    PlayerId, PlayerStatus, PlayerView, RosterEntry, Round, TaskTier, TaskView, Viewer,
+    PlayerId, PlayerReveal, PlayerStatus, PlayerView, RosterEntry, Round, TaskTier, TaskView,
+    Viewer, WhistledownPost,
 };
 use serde::{Deserialize, Serialize};
 
@@ -171,6 +172,33 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
             while changed.try_recv().is_ok() {}
         }
 
+        // Shared reply shape for every Host-mutation `ClientMsg` arm below
+        // (`Do`, `RunRaffle`, `PushLocationTask`, `DrawIntermissionEntrants`):
+        // on success, drain this connection's own broadcast echo and send a
+        // fresh view if it's watching as someone; on failure, relay the
+        // error as `ServerMsg::Failed`. Only the called mutation differs per
+        // arm -- a macro (not a function) so it can reach `socket`/
+        // `changed`/`viewer` directly, sidestepping the need to spell out
+        // this connection's concrete websocket type.
+        macro_rules! respond {
+            ($result:expr) => {
+                match $result {
+                    Ok(_) => {
+                        drain_self_echo(&mut changed);
+                        if let Some(v) = viewer {
+                            socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
+                        } else {
+                            true
+                        }
+                    }
+                    Err(e) => socket
+                        .send(ServerMsg::Failed { error: e.to_string() })
+                        .await
+                        .is_ok(),
+                }
+            };
+        }
+
         loop {
             tokio::select! {
                 incoming = socket.recv() => {
@@ -218,65 +246,13 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                             };
                             sent_view && sent_templates
                         }
-                        ClientMsg::Do(cmd) => match game_server::apply(cmd) {
-                            Ok(_) => {
-                                drain_self_echo(&mut changed);
-                                if let Some(v) = viewer {
-                                    socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
-                                } else {
-                                    true
-                                }
-                            }
-                            Err(e) => socket
-                                .send(ServerMsg::Failed { error: e.to_string() })
-                                .await
-                                .is_ok(),
-                        },
-                        ClientMsg::RunRaffle => match game_server::run_raffle() {
-                            Ok(_) => {
-                                drain_self_echo(&mut changed);
-                                if let Some(v) = viewer {
-                                    socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
-                                } else {
-                                    true
-                                }
-                            }
-                            Err(e) => socket
-                                .send(ServerMsg::Failed { error: e.to_string() })
-                                .await
-                                .is_ok(),
-                        },
+                        ClientMsg::Do(cmd) => respond!(game_server::apply(cmd)),
+                        ClientMsg::RunRaffle => respond!(game_server::run_raffle()),
                         ClientMsg::PushLocationTask { index } => {
-                            match game_server::push_location_task(index) {
-                                Ok(_) => {
-                                    drain_self_echo(&mut changed);
-                                    if let Some(v) = viewer {
-                                        socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
-                                    } else {
-                                        true
-                                    }
-                                }
-                                Err(e) => socket
-                                    .send(ServerMsg::Failed { error: e })
-                                    .await
-                                    .is_ok(),
-                            }
+                            respond!(game_server::push_location_task(index))
                         }
                         ClientMsg::DrawIntermissionEntrants => {
-                            match game_server::draw_intermission_entrants() {
-                                Ok(_) => {
-                                    drain_self_echo(&mut changed);
-                                    if let Some(v) = viewer {
-                                        socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
-                                    } else {
-                                        true
-                                    }
-                                }
-                                Err(e) => socket
-                                    .send(ServerMsg::Failed { error: e })
-                                    .await
-                                    .is_ok(),
-                            }
+                            respond!(game_server::draw_intermission_entrants())
                         }
                     };
                     if !sent_ok {
@@ -393,20 +369,7 @@ fn Play() -> Element {
         if let Some(message) = &v.martyrdom_message {
             p { class: "martyrdom-message", "{message}" }
         }
-        if !v.finale_cast_out_reveal.is_empty() {
-            div {
-                h4 { "The Last Denouncement -- revealed" }
-                for p in v.finale_cast_out_reveal.iter().cloned() {
-                    p {
-                        key: "{p.id.0}",
-                        strong { "{p.name}" }
-                        ": {p.true_faction:?}"
-                        if let Some(c) = p.character { ", {c:?}" }
-                        if p.converted { " (secretly converted to the Cult)" }
-                    }
-                }
-            }
-        }
+        FinaleCastOutReveal { reveal: v.finale_cast_out_reveal.clone(), heading_level: 4u8 }
         div {
             h4 { "Intermission" }
             if let Some(entrants) = &v.intermission_entrants {
@@ -483,18 +446,7 @@ fn Play() -> Element {
                 }
             }
         }
-        if !v.whistledown.is_empty() {
-            div {
-                h4 { "Lady Whistledown's Society Papers" }
-                for post in v.whistledown.iter().rev().cloned() {
-                    p {
-                        key: "{post.round:?}",
-                        class: "whistledown-post",
-                        "{post.text}"
-                    }
-                }
-            }
-        }
+        WhistledownPosts { posts: v.whistledown.clone(), heading_level: 4u8 }
         if v.own_character.is_none() {
             InterestLevelForm {
                 my_id: id,
@@ -608,6 +560,88 @@ fn RosterList(roster: Vec<RosterEntry>) -> Element {
     }
 }
 
+/// A `<select>` listing every roster entry by name, `value` set to the raw
+/// player id -- the Host console's recurring "pick a player" control (6
+/// call sites: faction/character assignment, a task's qualifying player,
+/// Convert's converter/target, a Servant point award). `on_change` gets the
+/// raw `FormEvent` rather than an already-parsed `PlayerId` so each call
+/// site keeps full control of what else its change should do (a couple
+/// also reset an unrelated "armed" confirmation state).
+#[component]
+fn PlayerSelect(
+    roster: Vec<RosterEntry>,
+    placeholder: &'static str,
+    on_change: EventHandler<FormEvent>,
+) -> Element {
+    rsx! {
+        select {
+            onchange: move |e| on_change.call(e),
+            option { value: "", "{placeholder}" }
+            for r in roster {
+                option { value: "{r.id.0}", "{r.name}" }
+            }
+        }
+    }
+}
+
+/// The full identities Cast Out at the Last Denouncement -- rendered
+/// identically on `/play` and `/display` (only the heading level differs).
+/// See `PlayerView::finale_cast_out_reveal`'s doc comment for why this is
+/// public to every viewer, unlike the Host-only `finale_reveal`. Renders
+/// nothing while empty (before the Finale's own Denouncement has closed).
+#[component]
+fn FinaleCastOutReveal(reveal: Vec<PlayerReveal>, heading_level: u8) -> Element {
+    if reveal.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        div {
+            if heading_level == 2 {
+                h2 { "The Last Denouncement -- revealed" }
+            } else {
+                h4 { "The Last Denouncement -- revealed" }
+            }
+            for p in reveal {
+                p {
+                    key: "{p.id.0}",
+                    strong { "{p.name}" }
+                    ": {p.true_faction:?}"
+                    if let Some(c) = p.character { ", {c:?}" }
+                    if p.converted { " (secretly converted to the Cult)" }
+                }
+            }
+        }
+    }
+}
+
+/// Every Whistledown post so far, newest first -- shared by `/play`,
+/// `/display`, and the Host console (only the heading level differs).
+/// Renders nothing while empty.
+#[component]
+fn WhistledownPosts(posts: Vec<WhistledownPost>, heading_level: u8) -> Element {
+    if posts.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        div {
+            if heading_level == 2 {
+                h2 { "Lady Whistledown's Society Papers" }
+            } else if heading_level == 3 {
+                h3 { "Lady Whistledown's Society Papers" }
+            } else {
+                h4 { "Lady Whistledown's Society Papers" }
+            }
+            for post in posts.into_iter().rev() {
+                p {
+                    key: "{post.round:?}",
+                    class: "whistledown-post",
+                    "{post.text}"
+                }
+            }
+        }
+    }
+}
+
 /// rules.md §1's "Character creation" -- free text, each field capped at
 /// 32 characters (enforced here via `maxlength` and, as the real source of
 /// truth, by the engine's own `SubmitBio` validation). Doesn't pre-fill
@@ -633,17 +667,17 @@ fn BioForm(my_id: PlayerId, own_bio: Option<Bio>, on_command: EventHandler<Comma
                     p {
                         "{pascal_case(&bio.character_name)} -- {pascal_case(&bio.occupation)}"
                     }
-                    p {
-                        "Hobbies: "
-                        {bio.hobbies.iter().filter(|s| !s.is_empty()).map(|s| pascal_case(s)).collect::<Vec<_>>().join(", ")}
-                    }
-                    p {
-                        "Clothing: "
-                        {bio.clothing_features.iter().filter(|s| !s.is_empty()).map(|s| pascal_case(s)).collect::<Vec<_>>().join(", ")}
-                    }
-                    p {
-                        "Skills: "
-                        {bio.skills.iter().filter(|s| !s.is_empty()).map(|s| pascal_case(s)).collect::<Vec<_>>().join(", ")}
+                    for (label , field) in [
+                        ("Hobbies", &bio.hobbies),
+                        ("Clothing", &bio.clothing_features),
+                        ("Skills", &bio.skills),
+                    ]
+                    {
+                        p {
+                            key: "{label}",
+                            "{label}: "
+                            {field.iter().filter(|s| !s.is_empty()).map(|s| pascal_case(s)).collect::<Vec<_>>().join(", ")}
+                        }
                     }
                 }
             }
@@ -1369,18 +1403,7 @@ fn Host() -> Element {
                 "The Finale reveal is ready \u{2014} see \"Finale reveal\" near the bottom of this page."
             }
         }
-        if !whistledown.is_empty() {
-            div {
-                h3 { "Lady Whistledown's Society Papers" }
-                for post in whistledown.iter().rev().cloned() {
-                    p {
-                        key: "{post.round:?}",
-                        class: "whistledown-post",
-                        "{post.text}"
-                    }
-                }
-            }
-        }
+        WhistledownPosts { posts: whistledown.clone(), heading_level: 3u8 }
         div {
             h3 { "Setup" }
             input {
@@ -1409,12 +1432,10 @@ fn Host() -> Element {
                 "Running the raffle assigns every named role by weighted ticket (higher interest = more tickets), splits everyone else across Ton/Uprising, then finalizes setup -- anyone added afterward joins as a Servant automatically. The controls below are for a manual fix-up afterward, or for designating the Deceiver mid-game."
             }
             div {
-                select {
-                    onchange: move |e| faction_player.set(e.value().parse().ok()),
-                    option { value: "", "-- player --" }
-                    for r in roster.clone() {
-                        option { value: "{r.id.0}", "{r.name}" }
-                    }
+                PlayerSelect {
+                    roster: roster.clone(),
+                    placeholder: "-- player --",
+                    on_change: move |e: FormEvent| faction_player.set(e.value().parse().ok()),
                 }
                 select {
                     onchange: move |e| {
@@ -1443,12 +1464,10 @@ fn Host() -> Element {
                 }
             }
             div {
-                select {
-                    onchange: move |e| character_player.set(e.value().parse().ok()),
-                    option { value: "", "-- player --" }
-                    for r in roster.clone() {
-                        option { value: "{r.id.0}", "{r.name}" }
-                    }
+                PlayerSelect {
+                    roster: roster.clone(),
+                    placeholder: "-- player --",
+                    on_change: move |e: FormEvent| character_player.set(e.value().parse().ok()),
                 }
                 select {
                     onchange: move |e| {
@@ -1554,12 +1573,10 @@ fn Host() -> Element {
                 option { value: "Medium", "Medium" }
                 option { value: "Hard", "Hard" }
             }
-            select {
-                onchange: move |e| task_qualifier.set(e.value().parse().ok()),
-                option { value: "", "-- who qualifies? --" }
-                for r in roster.clone() {
-                    option { value: "{r.id.0}", "{r.name}" }
-                }
+            PlayerSelect {
+                roster: roster.clone(),
+                placeholder: "-- who qualifies? --",
+                on_change: move |e: FormEvent| task_qualifier.set(e.value().parse().ok()),
             }
             button {
                 disabled: task_prompt().trim().is_empty() || task_qualifier().is_none(),
@@ -1581,25 +1598,21 @@ fn Host() -> Element {
         div {
             h3 { "Cult Leader: Convert" }
             p { "The Cult Leader has no self-service way to do this from their own phone -- they tell you who to convert, and you act on it here. The host's own view never shows factions/characters (see the security note on view_for), so use the player IDs you assigned during setup, not names shown here. This is irreversible and secret -- double check before confirming." }
-            select {
-                onchange: move |e| {
+            PlayerSelect {
+                roster: roster.clone(),
+                placeholder: "-- converter (Cult Leader) --",
+                on_change: move |e: FormEvent| {
                     convert_converter.set(e.value().parse().ok());
                     convert_armed.set(false);
                 },
-                option { value: "", "-- converter (Cult Leader) --" }
-                for r in roster.clone() {
-                    option { value: "{r.id.0}", "{r.name}" }
-                }
             }
-            select {
-                onchange: move |e| {
+            PlayerSelect {
+                roster: roster.clone(),
+                placeholder: "-- target --",
+                on_change: move |e: FormEvent| {
                     convert_target.set(e.value().parse().ok());
                     convert_armed.set(false);
                 },
-                option { value: "", "-- target --" }
-                for r in roster.clone() {
-                    option { value: "{r.id.0}", "{r.name}" }
-                }
             }
             button {
                 disabled: convert_converter().is_none() || convert_target().is_none(),
@@ -1690,12 +1703,10 @@ fn Host() -> Element {
         div {
             h3 { "Servant leaderboard" }
             p { "Any Servant, or any already-Cast-Out player, is eligible. What earns points (zone scorekeeping, trivia, a minigame) is up to you -- the app just tracks the running total." }
-            select {
-                onchange: move |e| servant_award_player.set(e.value().parse().ok()),
-                option { value: "", "-- player --" }
-                for r in roster.clone() {
-                    option { value: "{r.id.0}", "{r.name}" }
-                }
+            PlayerSelect {
+                roster: roster.clone(),
+                placeholder: "-- player --",
+                on_change: move |e: FormEvent| servant_award_player.set(e.value().parse().ok()),
             }
             input {
                 r#type: "number",
@@ -1929,32 +1940,8 @@ fn Display() -> Element {
             for task in v.open_tasks.iter().cloned() {
                 p { key: "{task.id.0}", "{task.prompt} ({task.tier:?})" }
             }
-            if !v.finale_cast_out_reveal.is_empty() {
-                div {
-                    h2 { "The Last Denouncement -- revealed" }
-                    for p in v.finale_cast_out_reveal.iter().cloned() {
-                        p {
-                            key: "{p.id.0}",
-                            strong { "{p.name}" }
-                            ": {p.true_faction:?}"
-                            if let Some(c) = p.character { ", {c:?}" }
-                            if p.converted { " (secretly converted to the Cult)" }
-                        }
-                    }
-                }
-            }
-            if !v.whistledown.is_empty() {
-                div {
-                    h2 { "Lady Whistledown's Society Papers" }
-                    for post in v.whistledown.iter().rev().cloned() {
-                        p {
-                            key: "{post.round:?}",
-                            class: "whistledown-post",
-                            "{post.text}"
-                        }
-                    }
-                }
-            }
+            FinaleCastOutReveal { reveal: v.finale_cast_out_reveal.clone(), heading_level: 2u8 }
+            WhistledownPosts { posts: v.whistledown.clone(), heading_level: 2u8 }
         }
     }
 }

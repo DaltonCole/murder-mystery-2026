@@ -34,7 +34,7 @@ pub enum CultPath {
 /// `ton_wins`/`uprising_wins`/`cult_wins` is ever `true` at once -- see the
 /// module-level doc comment for why an overlap is structurally possible and
 /// how it's resolved (Dalton's ruling: the Cult always has priority).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameOutcome {
     pub ton_wins: bool,
     pub uprising_wins: bool,
@@ -46,17 +46,6 @@ pub struct GameOutcome {
     /// `true` regardless of whether a Ton/Uprising condition was also
     /// independently satisfied and suppressed.
     pub cult_paths: Vec<CultPath>,
-}
-
-impl GameOutcome {
-    fn none() -> Self {
-        GameOutcome {
-            ton_wins: false,
-            uprising_wins: false,
-            cult_wins: false,
-            cult_paths: Vec::new(),
-        }
-    }
 }
 
 /// Checks every faction's win/loss condition against `state`, exactly as
@@ -117,7 +106,7 @@ impl GameOutcome {
 /// Uprising section below for the exact condition and why it can't newly
 /// collide with anything the Cult-priority override doesn't already handle.
 pub fn evaluate(state: &GameState) -> GameOutcome {
-    let mut outcome = GameOutcome::none();
+    let mut outcome = GameOutcome::default();
 
     let king_queen_converted_and_active = is_converted_and_active(state, state.king_queen());
     let leader_converted_and_active = is_converted_and_active(state, state.revolutionary_leader());
@@ -279,7 +268,7 @@ mod tests {
     fn nobody_wins_at_the_start() {
         let (state, ..) = base_state();
         let outcome = evaluate(&state);
-        assert_eq!(outcome, GameOutcome::none());
+        assert_eq!(outcome, GameOutcome::default());
     }
 
     #[test]

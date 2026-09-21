@@ -830,17 +830,7 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             vec![DomainEvent::RaffleClosed]
         }
 
-        Command::AssignFaction { player, faction } => {
-            let existing = state
-                .players
-                .get(&player)
-                .ok_or(GameError::UnknownPlayer(player))?;
-            if existing.faction != Faction::Unassigned {
-                return Err(GameError::AlreadyAssigned(player));
-            }
-            state.players.get_mut(&player).unwrap().faction = faction;
-            vec![DomainEvent::FactionAssigned { player, faction }]
-        }
+        Command::AssignFaction { player, faction } => assign_faction(state, player, faction)?,
 
         Command::AssignCharacter { player, character } => {
             assign_character(state, player, character)?
@@ -1011,15 +1001,25 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
     Ok(events)
 }
 
+fn assign_faction(
+    state: &mut GameState,
+    player: PlayerId,
+    faction: Faction,
+) -> Result<Vec<DomainEvent>, GameError> {
+    let existing = require_player(state, player)?;
+    if existing.faction != Faction::Unassigned {
+        return Err(GameError::AlreadyAssigned(player));
+    }
+    state.players.get_mut(&player).unwrap().faction = faction;
+    Ok(vec![DomainEvent::FactionAssigned { player, faction }])
+}
+
 fn assign_character(
     state: &mut GameState,
     player: PlayerId,
     character: Character,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    let p = state
-        .players
-        .get(&player)
-        .ok_or(GameError::UnknownPlayer(player))?;
+    let p = require_player(state, player)?;
     let mut faction_to_assign = None;
     if let Some(required) = GameState::required_faction(character) {
         // A secretly-recruited Cultist's *apparent* `faction` never changes
@@ -1181,9 +1181,7 @@ fn submit_interest_level(
     player: PlayerId,
     level: u8,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.players.contains_key(&player) {
-        return Err(GameError::UnknownPlayer(player));
-    }
+    require_player(state, player)?;
     if !(crate::raffle::MIN_INTEREST_LEVEL..=crate::raffle::MAX_INTEREST_LEVEL).contains(&level) {
         return Err(GameError::InterestLevelOutOfRange(level));
     }
@@ -1199,9 +1197,7 @@ fn submit_bio(
     player: PlayerId,
     bio: Bio,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.players.contains_key(&player) {
-        return Err(GameError::UnknownPlayer(player));
-    }
+    require_player(state, player)?;
     if let Some((field, len)) = bio.first_oversized_field() {
         return Err(GameError::FieldTooLong {
             field,
@@ -1238,10 +1234,7 @@ fn convert(
     if state.available_recruitment_slots == 0 {
         return Err(GameError::NoRecruitmentSlotAvailable);
     }
-    let target_player = state
-        .players
-        .get(&target)
-        .ok_or(GameError::UnknownPlayer(target))?;
+    let target_player = require_player(state, target)?;
     if target_player.status != PlayerStatus::Active {
         return Err(GameError::NotActive(target));
     }
@@ -1330,18 +1323,11 @@ fn designate_successor(
     if state.revolutionary_leader != Some(leader) {
         return Err(GameError::NotCurrentLeader(leader));
     }
-    let s = state
-        .players
-        .get(&successor)
-        .ok_or(GameError::UnknownPlayer(successor))?;
+    require_player(state, successor)?;
     // true_faction(), not the apparent faction: a secretly-converted
     // Uprising member is Cult now, not a valid successor -- see
     // `first_eligible`'s doc comment for why this matters.
-    if s.status != PlayerStatus::Active
-        || s.true_faction() != Faction::Uprising
-        || successor == leader
-        || !state.is_untitled(successor)
-    {
+    if !is_eligible_titleholder(state, successor, Faction::Uprising, leader) {
         return Err(GameError::IneligibleSuccessor(successor));
     }
     state.revolutionary_leader_successor = Some(successor);
@@ -1366,19 +1352,12 @@ fn transfer_king_queen(
     let old_holder = state
         .king_queen
         .ok_or(GameError::IneligibleKingQueenReplacement(new_holder))?;
-    let np = state
-        .players
-        .get(&new_holder)
-        .ok_or(GameError::UnknownPlayer(new_holder))?;
+    require_player(state, new_holder)?;
     // true_faction(), not the apparent faction -- a King/Queen voluntarily
     // handing the crown to a secretly-converted Ton member would be an
     // immediate, player-triggered version of the same bug `first_eligible`'s
     // doc comment describes.
-    if np.status != PlayerStatus::Active
-        || np.true_faction() != Faction::Ton
-        || new_holder == old_holder
-        || !state.is_untitled(new_holder)
-    {
+    if !is_eligible_titleholder(state, new_holder, Faction::Ton, old_holder) {
         return Err(GameError::IneligibleKingQueenReplacement(new_holder));
     }
 
@@ -1425,10 +1404,7 @@ fn resolve_cast_out(
     fallback_replacement: Option<PlayerId>,
     also_departing: &[PlayerId],
 ) -> Result<Vec<DomainEvent>, GameError> {
-    let p = state
-        .players
-        .get(&player)
-        .ok_or(GameError::UnknownPlayer(player))?;
+    let p = require_player(state, player)?;
     if p.status != PlayerStatus::Active {
         return Err(GameError::NotActive(player));
     }
@@ -2160,10 +2136,7 @@ fn award_servant_points(
     player: PlayerId,
     points: u32,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    let p = state
-        .players
-        .get(&player)
-        .ok_or(GameError::UnknownPlayer(player))?;
+    let p = require_player(state, player)?;
     if !is_servant(p) {
         return Err(GameError::NotAServant(player));
     }
@@ -2189,10 +2162,7 @@ fn submit_gallery_prediction(
     player: PlayerId,
     prediction: GalleryPrediction,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    let p = state
-        .players
-        .get(&player)
-        .ok_or(GameError::UnknownPlayer(player))?;
+    let p = require_player(state, player)?;
     if p.status != PlayerStatus::CastOut {
         return Err(GameError::MustBeCastOutForGallery(player));
     }
@@ -2393,6 +2363,52 @@ fn require_character(
     Ok(())
 }
 
+/// Looks up `id`, or reports `GameError::UnknownPlayer` -- the shared shape
+/// behind every command that takes a bare `PlayerId` with no other
+/// precondition to check first.
+fn require_player(state: &GameState, id: PlayerId) -> Result<&Player, GameError> {
+    state.players.get(&id).ok_or(GameError::UnknownPlayer(id))
+}
+
+/// Shared precondition for the four procedural Denouncement modifiers
+/// (Potion Maker immunity, Magistrate/Firebrand's double vote, the Normal
+/// Uprising vote shield, the Grand Inquisitor's slot override): each can
+/// only be armed while a Denouncement is actually open. Duelist/Agitator
+/// are deliberately not included here -- they need a *specific* phase
+/// (Nomination/Discussion), not just "any Denouncement," so they keep their
+/// own phase-matching checks rather than sharing this one.
+///
+/// Must be called *after* the caller's own "already used" check -- once a
+/// Denouncement closes, `state.denouncement` resets to `None`, so checking
+/// this first would misreport a genuinely-spent ability as "no Denouncement
+/// open" on a same-round reuse attempt instead of the more specific error.
+fn require_denouncement_open(state: &GameState) -> Result<(), GameError> {
+    if state.denouncement.is_none() {
+        return Err(GameError::NoDenouncementOpen);
+    }
+    Ok(())
+}
+
+/// Shared eligibility predicate for "a currently-active, untitled member of
+/// `faction`, other than `exclude`" -- the Revolutionary Leader succession
+/// search (`first_eligible`) and the two player-chosen replacements
+/// (`designate_successor`'s successor, `transfer_king_queen`'s new holder)
+/// all mean exactly this, just phrased as a search vs. a single candidate
+/// check.
+fn is_eligible_titleholder(
+    state: &GameState,
+    id: PlayerId,
+    faction: Faction,
+    exclude: PlayerId,
+) -> bool {
+    id != exclude
+        && state
+            .players
+            .get(&id)
+            .is_some_and(|p| p.status == PlayerStatus::Active && p.true_faction() == faction)
+        && state.is_untitled(id)
+}
+
 /// Computes `kind`'s falsify decision, records the delivered result into
 /// `state.info_check_results`, and returns the events -- the one place
 /// `use_oracle`, `use_spymaster`, and `cult_leader_query` all funnel through
@@ -2451,10 +2467,7 @@ fn use_oracle(
             character: Character::Oracle,
         });
     }
-    let target_player = state
-        .players
-        .get(&target)
-        .ok_or(GameError::UnknownPlayer(target))?;
+    let target_player = require_player(state, target)?;
     let true_answer = InfoCheckAnswer::Dossier(Dossier {
         apparent_faction: target_player.faction,
         converted: target_player.converted,
@@ -2525,10 +2538,7 @@ fn use_spymaster(
             character: Character::Spymaster,
         });
     }
-    let target_player = state
-        .players
-        .get(&target)
-        .ok_or(GameError::UnknownPlayer(target))?;
+    let target_player = require_player(state, target)?;
     let true_answer = InfoCheckAnswer::Faction(target_player.faction);
 
     state.spymaster_used = true;
@@ -2559,10 +2569,7 @@ fn cult_leader_query(
             character: Character::CultLeader,
         });
     }
-    let target_player = state
-        .players
-        .get(&target)
-        .ok_or(GameError::UnknownPlayer(target))?;
+    let target_player = require_player(state, target)?;
     let true_answer = match kind {
         InfoQueryKind::IsTonAligned => {
             InfoCheckAnswer::Bool(target_player.true_faction() == Faction::Ton)
@@ -2701,14 +2708,10 @@ fn activate_potion_immunity(
     // silently get consumed by whatever *unrelated* Denouncement happened
     // to close next -- the exact hazard `duelist_challenge`'s doc comment
     // already names for a different ability ("arming it any earlier would
-    // risk a later, unrelated Denouncement... consuming it instead").
-    // Checked after the "already used" case above, not before, so an
-    // ability that's genuinely spent reports that -- the more specific,
-    // more useful reason -- rather than "no Denouncement open" just
-    // because its own Denouncement has since closed.
-    if state.denouncement.is_none() {
-        return Err(GameError::NoDenouncementOpen);
-    }
+    // risk a later, unrelated Denouncement... consuming it instead"). See
+    // `require_denouncement_open`'s doc comment for why this is checked
+    // after the "already used" case above, not before.
+    require_denouncement_open(state)?;
     if !state.is_active(target) {
         return Err(GameError::NotActive(target));
     }
@@ -2756,14 +2759,9 @@ fn activate_double_vote(
             character: character.unwrap(),
         });
     }
-    // See `activate_potion_immunity`'s comment: without an open-Denouncement
-    // check, this could be armed at any point and silently consumed by
-    // whatever unrelated Denouncement happens to close next. Checked after
-    // the "already used" case above so a genuinely-spent ability reports
-    // that, not "no Denouncement open" just because its own has closed.
-    if state.denouncement.is_none() {
-        return Err(GameError::NoDenouncementOpen);
-    }
+    // See `require_denouncement_open`'s doc comment for why this check
+    // comes after the "already used" case above.
+    require_denouncement_open(state)?;
     match character {
         Some(Character::Magistrate) => state.magistrate_double_vote_armed = true,
         Some(Character::Firebrand) => state.firebrand_double_vote_armed = true,
@@ -2782,14 +2780,9 @@ fn arm_vote_shield(state: &mut GameState, player: PlayerId) -> Result<Vec<Domain
             character: Character::NormalUprising,
         });
     }
-    // See `activate_potion_immunity`'s comment: without an open-Denouncement
-    // check, this could be armed at any point and silently consumed by
-    // whatever unrelated Denouncement happens to close next. Checked after
-    // the "already used" case above so a genuinely-spent ability reports
-    // that, not "no Denouncement open" just because its own has closed.
-    if state.denouncement.is_none() {
-        return Err(GameError::NoDenouncementOpen);
-    }
+    // See `require_denouncement_open`'s doc comment for why this check
+    // comes after the "already used" case above.
+    require_denouncement_open(state)?;
     state.vote_shield_armed.insert(player);
     Ok(vec![DomainEvent::VoteShieldArmed { player }])
 }
@@ -2877,14 +2870,9 @@ fn activate_grand_inquisitor(
             character: Character::GrandInquisitor,
         });
     }
-    // See `activate_potion_immunity`'s comment: without an open-Denouncement
-    // check, this could be armed at any point and silently consumed by
-    // whatever unrelated Denouncement happens to close next. Checked after
-    // the "already used" case above so a genuinely-spent ability reports
-    // that, not "no Denouncement open" just because its own has closed.
-    if state.denouncement.is_none() {
-        return Err(GameError::NoDenouncementOpen);
-    }
+    // See `require_denouncement_open`'s doc comment for why this check
+    // comes after the "already used" case above.
+    require_denouncement_open(state)?;
     state.grand_inquisitor_armed = true;
     Ok(vec![DomainEvent::GrandInquisitorInvoked { player }])
 }

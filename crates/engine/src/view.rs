@@ -252,6 +252,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         Viewer::Player(id) => Some(id),
         Viewer::Host | Viewer::Display => None,
     };
+    let is_host = matches!(viewer, Viewer::Host);
 
     let own_faction = viewer_id.and_then(|id| state.player(id).map(|p| p.faction));
     let own_character = viewer_id.and_then(|id| state.player(id).and_then(|p| p.character));
@@ -313,25 +314,25 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     let revealed_leader = viewer_id.and_then(|id| state.leader_known_to(id));
     let i_opted_into_intermission = viewer_id.is_some_and(|id| state.opted_into_intermission(id));
     let intermission_entrants = state.intermission_entrants().map(|e| e.to_vec());
-    let contest_results = if matches!(viewer, Viewer::Host) {
+    let contest_results = if is_host {
         state.contest_results_for_host()
     } else {
         Vec::new()
     };
-    let winner = if matches!(viewer, Viewer::Host) {
+    let winner = if is_host {
         state.winner_for_host()
     } else {
         None
     };
-    let gallery_resolved = matches!(viewer, Viewer::Host) && state.gallery_resolved();
+    let gallery_resolved = is_host && state.gallery_resolved();
     let own_bio = viewer_id.and_then(|id| state.bio(id)).cloned();
     let own_interest_level = viewer_id.and_then(|id| state.interest_level(id));
-    let interest_levels = if matches!(viewer, Viewer::Host) {
+    let interest_levels = if is_host {
         state.interest_levels().collect()
     } else {
         Vec::new()
     };
-    let task_candidates = if matches!(viewer, Viewer::Host) {
+    let task_candidates = if is_host {
         [TaskTier::Easy, TaskTier::Medium, TaskTier::Hard]
             .into_iter()
             .map(|tier| (tier, crate::bio::task_candidates(state, tier)))
@@ -340,7 +341,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         Vec::new()
     };
     let finale_reveal_data = finale_reveal::reveal(state);
-    let finale_reveal_for_host = if matches!(viewer, Viewer::Host) {
+    let finale_reveal_for_host = if is_host {
         finale_reveal_data.clone()
     } else {
         None

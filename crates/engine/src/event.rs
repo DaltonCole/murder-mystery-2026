@@ -20,9 +20,7 @@ use serde::{Deserialize, Serialize};
 /// This log is deliberately the single source powering several later
 /// features rather than each having its own bespoke tracking: Whistledown's
 /// text generation reads it, the finale's "reveal everything" walkthrough
-/// reads it, and it doubles as an audit trail for host debugging. Keeping
-/// one append-only log now, even while it only has two variants, avoids
-/// having to retrofit that unification later.
+/// reads it, and it doubles as an audit trail for host debugging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DomainEvent {
     PlayerAdded {

@@ -48,6 +48,11 @@ pub struct HostDriver {
     url: String,
 }
 
+/// The timeout every `do_cmd_until`/`do_cmd_sequential` call in this file
+/// uses -- pulled out as one constant purely so a future tuning pass is a
+/// one-line change instead of a 15-site find-and-replace.
+const CMD_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// This crate's own stand-in for rules.md §4's location tasks (medium:
 /// location stated plainly; hard: a riddle) -- `(tier, prompt, code)`,
 /// deliberately separate content from the real app's own
@@ -280,7 +285,7 @@ impl HostDriver {
                         expected_code: None,
                     },
                     |v| v.open_tasks.len() >= pushed,
-                    Duration::from_secs(10),
+                    CMD_TIMEOUT,
                     "task count increasing after PushTask",
                 )
                 .await?;
@@ -290,7 +295,7 @@ impl HostDriver {
             .do_cmd_until(
                 Command::CloseTasks,
                 |v| v.open_tasks.is_empty(),
-                Duration::from_secs(10),
+                CMD_TIMEOUT,
                 "open_tasks clearing after CloseTasks",
             )
             .await?;
@@ -322,7 +327,7 @@ impl HostDriver {
                         expected_code: None,
                     },
                     |v| v.open_tasks.len() >= pushed,
-                    Duration::from_secs(10),
+                    CMD_TIMEOUT,
                     "task count increasing after PushTask",
                 )
                 .await?;
@@ -345,7 +350,7 @@ impl HostDriver {
                         expected_code: Some(code.into()),
                     },
                     |v| v.open_tasks.len() >= pushed,
-                    Duration::from_secs(10),
+                    CMD_TIMEOUT,
                     "task count increasing after PushTask",
                 )
                 .await?;
@@ -355,7 +360,7 @@ impl HostDriver {
             .do_cmd_until(
                 Command::CloseTasks,
                 |v| v.open_tasks.is_empty(),
-                Duration::from_secs(10),
+                CMD_TIMEOUT,
                 "open_tasks clearing after CloseTasks",
             )
             .await?;
@@ -367,7 +372,7 @@ impl HostDriver {
             .do_cmd_until(
                 Command::AdvanceRound,
                 |v| v.current_round == expected,
-                Duration::from_secs(10),
+                CMD_TIMEOUT,
                 "current_round reaching the expected round",
             )
             .await
@@ -389,7 +394,7 @@ impl HostDriver {
             .do_cmd_until(
                 Command::OpenDenouncement,
                 |v| matches!(v.denouncement, Some(DenouncementView::Nomination { .. })),
-                Duration::from_secs(10),
+                CMD_TIMEOUT,
                 "Nomination phase opening",
             )
             .await?;
@@ -398,7 +403,7 @@ impl HostDriver {
             .do_cmd_until(
                 Command::CloseNomination,
                 |v| matches!(v.denouncement, Some(DenouncementView::Discussion { .. })),
-                Duration::from_secs(10),
+                CMD_TIMEOUT,
                 "Discussion phase opening",
             )
             .await?;
@@ -406,7 +411,7 @@ impl HostDriver {
             .do_cmd_until(
                 Command::OpenBallot,
                 |v| matches!(v.denouncement, Some(DenouncementView::Ballot { .. })),
-                Duration::from_secs(10),
+                CMD_TIMEOUT,
                 "Ballot phase opening",
             )
             .await?;
@@ -418,7 +423,7 @@ impl HostDriver {
                     fallback_replacement: None,
                 },
                 |v| !matches!(v.denouncement, Some(DenouncementView::Ballot { .. })),
-                Duration::from_secs(10),
+                CMD_TIMEOUT,
                 "Ballot phase closing (to Runoff or resolved)",
             )
             .await?;
@@ -432,7 +437,7 @@ impl HostDriver {
                         fallback_replacement: None,
                     },
                     |v| v.denouncement.is_none(),
-                    Duration::from_secs(10),
+                    CMD_TIMEOUT,
                     "Runoff phase closing",
                 )
                 .await;
@@ -473,7 +478,7 @@ impl HostDriver {
                             .iter()
                             .any(|&((r, c), _)| r == round && c == category)
                     },
-                    Duration::from_secs(10),
+                    CMD_TIMEOUT,
                     "contest_results reflecting the recorded category",
                 )
                 .await?;
@@ -519,7 +524,7 @@ impl HostDriver {
                     selected: candidates,
                 },
                 |v| v.intermission_entrants.is_some(),
-                Duration::from_secs(10),
+                CMD_TIMEOUT,
                 "intermission_entrants being drawn",
             )
             .await?;
@@ -539,7 +544,7 @@ impl HostDriver {
                 .do_cmd_until(
                     Command::AwardServantPoints { player, points: 1 },
                     |v| v.servant_leaderboard.iter().any(|&(id, _)| id == player),
-                    Duration::from_secs(10),
+                    CMD_TIMEOUT,
                     "servant_leaderboard reflecting the award",
                 )
                 .await?;
@@ -577,7 +582,7 @@ impl HostDriver {
                     actual_winner,
                 },
                 |v| v.gallery_resolved,
-                Duration::from_secs(10),
+                CMD_TIMEOUT,
                 "gallery_resolved flipping true",
             )
             .await
