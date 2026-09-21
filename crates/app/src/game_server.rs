@@ -14,7 +14,8 @@
 
 use engine::{
     apply_command, raffle_priority, raffle_winners, ticket_count, ticket_slots, view_for, Command,
-    DomainEvent, Faction, GameError, GameState, PlayerId, PlayerView, TaskTier, Viewer,
+    DomainEvent, Faction, GameError, GameState, PlayerId, PlayerStatus, PlayerView, TaskTier,
+    Viewer,
 };
 use rand::seq::SliceRandom;
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,10 +69,24 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
 /// the leftovers, then `CloseRaffle`/`FinalizeSetup`) -- that's the
 /// network-driven equivalent of this same sequence for the bot test
 /// harness; this is the real one a live host actually presses.
-pub fn run_raffle() -> Result<Vec<DomainEvent>, GameError> {
+///
+/// `String` error (not `GameError`, matching `push_location_task`'s
+/// precedent) since the one way this can fail -- a double-click re-running
+/// an already-closed raffle -- is an app-level UI mistake, not a domain
+/// rejection: a reliability review found this had no guard at all, so a
+/// double-click under live-event network latency (the button doesn't
+/// disable until a fresh view round-trips back) could draw a *second*,
+/// different random shuffle and abort partway through `AssignCharacter`
+/// once a winner collides with a character they already hold from the
+/// first run, leaving a tangled, half-reassigned roster with no clean way
+/// to recover except the Host UI's manual fallback controls.
+pub fn run_raffle() -> Result<Vec<DomainEvent>, String> {
     let mut events = Vec::new();
     {
         let mut state = lock_state();
+        if state.raffle_closed() {
+            return Err("the raffle has already run".to_string());
+        }
         let roster: Vec<PlayerId> = state.players().map(|p| p.id).collect();
 
         let mut tickets = BTreeMap::new();
@@ -93,10 +108,10 @@ pub fn run_raffle() -> Result<Vec<DomainEvent>, GameError> {
         let winners = raffle_winners(&priority);
 
         for (character, player) in winners.iter().copied() {
-            events.extend(apply_command(
-                &mut state,
-                Command::AssignCharacter { player, character },
-            )?);
+            events.extend(
+                apply_command(&mut state, Command::AssignCharacter { player, character })
+                    .map_err(|e| e.to_string())?,
+            );
         }
 
         let won_a_role: BTreeSet<PlayerId> = winners.iter().map(|&(_, player)| player).collect();
@@ -110,21 +125,64 @@ pub fn run_raffle() -> Result<Vec<DomainEvent>, GameError> {
         let (ton, uprising) = remaining.split_at(ton_count);
         for (group, faction) in [(ton, Faction::Ton), (uprising, Faction::Uprising)] {
             for &id in group {
-                events.extend(apply_command(
-                    &mut state,
-                    Command::AssignFaction {
-                        player: id,
-                        faction,
-                    },
-                )?);
+                events.extend(
+                    apply_command(
+                        &mut state,
+                        Command::AssignFaction {
+                            player: id,
+                            faction,
+                        },
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
             }
         }
 
-        events.extend(apply_command(&mut state, Command::CloseRaffle)?);
-        events.extend(apply_command(&mut state, Command::FinalizeSetup)?);
+        events.extend(apply_command(&mut state, Command::CloseRaffle).map_err(|e| e.to_string())?);
+        events
+            .extend(apply_command(&mut state, Command::FinalizeSetup).map_err(|e| e.to_string())?);
     }
     // Same reasoning as `apply` above: nobody subscribed is a fine outcome
     // to ignore, there's just nobody waiting to be told.
+    let _ = server().changed.send(());
+    Ok(events)
+}
+
+/// Draws up to 5 Intermission entrants (rules.md §4) from whoever's
+/// currently opted in and still active -- the Host console's "Draw
+/// entrants" button. A reliability review found the Host UI previously
+/// asked Dalton to type in entrant player IDs by hand, which is impossible
+/// to do correctly: `view_for` deliberately never reveals the opt-in pool
+/// to `Viewer::Host` (see `GameState::intermission_opt_ins`'s doc comment
+/// on "no ambient god-view"). This runs the actual weighted-nothing (a
+/// plain shuffle, every opted-in active player equally likely) draw
+/// server-side, reading `GameState` directly rather than the scrubbed
+/// view -- the same "randomness at the boundary" shape as `run_raffle`
+/// above and `bots::HostDriver::draw_intermission_entrants`.
+pub fn draw_intermission_entrants() -> Result<Vec<DomainEvent>, String> {
+    let events;
+    {
+        let mut state = lock_state();
+        let active: BTreeSet<PlayerId> = state
+            .players()
+            .filter(|p| p.status == PlayerStatus::Active)
+            .map(|p| p.id)
+            .collect();
+        let mut candidates: Vec<PlayerId> = state
+            .intermission_opt_ins()
+            .filter(|id| active.contains(id))
+            .collect();
+        let mut rng = rand::rng();
+        candidates.shuffle(&mut rng);
+        candidates.truncate(5);
+        events = apply_command(
+            &mut state,
+            Command::DrawIntermissionEntrants {
+                selected: candidates,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let _ = server().changed.send(());
     Ok(events)
 }

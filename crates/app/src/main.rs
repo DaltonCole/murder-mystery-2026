@@ -127,6 +127,14 @@ enum ClientMsg {
     /// doc comment), so the Host browser can only ever refer to a template
     /// by index, never construct the `PushTask` itself.
     PushLocationTask { index: usize },
+    /// `/host` only: draws the Intermission entrants server-side. Not a
+    /// plain `Command { selected }` either -- unlike a real player's own
+    /// `Command::OptIntoIntermission`, the Host browser has no legitimate
+    /// way to know *who* opted in to pass as `selected` in the first
+    /// place: `view_for` deliberately never reveals the opt-in pool to
+    /// `Viewer::Host` (see `game_server::draw_intermission_entrants`'s doc
+    /// comment). The server reads `GameState` directly instead.
+    DrawIntermissionEntrants,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +248,22 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         },
                         ClientMsg::PushLocationTask { index } => {
                             match game_server::push_location_task(index) {
+                                Ok(_) => {
+                                    drain_self_echo(&mut changed);
+                                    if let Some(v) = viewer {
+                                        socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
+                                    } else {
+                                        true
+                                    }
+                                }
+                                Err(e) => socket
+                                    .send(ServerMsg::Failed { error: e })
+                                    .await
+                                    .is_ok(),
+                            }
+                        }
+                        ClientMsg::DrawIntermissionEntrants => {
+                            match game_server::draw_intermission_entrants() {
                                 Ok(_) => {
                                     drain_self_echo(&mut changed);
                                     if let Some(v) = viewer {
@@ -1240,6 +1264,12 @@ fn Host() -> Element {
             let _ = socket.send(ClientMsg::PushLocationTask { index }).await;
         });
     };
+    let draw_intermission_entrants = move || {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::DrawIntermissionEntrants).await;
+        });
+    };
 
     let mut new_name = use_signal(String::new);
     let mut faction_player = use_signal(|| None::<u32>);
@@ -1251,14 +1281,29 @@ fn Host() -> Element {
     let mut task_qualifier = use_signal(|| None::<u32>);
     let mut convert_converter = use_signal(|| None::<u32>);
     let mut convert_target = use_signal(|| None::<u32>);
+    // A review flagged this panel as unguarded, catastrophic-if-misclicked
+    // dev tooling -- but it's actually the *only* way `Command::Convert`
+    // is reachable at all (the Cult Leader has no self-service UI for it
+    // via `/play`; they tell the Host who to convert, and the Host acts on
+    // it here), so hiding it would break the Cult's core recruitment
+    // mechanic. The real fix is a confirm step, not removal: `convert_armed`
+    // requires a second, distinct click before the command actually fires,
+    // and resets the moment either dropdown changes.
+    let mut convert_armed = use_signal(|| false);
     let mut contest_round = use_signal(|| Round::Two);
     let mut contest_category = use_signal(|| ContestCategory::Strength);
     let mut contest_ton_won = use_signal(|| true);
-    let mut intermission_selected = use_signal(String::new);
     let mut servant_award_player = use_signal(|| None::<u32>);
     let mut servant_award_points = use_signal(|| 1u32);
-    let mut gallery_cast_out = use_signal(String::new);
     let mut gallery_winner = use_signal(|| Faction::Ton);
+    // A review found the Host console never rendered Whistledown posts at
+    // all (Dalton had to tab over to /play or /display to ever see one) --
+    // and that even content it DOES render (the finale reveal) gives no
+    // signal when it newly becomes available, just silently appearing
+    // wherever its panel happens to sit on a long page. `whistledown_seen`
+    // tracks how many posts Dalton has acknowledged, so a banner can show
+    // exactly when there's something new.
+    let mut whistledown_seen = use_signal(|| 0usize);
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
     let interest_levels = view().map(|v| v.interest_levels).unwrap_or_default();
@@ -1266,11 +1311,75 @@ fn Host() -> Element {
     let winner = view().and_then(|v| v.winner);
     let task_candidates = view().map(|v| v.task_candidates).unwrap_or_default();
     let finale_reveal = view().and_then(|v| v.finale_reveal);
+    let finale_cast_out_reveal = view().map(|v| v.finale_cast_out_reveal).unwrap_or_default();
+    let whistledown = view().map(|v| v.whistledown).unwrap_or_default();
+    let whistledown_len = whistledown.len();
+    let has_new_whistledown = whistledown_len > whistledown_seen();
+
+    // A single always-visible "what's happening, what do I do next"
+    // line -- a review found the console otherwise gives no on-page
+    // signal of Denouncement sub-phase at all (Nomination vs.
+    // Discussion vs. Ballot vs. Runoff), forcing a host to alt-tab to
+    // `/display` before every one of the five Denouncement buttons
+    // just to know which one is next.
+    let phase_summary = match &view() {
+        None => "Connecting...".to_string(),
+        Some(v) => match &v.denouncement {
+            None => format!("{:?} -- no Denouncement currently open", v.current_round),
+            Some(DenouncementView::Nomination { .. }) => {
+                format!("{:?} -- Nomination open", v.current_round)
+            }
+            Some(DenouncementView::Discussion { surfaced }) => format!(
+                "{:?} -- Discussion (surfaced: {})",
+                v.current_round,
+                names(surfaced, &v.roster)
+            ),
+            Some(DenouncementView::Ballot { candidates, .. }) => format!(
+                "{:?} -- Ballot open (candidates: {})",
+                v.current_round,
+                names(candidates, &v.roster)
+            ),
+            Some(DenouncementView::Runoff { candidates, .. }) => format!(
+                "{:?} -- Runoff open (candidates: {})",
+                v.current_round,
+                names(candidates, &v.roster)
+            ),
+        },
+    };
 
     rsx! {
         h1 { "Host Console" }
+        div {
+            style: "font-weight:bold;padding:0.5em 0;",
+            "{phase_summary}"
+        }
         if let Some(e) = error() {
             p { style: "color:red", "{e}" }
+        }
+        if has_new_whistledown {
+            div {
+                style: "background:#4a1620;color:#f3e9d2;padding:0.75em 1em;cursor:pointer;",
+                onclick: move |_| whistledown_seen.set(whistledown_len),
+                "\u{1F4F0} New Whistledown post below \u{2014} tap to mark read"
+            }
+        }
+        if finale_reveal.is_some() {
+            div {
+                style: "background:#4a1620;color:#f3e9d2;padding:0.75em 1em;",
+                "The Finale reveal is ready \u{2014} see \"Finale reveal\" near the bottom of this page."
+            }
+        }
+        if !whistledown.is_empty() {
+            div {
+                h3 { "Lady Whistledown's Society Papers" }
+                for post in whistledown.iter().rev().cloned() {
+                    p {
+                        key: "{post.round:?}",
+                        class: "whistledown-post",
+                        "{post.text}"
+                    }
+                }
+            }
         }
         div {
             h3 { "Setup" }
@@ -1470,17 +1579,23 @@ fn Host() -> Element {
             button { onclick: move |_| do_cmd(Command::CloseTasks), "Close tasks" }
         }
         div {
-            h3 { "Debug: Cult conversion" }
-            p { "The real recruitment schedule is Phase 2 -- this is a manual stand-in. The host's own view never shows factions/characters (see the security note on view_for), so use the player IDs you assigned above, not names shown here." }
+            h3 { "Cult Leader: Convert" }
+            p { "The Cult Leader has no self-service way to do this from their own phone -- they tell you who to convert, and you act on it here. The host's own view never shows factions/characters (see the security note on view_for), so use the player IDs you assigned during setup, not names shown here. This is irreversible and secret -- double check before confirming." }
             select {
-                onchange: move |e| convert_converter.set(e.value().parse().ok()),
+                onchange: move |e| {
+                    convert_converter.set(e.value().parse().ok());
+                    convert_armed.set(false);
+                },
                 option { value: "", "-- converter (Cult Leader) --" }
                 for r in roster.clone() {
                     option { value: "{r.id.0}", "{r.name}" }
                 }
             }
             select {
-                onchange: move |e| convert_target.set(e.value().parse().ok()),
+                onchange: move |e| {
+                    convert_target.set(e.value().parse().ok());
+                    convert_armed.set(false);
+                },
                 option { value: "", "-- target --" }
                 for r in roster.clone() {
                     option { value: "{r.id.0}", "{r.name}" }
@@ -1493,12 +1608,19 @@ fn Host() -> Element {
                     else {
                         return;
                     };
+                    if !convert_armed() {
+                        convert_armed.set(true);
+                        return;
+                    }
                     do_cmd(Command::Convert {
                         converter: PlayerId(converter),
                         target: PlayerId(target),
                     });
+                    convert_armed.set(false);
+                    convert_converter.set(None);
+                    convert_target.set(None);
                 },
-                "Convert"
+                if convert_armed() { "Confirm convert -- click again" } else { "Convert" }
             }
         }
         div {
@@ -1559,23 +1681,9 @@ fn Host() -> Element {
         }
         div {
             h3 { "Intermission lottery" }
-            p { "Draw the 5 entrants from whoever opted in (comma-separated player IDs -- the host doesn't get a names-and-opt-ins list here, per the same no-ambient-god-view rule as everything else)." }
-            input {
-                placeholder: "e.g. 2,5,9",
-                value: "{intermission_selected}",
-                oninput: move |e| intermission_selected.set(e.value()),
-            }
+            p { "Draws up to 5 entrants from whoever opted in and is still active -- you don't get a names-and-opt-ins list (same no-ambient-god-view rule as everywhere else), so this runs the draw server-side instead of asking you to pick." }
             button {
-                onclick: move |_| {
-                    let selected: Vec<PlayerId> = intermission_selected
-                        .peek()
-                        .split(',')
-                        .filter_map(|s| s.trim().parse::<u32>().ok())
-                        .map(PlayerId)
-                        .collect();
-                    do_cmd(Command::DrawIntermissionEntrants { selected });
-                    intermission_selected.set(String::new());
-                },
+                onclick: move |_| draw_intermission_entrants(),
                 "Draw entrants"
             }
         }
@@ -1614,10 +1722,18 @@ fn Host() -> Element {
         div {
             h3 { "Gallery resolution" }
             p { "Once at the Finale, after the ballot has actually closed: score every submitted Gallery prediction against the real outcome. Only one faction ever wins -- the Cult has priority over any overlap (see win_condition::evaluate's doc comment)." }
-            input {
-                placeholder: "actual Cast-Out IDs, e.g. 2,5",
-                value: "{gallery_cast_out}",
-                oninput: move |e| gallery_cast_out.set(e.value()),
+            // Both inputs below come straight from state the engine already
+            // computed (`finale_cast_out_reveal`, `winner`) -- a review
+            // found this panel used to make Dalton retype Cast-Out player
+            // IDs by hand from memory, redundant with (and a real risk of
+            // drifting from) the public reveal the app already shows him.
+            p {
+                "Cast Out at the Last Denouncement: "
+                if finale_cast_out_reveal.is_empty() {
+                    "(none yet -- the ballot hasn't closed)"
+                } else {
+                    "{names(&finale_cast_out_reveal.iter().map(|p| p.id).collect::<Vec<_>>(), &roster)}"
+                }
             }
             if let Some(f) = winner {
                 // The button sends the engine's own computed answer
@@ -1627,12 +1743,7 @@ fn Host() -> Element {
                 p { "The engine computed the winner as {f:?} -- this is what gets recorded." }
                 button {
                     onclick: move |_| {
-                        let actual_cast_out: Vec<PlayerId> = gallery_cast_out
-                            .peek()
-                            .split(',')
-                            .filter_map(|s| s.trim().parse::<u32>().ok())
-                            .map(PlayerId)
-                            .collect();
+                        let actual_cast_out = finale_cast_out_reveal.iter().map(|p| p.id).collect();
                         do_cmd(Command::ResolveGalleryPredictions {
                             actual_cast_out,
                             actual_winner: f,
@@ -1655,12 +1766,7 @@ fn Host() -> Element {
                 }
                 button {
                     onclick: move |_| {
-                        let actual_cast_out: Vec<PlayerId> = gallery_cast_out
-                            .peek()
-                            .split(',')
-                            .filter_map(|s| s.trim().parse::<u32>().ok())
-                            .map(PlayerId)
-                            .collect();
+                        let actual_cast_out = finale_cast_out_reveal.iter().map(|p| p.id).collect();
                         do_cmd(Command::ResolveGalleryPredictions {
                             actual_cast_out,
                             actual_winner: gallery_winner(),

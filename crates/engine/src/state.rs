@@ -601,6 +601,24 @@ impl GameState {
         self.intermission_opt_ins.contains(&viewer)
     }
 
+    /// Everyone currently opted into the Intermission lottery -- fully
+    /// `pub` (unlike `opted_into_intermission` above), since `app`'s
+    /// server-side code needs the real pool to actually run the draw
+    /// (shuffle + pick up to 5, `Command::DrawIntermissionEntrants`'s own
+    /// "randomness at the boundary" caller). A reliability review found
+    /// the Host UI previously asked a live host to *type in* entrant
+    /// player IDs by hand -- IDs `view_for` deliberately never reveals to
+    /// `Viewer::Host` at all (`opted_into_intermission` above stays
+    /// `pub(crate)`, private to each opted-in player's own view, exactly
+    /// the "no ambient god-view" rule every other private field in this
+    /// engine follows) -- making that control impossible to use as
+    /// specified. This accessor is for the *server process itself* to read
+    /// directly and run the draw; it must never be serialized into any
+    /// `PlayerView` or otherwise reach a client.
+    pub fn intermission_opt_ins(&self) -> impl Iterator<Item = PlayerId> + '_ {
+        self.intermission_opt_ins.iter().copied()
+    }
+
     /// The drawn Intermission entrants, once `DrawIntermissionEntrants` has
     /// run -- a public reveal (rules.md §4 frames the draw itself as a live
     /// party moment), so every viewer gets the same answer, unlike the
@@ -665,6 +683,19 @@ impl GameState {
     /// `bots` crate.
     pub(crate) fn gallery_resolved(&self) -> bool {
         self.gallery_resolved
+    }
+
+    /// Whether `Command::CloseRaffle` has run yet -- fully `pub` (not
+    /// `pub(crate)` like the Host-only accessors above) since `app`'s
+    /// server-side code needs it too, to guard its own `run_raffle` helper
+    /// against a double-click re-running the whole weighted draw on an
+    /// already-set-up game (a reliability review flagged this: `run_raffle`
+    /// had no such guard, so a double-click under live-event network
+    /// latency could draw a fresh shuffle and abort partway through with a
+    /// tangled, half-reassigned roster once a winner collides with an
+    /// already-held character).
+    pub fn raffle_closed(&self) -> bool {
+        self.raffle_closed
     }
 
     /// The faction a title's holder must belong to. Used to validate
@@ -2191,7 +2222,27 @@ fn resolve_gallery_predictions(
     // predictions actually come in. Requires the Last Denouncement to have
     // actually closed (not just be open) -- the real outcome isn't known
     // until then, so resolving any earlier could only ever be a mistake.
-    if state.current_round != Round::Finale || state.denouncement.is_some() {
+    //
+    // `state.denouncement.is_some()` alone can't tell "never opened this
+    // round" apart from "opened, then closed" -- both are `None`, since
+    // `close_denouncement` resets the field rather than leaving a terminal
+    // "Closed" phase behind. A review found this same ambiguity already
+    // caused a real bug in `finale_reveal::reveal` (fixed in a prior
+    // commit): advancing to `Round::Finale` is a separate step from
+    // `OpenDenouncement`, so without this check, resolving in that gap
+    // would have *incorrectly succeeded* -- permanently zeroing the
+    // Gallery before a single real prediction was ever scored. Same fix:
+    // require `DenouncementOpened` to have actually fired since the last
+    // `RoundAdvanced`.
+    let mut opened_this_round = false;
+    for event in state.event_log() {
+        match event {
+            DomainEvent::RoundAdvanced { .. } => opened_this_round = false,
+            DomainEvent::DenouncementOpened => opened_this_round = true,
+            _ => {}
+        }
+    }
+    if state.current_round != Round::Finale || state.denouncement.is_some() || !opened_this_round {
         return Err(GameError::GalleryResolutionTooEarly);
     }
     state.gallery_resolved = true;
@@ -10777,6 +10828,35 @@ mod tests {
             },
         );
         assert_eq!(result, Err(GameError::GalleryResolutionTooEarly));
+    }
+
+    #[test]
+    fn resolve_gallery_predictions_rejects_at_the_finale_before_its_denouncement_has_even_opened() {
+        // Security/reliability regression: `denouncement.is_none()` alone
+        // can't tell "never opened this round" apart from "opened, then
+        // closed" -- both look identical. Without this fix, resolving in
+        // the gap between reaching Round::Finale and calling
+        // OpenDenouncement would have *incorrectly succeeded*, permanently
+        // zeroing the Gallery (once-per-game, irreversible) before a
+        // single real prediction was ever scored. Same bug class as
+        // finale_reveal::reveal's, fixed separately here since this
+        // function has its own independent gating check.
+        let mut state = GameState::new();
+        add_player(&mut state, "Alice", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        for _ in 0..5 {
+            apply_command(&mut state, Command::AdvanceRound).unwrap();
+        }
+        assert_eq!(state.current_round(), Round::Finale);
+        let result = apply_command(
+            &mut state,
+            Command::ResolveGalleryPredictions {
+                actual_cast_out: vec![],
+                actual_winner: Faction::Ton,
+            },
+        );
+        assert_eq!(result, Err(GameError::GalleryResolutionTooEarly));
+        assert!(!state.gallery_resolved());
     }
 
     #[test]
