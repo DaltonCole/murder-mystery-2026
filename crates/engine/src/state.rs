@@ -698,6 +698,15 @@ impl GameState {
         self.raffle_closed
     }
 
+    /// How many Cult recruitment slots are currently available to spend --
+    /// `view_for`'s Host-only `recruitment_slots_available_for_host` reads
+    /// this so the Host console can sanity-check the Cult Leader's "convert
+    /// them now" instruction before acting on it (a UX review found the
+    /// Host previously had no visibility into this at all).
+    pub fn available_recruitment_slots(&self) -> usize {
+        self.available_recruitment_slots
+    }
+
     /// The faction a title's holder must belong to. Used to validate
     /// [`Command::AssignCharacter`] -- e.g. rejects assigning `CultLeader`
     /// to a Ton player.

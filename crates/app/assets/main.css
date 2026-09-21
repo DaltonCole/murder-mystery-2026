@@ -204,6 +204,17 @@ strong {
   color: var(--color-primary-dark);
 }
 
+/* The Round 1 character-reveal gate on /play -- a small ceremonial
+ * moment, deliberately styled to feel like an invitation to press
+ * something rather than an ordinary status paragraph. */
+.reveal-gate {
+  text-align: center;
+  background: var(--color-bg-card);
+  border: 1px dashed var(--color-accent);
+  border-radius: 10px;
+  padding: 1rem;
+}
+
 /* rules.md §6's private martyrdom message -- a deliberately somber,
  * different color from Whistledown's lighter gossip-column tone. */
 .martyrdom-message {
@@ -225,4 +236,66 @@ strong {
 
 .route-display h1 {
   font-size: 2.4rem;
+}
+
+/* The tiny Play/Host/Display wayfinding nav at the very top of every
+ * route (App()) -- small and muted on purpose so it doesn't compete with
+ * the actual game content or look out of place on the shared /display
+ * screen, but still gives a first-time host a way to discover /host and
+ * /display exist at all. */
+.route-nav {
+  display: flex;
+  gap: 0.9rem;
+  justify-content: center;
+  font-family: var(--font-heading);
+  font-size: 0.85rem;
+  letter-spacing: 0.03em;
+  padding-bottom: 0.5rem;
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.route-nav a {
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+.route-nav a:hover {
+  text-decoration: underline;
+}
+
+/* Every "something went wrong" message shares this class now instead of
+ * an inline `color:red` -- plain red on this theme's parchment background
+ * measures well under WCAG AA contrast, exactly the text a confused host
+ * or player most needs to actually read. */
+.error-text {
+  color: var(--color-danger);
+  font-weight: bold;
+}
+
+/* A caution, not a rejection -- e.g. "tasks are still open" before
+ * opening a Denouncement. Amber rather than error-text's red so the two
+ * read as different severities at a glance. */
+.warning-text {
+  color: #6b4a00;
+  font-weight: bold;
+}
+
+/* The finale's public Cast-Out reveal (rules.md §4: "revealed publicly on
+ * a shared screen") -- the emotional climax of the whole night deserves
+ * more than plain paragraphs indistinguishable from routine status text. */
+.finale-reveal {
+  background: var(--color-primary-dark);
+  color: var(--color-bg-card);
+  border-radius: 10px;
+  padding: 1rem 1.2rem;
+}
+
+.finale-reveal h2,
+.finale-reveal h4 {
+  color: var(--color-accent-light);
+}
+
+.finale-reveal strong {
+  color: #fff;
 }

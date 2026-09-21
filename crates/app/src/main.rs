@@ -96,6 +96,21 @@ fn App() -> Element {
         document::Link { rel: "manifest", href: MANIFEST }
         document::Link { rel: "icon", href: ICON, r#type: "image/svg+xml" }
         document::Meta { name: "theme-color", content: "#4a1620" }
+        // Without this, mobile browsers render the page at a virtual
+        // desktop-width layout viewport and scale it down -- every
+        // control on this phone-first app would show up tiny and
+        // require pinch-zoom. A review pass found this missing entirely.
+        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
+        // A first-time host landing on the bare `/` join screen has no
+        // way to discover `/host`/`/display` exist -- a review pass
+        // found there was no navigation between routes anywhere in the
+        // app. This tiny nav is the whole fix: which route to use is
+        // self-explanatory from the labels, no further guidance needed.
+        nav { class: "route-nav",
+            Link { to: Route::Play {}, "Play" }
+            Link { to: Route::Host {}, "Host" }
+            Link { to: Route::Display {}, "Display" }
+        }
         Router::<Route> {}
     }
 }
@@ -292,10 +307,16 @@ fn Play() -> Element {
         loop {
             match socket.recv().await {
                 Ok(ServerMsg::Joined { player }) => my_id.set(Some(player)),
-                Ok(ServerMsg::View(v)) => {
-                    view.set(Some(v));
-                    error.set(None);
-                }
+                // Deliberately NOT clearing `error` here. This connection
+                // gets a fresh `View` on every successful command from
+                // *any* connected player, not just this one's own (one
+                // shared broadcast channel, see `game_server::apply`'s doc
+                // comment) -- a review found that clearing the error banner
+                // on every such push meant someone else's unrelated action
+                // could silently wipe a just-shown rejection before this
+                // player finished reading it. `send_cmd` below clears it
+                // instead, only on this player's own next action.
+                Ok(ServerMsg::View(v)) => view.set(Some(v)),
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
                 // `/play` never watches as `Viewer::Host`, so this never
                 // actually arrives here -- see `ServerMsg::LocationTaskTemplates`'s
@@ -306,8 +327,9 @@ fn Play() -> Element {
         }
     });
 
-    let send_cmd = move |cmd: Command| {
+    let mut send_cmd = move |cmd: Command| {
         let socket = socket;
+        error.set(None);
         spawn(async move {
             let _ = socket.send(ClientMsg::Do(cmd)).await;
         });
@@ -315,6 +337,13 @@ fn Play() -> Element {
 
     let mut gallery_pick = use_signal(|| None::<u32>);
     let mut gallery_faction_pick = use_signal(|| None::<Faction>);
+    // rules.md's Round 1 has Dalton live-demo a "press and hold" reveal
+    // before everyone privately reveals their own character -- a review
+    // pass found this ritual had no matching UI at all: the moment a
+    // faction/character was assigned, it just appeared as static text
+    // with nothing to actually press or hold. Once tripped, stays revealed
+    // for the rest of the game -- there's no reason to re-hide it.
+    let mut revealed = use_signal(|| false);
 
     let mut do_join = move || {
         let name = name_draft.peek().trim().to_string();
@@ -332,7 +361,7 @@ fn Play() -> Element {
         return rsx! {
             h1 { "Murder Mystery 2026" }
             if let Some(e) = error() {
-                p { style: "color:red", "{e}" }
+                p { class: "error-text", "{e}" }
             }
             input {
                 placeholder: "Your name",
@@ -355,17 +384,32 @@ fn Play() -> Element {
     rsx! {
         h1 { "Murder Mystery 2026" }
         if let Some(e) = error() {
-            p { style: "color:red", "{e}" }
+            p { class: "error-text", "{e}" }
         }
         p { "Round: {v.current_round:?}" }
-        p {
-            "Your faction: {v.own_faction:?}"
-            if let Some(c) = v.own_character {
-                " -- {c:?}"
+        if let Some(faction) = v.own_faction {
+            if faction == Faction::Unassigned {
+                p { "Waiting for setup to finish..." }
+            } else if revealed() {
+                p {
+                    "Your faction: {faction:?}"
+                    if let Some(c) = v.own_character {
+                        " -- {character_label(c)}"
+                    }
+                }
+            } else {
+                div {
+                    class: "reveal-gate",
+                    p { "Your character is ready. Press and hold below to reveal it -- just to you." }
+                    button {
+                        onclick: move |_| revealed.set(true),
+                        "Press and hold to reveal"
+                    }
+                }
             }
         }
         if v.i_am_drunk {
-            p { style: "color:red", "You're drunk this round -- you can't nominate or vote." }
+            p { class: "error-text", "You're drunk this round -- you can't nominate or vote." }
         }
         if let Some(leader) = v.revealed_leader {
             p { "You now know the Revolutionary Leader: {names(&[leader], &v.roster)}." }
@@ -374,15 +418,28 @@ fn Play() -> Element {
             p { "These people now know you're the Revolutionary Leader: {names(&v.my_confidants, &v.roster)}." }
         }
         if let Some(message) = &v.martyrdom_message {
-            p { class: "martyrdom-message", "{message}" }
+            p { class: "martyrdom-message",
+                "{message}"
+                br {}
+                em { "(private -- only you can see this)" }
+            }
         }
         FinaleCastOutReveal { reveal: v.finale_cast_out_reveal.clone(), heading_level: 4u8 }
+        if v.own_character.is_none() {
+            InterestLevelForm {
+                my_id: id,
+                own_interest_level: v.own_interest_level,
+                on_command: send_cmd,
+            }
+        }
         div {
             h4 { "Intermission" }
             if let Some(entrants) = &v.intermission_entrants {
                 p { "Entrants: {names(entrants, &v.roster)}" }
             } else if v.i_opted_into_intermission {
                 p { "You're in the pool. Entrants haven't been drawn yet." }
+            } else if v.roster.iter().any(|r| r.id == id && r.status == PlayerStatus::CastOut) {
+                p { "Cast-Out players aren't eligible for the Intermission lottery." }
             } else {
                 button {
                     onclick: move |_| send_cmd(Command::OptIntoIntermission { player: id }),
@@ -454,19 +511,19 @@ fn Play() -> Element {
             }
         }
         WhistledownPosts { posts: v.whistledown.clone(), heading_level: 4u8 }
-        if v.own_character.is_none() {
-            InterestLevelForm {
-                my_id: id,
-                own_interest_level: v.own_interest_level,
-                on_command: send_cmd,
-            }
-        }
         BioForm {
             my_id: id,
             own_bio: v.own_bio.clone(),
             on_command: send_cmd,
         }
         RosterList { roster: v.roster.clone() }
+        // Repeated here, not just at the top of the page -- a review found
+        // a rejected ability/vote produced an error banner far above these
+        // action panels, easy to miss on a long phone-width page without
+        // scrolling back up.
+        if let Some(e) = error() {
+            p { class: "error-text", "{e}" }
+        }
         AbilityPanel {
             my_id: id,
             own_character: v.own_character,
@@ -477,11 +534,15 @@ fn Play() -> Element {
             roster: v.roster.clone(),
             on_command: send_cmd,
         }
-        DenouncementPanel {
-            my_id: id,
-            denouncement: v.denouncement.clone(),
-            roster: v.roster.clone(),
-            on_command: send_cmd,
+        if v.roster.iter().any(|r| r.id == id && r.status == PlayerStatus::CastOut) {
+            p { "You've been Cast Out -- you're spectating the rest of the Denouncement." }
+        } else {
+            DenouncementPanel {
+                my_id: id,
+                denouncement: v.denouncement.clone(),
+                roster: v.roster.clone(),
+                on_command: send_cmd,
+            }
         }
         for task in v.open_tasks.clone() {
             if task.is_location_task {
@@ -580,6 +641,11 @@ fn PlayerSelect(
     placeholder: &'static str,
     on_change: EventHandler<FormEvent>,
 ) -> Element {
+    // Sorted by name -- a review found every roster dropdown listed
+    // players in join order, making a specific name slower to find in a
+    // 20-30 player list than an alphabetical one would be.
+    let mut roster = roster;
+    roster.sort_by(|a, b| a.name.cmp(&b.name));
     rsx! {
         select {
             onchange: move |e| on_change.call(e),
@@ -603,6 +669,7 @@ fn FinaleCastOutReveal(reveal: Vec<PlayerReveal>, heading_level: u8) -> Element 
     }
     rsx! {
         div {
+            class: "finale-reveal",
             if heading_level == 2 {
                 h2 { "The Last Denouncement -- revealed" }
             } else {
@@ -613,7 +680,7 @@ fn FinaleCastOutReveal(reveal: Vec<PlayerReveal>, heading_level: u8) -> Element 
                     key: "{p.id.0}",
                     strong { "{p.name}" }
                     ": {p.true_faction:?}"
-                    if let Some(c) = p.character { ", {c:?}" }
+                    if let Some(c) = p.character { ", {character_label(c)}" }
                     if p.converted { " (secretly converted to the Cult)" }
                 }
             }
@@ -792,7 +859,13 @@ fn AbilityPanel(
     };
 
     let mut target = use_signal(|| None::<u32>);
-    let mut lands = use_signal(|| true);
+    // No default -- a review found this silently defaulted to `true`
+    // ("it lands"), so a player who didn't consciously flip the coin at
+    // the table before submitting would submit an outcome that was never
+    // actually decided. Forcing an explicit choice doesn't change what the
+    // ability does, just makes it harder to report the wrong coin flip by
+    // accident.
+    let mut lands = use_signal(|| None::<bool>);
     let mut kind = use_signal(|| InfoQueryKind::IsTheLeader);
 
     let others: Vec<RosterEntry> = roster
@@ -860,6 +933,13 @@ fn AbilityPanel(
                 },
                 Character::CultLeader => rsx! {
                     p { "Queries available: {abilities.cult_leader_queries_available.unwrap_or(0)}" }
+                    p {
+                        if abilities.recruitment_slots_available.unwrap_or(0) == 0 {
+                            "No recruitment slot available right now -- tell the Host once a new one opens up."
+                        } else {
+                            "Recruitment slots available: {abilities.recruitment_slots_available.unwrap_or(0)} -- tell the Host who to convert."
+                        }
+                    }
                     {target_picker}
                     select {
                         onchange: move |e| kind.set(if e.value() == "IsTonAligned" {
@@ -942,24 +1022,39 @@ fn AbilityPanel(
                         }
                     }
                     {target_picker}
+                    p { "Flip a coin at the table, then record what actually happened:" }
                     label {
                         input {
-                            r#type: "checkbox",
-                            checked: lands(),
-                            onchange: move |e| lands.set(e.checked()),
+                            r#type: "radio",
+                            name: "bartender-lands",
+                            checked: lands() == Some(true),
+                            onchange: move |_| lands.set(Some(true)),
                         }
-                        " it lands (flip a coin at the table)"
+                        " It landed"
+                    }
+                    label {
+                        input {
+                            r#type: "radio",
+                            name: "bartender-lands",
+                            checked: lands() == Some(false),
+                            onchange: move |_| lands.set(Some(false)),
+                        }
+                        " It didn't land"
                     }
                     button {
-                        disabled: !abilities.bartender_available.unwrap_or(false) || target().is_none(),
+                        disabled: !abilities.bartender_available.unwrap_or(false)
+                            || target().is_none()
+                            || lands().is_none(),
                         onclick: move |_| {
                             let Some(t) = target() else { return };
+                            let Some(l) = lands() else { return };
                             on_command
                                 .call(Command::BartenderTarget {
                                     player: my_id,
                                     target: PlayerId(t),
-                                    lands: lands(),
+                                    lands: l,
                                 });
+                            lands.set(None);
                         },
                         "Target",
                     }
@@ -1033,16 +1128,28 @@ fn describe_check(check: &InfoCheckDelivery, roster: &[RosterEntry]) -> String {
         .map(|t| names(&[t], roster))
         .unwrap_or_else(|| "no single target".to_string());
     match &check.answer {
-        InfoCheckAnswer::Dossier(d) => format!(
-            "{target}: apparent faction {:?}, converted: {}, character: {:?}",
-            d.apparent_faction, d.converted, d.character
-        ),
+        InfoCheckAnswer::Dossier(d) => {
+            let character = d.character.map(character_label).unwrap_or("no title yet");
+            let converted = if d.converted { "yes" } else { "no" };
+            format!(
+                "{target} -- apparent faction: {:?}, converted: {converted}, character: {character}",
+                d.apparent_faction
+            )
+        }
         InfoCheckAnswer::Faction(f) => format!("{target}: faction color {f:?}"),
         // `kind` distinguishes the Cult Leader's two possible yes/no
         // queries (IsTheLeader vs. IsTonAligned) -- without it, two
         // queries against different players/questions would render as
         // indistinguishable "Name: true/false" lines.
-        InfoCheckAnswer::Bool(b) => format!("{target} ({:?}): {b}", check.kind),
+        InfoCheckAnswer::Bool(b) => {
+            let question = match check.kind {
+                InfoQueryKind::IsTheLeader => "is the Revolutionary Leader",
+                InfoQueryKind::IsTonAligned => "is Ton-aligned",
+                _ => "?",
+            };
+            let answer = if *b { "yes" } else { "no" };
+            format!("{target} {question}: {answer}")
+        }
         InfoCheckAnswer::PlayerSet(set) => {
             format!("Definitely not the Leader: {}", names(set, roster))
         }
@@ -1059,11 +1166,19 @@ fn DenouncementPanel(
     let Some(phase) = denouncement else {
         return rsx! { p { "No Denouncement in progress." } };
     };
+    // A review found the Ballot and Runoff phases rendered identically
+    // (same "Ballot" heading, same copy) -- a player who voted in a first
+    // ballot that tied, then sees the exact same names reappear, had no
+    // way to tell this is a runoff (narrower field, real stakes) rather
+    // than a glitchy repeat. Checked against a reference so it doesn't
+    // consume `phase` before the match below does.
+    let is_runoff = matches!(&phase, DenouncementView::Runoff { .. });
 
-    let active_others: Vec<RosterEntry> = roster
+    let mut active_others: Vec<RosterEntry> = roster
         .into_iter()
         .filter(|r| r.status == PlayerStatus::Active && r.id != my_id)
         .collect();
+    active_others.sort_by(|a, b| a.name.cmp(&b.name));
 
     match phase {
         DenouncementView::Nomination { i_have_acted } => {
@@ -1109,8 +1224,15 @@ fn DenouncementPanel(
                 .cloned()
                 .collect();
             rsx! {
-                h3 { "Ballot" }
-                p { if i_have_acted { "You've voted." } else { "Cast your ballot." } }
+                if is_runoff {
+                    h3 { "Runoff -- the first ballot tied" }
+                    p {
+                        if i_have_acted { "You've voted in the runoff." } else { "Vote again to break the tie." }
+                    }
+                } else {
+                    h3 { "Ballot" }
+                    p { if i_have_acted { "You've voted." } else { "Cast your ballot." } }
+                }
                 select {
                     onchange: move |e| pick.set(e.value().parse().ok()),
                     option { value: "", "-- choose --" }
@@ -1151,6 +1273,38 @@ fn names(ids: &[PlayerId], roster: &[RosterEntry]) -> String {
         .join(", ")
 }
 
+/// A human-readable label for every `Character` variant -- a review pass
+/// found the player's own reveal rendered these via `{c:?}` (e.g. a bare
+/// "PrincePrincess", no space), inconsistent with the Host's own
+/// character-assign dropdown, which already spells the 4 titled roles out
+/// properly. This extends that same treatment to the rest of the roster so
+/// every player's reveal reads as prose, not a Rust identifier.
+fn character_label(c: Character) -> &'static str {
+    match c {
+        Character::KingQueen => "King/Queen",
+        Character::PrincePrincess => "Prince/Princess",
+        Character::RevolutionaryLeader => "Revolutionary Leader",
+        Character::CultLeader => "Cult Leader",
+        Character::Oracle => "Oracle",
+        Character::Almanac => "Almanac",
+        Character::Spymaster => "Spymaster",
+        Character::PriestPriestess => "Priest/Priestess",
+        Character::PotionMaker => "Potion Maker",
+        Character::Magistrate => "Magistrate",
+        Character::Bartender => "Bartender",
+        Character::DoctorMedic => "Doctor/Medic",
+        Character::Firebrand => "Firebrand",
+        Character::CellLeader => "Cell Leader",
+        Character::Deceiver => "Deceiver",
+        Character::Duelist => "Duelist",
+        Character::Agitator => "Agitator",
+        Character::GrandInquisitor => "Grand Inquisitor",
+        Character::NormalTon => "Ton",
+        Character::NormalUprising => "Uprising",
+        Character::Cultist => "Cultist",
+    }
+}
+
 #[component]
 fn TaskAttemptForm(
     my_id: PlayerId,
@@ -1158,10 +1312,11 @@ fn TaskAttemptForm(
     roster: Vec<RosterEntry>,
     on_command: EventHandler<Command>,
 ) -> Element {
-    let options: Vec<RosterEntry> = roster
+    let mut options: Vec<RosterEntry> = roster
         .into_iter()
         .filter(|r| r.status == PlayerStatus::Active && r.id != my_id)
         .collect();
+    options.sort_by(|a, b| a.name.cmp(&b.name));
 
     if let Some(credited) = task.my_outcome {
         return rsx! {
@@ -1195,6 +1350,9 @@ fn TaskAttemptForm(
                         option { selected: slot == Some(r.id.0), value: "{r.id.0}", "{r.name}" }
                     }
                 }
+            }
+            if picks.0.is_some() && picks.1.is_some() && picks.2.is_some() && !all_distinct {
+                p { "Pick three different people." }
             }
             button {
                 disabled: !all_distinct,
@@ -1266,10 +1424,10 @@ fn Host() -> Element {
         let _ = socket.send(ClientMsg::Watch(Viewer::Host)).await;
         loop {
             match socket.recv().await {
-                Ok(ServerMsg::View(v)) => {
-                    view.set(Some(v));
-                    error.set(None);
-                }
+                // Deliberately NOT clearing `error` here -- see `Play`'s
+                // identical comment on the same fix. Every Host-visible
+                // action below clears it locally instead.
+                Ok(ServerMsg::View(v)) => view.set(Some(v)),
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
                 Ok(ServerMsg::Joined { .. }) => {}
                 Ok(ServerMsg::LocationTaskTemplates(templates)) => {
@@ -1287,32 +1445,37 @@ fn Host() -> Element {
         }
     });
 
-    let do_cmd = move |cmd: Command| {
+    let mut do_cmd = move |cmd: Command| {
         let socket = socket;
+        error.set(None);
         spawn(async move {
             let _ = socket.send(ClientMsg::Do(cmd)).await;
         });
     };
-    let run_raffle = move || {
+    let mut run_raffle = move || {
         let socket = socket;
+        error.set(None);
         spawn(async move {
             let _ = socket.send(ClientMsg::RunRaffle).await;
         });
     };
-    let push_location_task = move |index: usize| {
+    let mut push_location_task = move |index: usize| {
         let socket = socket;
+        error.set(None);
         spawn(async move {
             let _ = socket.send(ClientMsg::PushLocationTask { index }).await;
         });
     };
-    let draw_intermission_entrants = move || {
+    let mut draw_intermission_entrants = move || {
         let socket = socket;
+        error.set(None);
         spawn(async move {
             let _ = socket.send(ClientMsg::DrawIntermissionEntrants).await;
         });
     };
-    let start_round_one = move || {
+    let mut start_round_one = move || {
         let socket = socket;
+        error.set(None);
         spawn(async move {
             let _ = socket.send(ClientMsg::StartRoundOne).await;
         });
@@ -1337,9 +1500,21 @@ fn Host() -> Element {
     // requires a second, distinct click before the command actually fires,
     // and resets the moment either dropdown changes.
     let mut convert_armed = use_signal(|| false);
+    // The Intermission draw is once-per-game and irreversible (a misclick
+    // during Round 1 permanently locks in a near-empty entrant pool for
+    // the whole night) -- a review found it was a single unguarded button,
+    // unlike Convert's arm/confirm pattern above. Reusing that same shape
+    // here.
+    let mut draw_armed = use_signal(|| false);
     let mut contest_round = use_signal(|| Round::Two);
-    let mut contest_category = use_signal(|| ContestCategory::Strength);
-    let mut contest_ton_won = use_signal(|| true);
+    // Neither defaults, and both reset to `None` after every submit -- a
+    // review found these stayed sticky across submissions with no reset,
+    // which combined badly with `RecordContestResult` silently overwriting
+    // an existing result rather than rejecting a repeat: a stale category
+    // or winner selection carried into the next submit could quietly
+    // clobber an already-correct result for a different category.
+    let mut contest_category = use_signal(|| None::<ContestCategory>);
+    let mut contest_ton_won = use_signal(|| None::<bool>);
     let mut servant_award_player = use_signal(|| None::<u32>);
     let mut servant_award_points = use_signal(|| 1u32);
     let mut gallery_winner = use_signal(|| Faction::Ton);
@@ -1354,6 +1529,11 @@ fn Host() -> Element {
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
     let interest_levels = view().map(|v| v.interest_levels).unwrap_or_default();
+    let raffle_closed = view().map(|v| v.raffle_closed).unwrap_or(false);
+    let recruitment_slots_available_for_host =
+        view().and_then(|v| v.recruitment_slots_available_for_host);
+    let denouncement_phase = view().and_then(|v| v.denouncement);
+    let open_tasks = view().map(|v| v.open_tasks).unwrap_or_default();
     let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
     let winner = view().and_then(|v| v.winner);
     let task_candidates = view().map(|v| v.task_candidates).unwrap_or_default();
@@ -1372,7 +1552,20 @@ fn Host() -> Element {
     let phase_summary = match &view() {
         None => "Connecting...".to_string(),
         Some(v) => match &v.denouncement {
-            None => format!("{:?} -- no Denouncement currently open", v.current_round),
+            // A review found "Start Round 1 (push tasks)" gave no
+            // confirmation it worked -- a host had to switch to /display
+            // to check. Folding open-task count into this same
+            // always-visible banner (already used for Denouncement
+            // sub-phases) covers that gap for every round, not just
+            // Round 1.
+            None if v.open_tasks.is_empty() => {
+                format!("{:?} -- no Denouncement currently open", v.current_round)
+            }
+            None => format!(
+                "{:?} -- no Denouncement currently open -- {} task(s) open",
+                v.current_round,
+                v.open_tasks.len()
+            ),
             Some(DenouncementView::Nomination { .. }) => {
                 format!("{:?} -- Nomination open", v.current_round)
             }
@@ -1401,7 +1594,7 @@ fn Host() -> Element {
             "{phase_summary}"
         }
         if let Some(e) = error() {
-            p { style: "color:red", "{e}" }
+            p { class: "error-text", "{e}" }
         }
         if has_new_whistledown {
             div {
@@ -1437,13 +1630,32 @@ fn Host() -> Element {
             p {
                 "{interest_levels.len()} of {roster.len()} players have rated their interest so far (rules.md §1)."
             }
-            button {
-                onclick: move |_| run_raffle(),
-                "Run the raffle"
+            {
+                let rated: std::collections::BTreeSet<PlayerId> =
+                    interest_levels.iter().map(|&(id, _)| id).collect();
+                let missing: Vec<&RosterEntry> =
+                    roster.iter().filter(|r| !rated.contains(&r.id)).collect();
+                rsx! {
+                    if !missing.is_empty() {
+                        p {
+                            "Still waiting on: "
+                            {missing.iter().map(|r| r.name.clone()).collect::<Vec<_>>().join(", ")}
+                        }
+                    }
+                }
             }
-            p {
-                "Running the raffle assigns every named role by weighted ticket (higher interest = more tickets), splits everyone else across Ton/Uprising, then finalizes setup -- anyone added afterward joins as a Servant automatically. The controls below are for a manual fix-up afterward, or for designating the Deceiver mid-game."
+            if raffle_closed {
+                p { "Setup finalized -- roles and factions are assigned. The controls below are for a manual fix-up, or for designating the Deceiver mid-game." }
+            } else {
+                button {
+                    onclick: move |_| run_raffle(),
+                    "Run the raffle"
+                }
+                p {
+                    "Running the raffle assigns every named role by weighted ticket (higher interest = more tickets), splits everyone else across Ton/Uprising, then finalizes setup -- anyone added afterward joins as a Servant automatically."
+                }
             }
+            p { "Manual path (skip this if you used \"Run the raffle\" above): assign a faction to every player first, assign the four titles below to their holders, then Finalize -- everyone else gets a generic character automatically." }
             div {
                 PlayerSelect {
                     roster: roster.clone(),
@@ -1508,7 +1720,6 @@ fn Host() -> Element {
                     "Assign title"
                 }
             }
-            p { "Manual path (skip this if you used \"Run the raffle\" above): assign a faction to every player first, assign the four titles above to their holders, then Finalize -- everyone else gets a generic character automatically." }
             button { onclick: move |_| do_cmd(Command::FinalizeSetup), "Finalize setup" }
         }
         div {
@@ -1520,14 +1731,34 @@ fn Host() -> Element {
         }
         div {
             h3 { "The Denouncement" }
-            button { onclick: move |_| do_cmd(Command::OpenDenouncement), "Open Denouncement" }
-            button { onclick: move |_| do_cmd(Command::CloseNomination), "Close nomination" }
-            button { onclick: move |_| do_cmd(Command::OpenBallot), "Open ballot" }
+            p { "Only the button matching the current phase above is enabled -- a review found all five were always clickable regardless of phase, so an out-of-order click just produced a raw error." }
+            if denouncement_phase.is_none() && !open_tasks.is_empty() {
+                p { class: "warning-text",
+                    "{open_tasks.len()} task(s) are still open -- rules.md locks submissions before nomination starts. Close tasks below first, or open the Denouncement anyway if that's intentional."
+                }
+            }
             button {
+                disabled: denouncement_phase.is_some(),
+                onclick: move |_| do_cmd(Command::OpenDenouncement),
+                "Open Denouncement",
+            }
+            button {
+                disabled: !matches!(denouncement_phase, Some(DenouncementView::Nomination { .. })),
+                onclick: move |_| do_cmd(Command::CloseNomination),
+                "Close nomination",
+            }
+            button {
+                disabled: !matches!(denouncement_phase, Some(DenouncementView::Discussion { .. })),
+                onclick: move |_| do_cmd(Command::OpenBallot),
+                "Open ballot",
+            }
+            button {
+                disabled: !matches!(denouncement_phase, Some(DenouncementView::Ballot { .. })),
                 onclick: move |_| do_cmd(Command::CloseBallot { fallback_replacement: None }),
                 "Close ballot"
             }
             button {
+                disabled: !matches!(denouncement_phase, Some(DenouncementView::Runoff { .. })),
                 onclick: move |_| do_cmd(Command::CloseRunoff { fallback_replacement: None }),
                 "Close runoff"
             }
@@ -1536,13 +1767,24 @@ fn Host() -> Element {
             h3 { "Tasks" }
             p { "Rounds 3 and 5 each auto-push their own bio-derived tasks the moment that round's task phase begins -- no action needed there. Round 1's two tasks wait for you: click below once you've given the live intro and everyone's revealed their character." }
             button { onclick: move |_| start_round_one(), "Start Round 1 (push tasks)" }
+            if open_tasks.is_empty() {
+                p { "No tasks currently open." }
+            } else {
+                p { "Currently open ({open_tasks.len()}):" }
+                ul {
+                    for task in open_tasks.clone() {
+                        li { key: "{task.id.0}", "{task.prompt} ({task.tier:?})" }
+                    }
+                }
+            }
+            button { onclick: move |_| do_cmd(Command::CloseTasks), "Close tasks" }
             p { "The controls below are for a manual top-up or fix-up only." }
             h4 { "From player bios (rules.md §4, Rounds 3/5)" }
             for (tier , candidates) in task_candidates.clone() {
                 div {
                     key: "{tier:?}",
-                    p { "{tier:?}:" }
-                    for candidate in candidates {
+                    p { "{tier:?} ({candidates.len()} candidates):" }
+                    for candidate in candidates.into_iter().take(8) {
                         button {
                             key: "{candidate.prompt}",
                             onclick: {
@@ -1608,11 +1850,19 @@ fn Host() -> Element {
                 },
                 "Push task"
             }
-            button { onclick: move |_| do_cmd(Command::CloseTasks), "Close tasks" }
         }
         div {
             h3 { "Cult Leader: Convert" }
-            p { "The Cult Leader has no self-service way to do this from their own phone -- they tell you who to convert, and you act on it here. The host's own view never shows factions/characters (see the security note on view_for), so use the player IDs you assigned during setup, not names shown here. This is irreversible and secret -- double check before confirming." }
+            p { "The Cult Leader has no self-service way to do this from their own phone -- they tell you who to convert, and you act on it here. This is irreversible and secret -- double check before confirming." }
+            if let Some(slots) = recruitment_slots_available_for_host {
+                p {
+                    if slots == 0 {
+                        "No recruitment slot is currently available -- wait for the next round to open one."
+                    } else {
+                        "{slots} recruitment slot(s) currently available."
+                    }
+                }
+            }
             PlayerSelect {
                 roster: roster.clone(),
                 placeholder: "-- converter (Cult Leader) --",
@@ -1654,6 +1904,13 @@ fn Host() -> Element {
         div {
             h3 { "Contest rounds (Round 2 & 4)" }
             p { "The actual mini-games are designed later -- this just records each category's result. Players never see the running standings or the breakdown (only the engine tracks it, for the Leader's Confidants)." }
+            p {
+                if contest_round() == Round::Two {
+                    "Round 2: the whole room competes together, one category at a time."
+                } else {
+                    "Round 4: 3 simultaneous zones, one per category -- a Cast-Out scorekeeper reports each zone's result in as it finishes."
+                }
+            }
             select {
                 onchange: move |e| {
                     contest_round.set(if e.value() == "Four" { Round::Four } else { Round::Two });
@@ -1662,29 +1919,52 @@ fn Host() -> Element {
                 option { value: "Four", "Round 4" }
             }
             select {
+                value: match contest_category() {
+                    Some(ContestCategory::Strength) => "Strength",
+                    Some(ContestCategory::Creativity) => "Creativity",
+                    Some(ContestCategory::Intelligence) => "Intelligence",
+                    None => "",
+                },
                 onchange: move |e| {
                     contest_category.set(match e.value().as_str() {
-                        "Creativity" => ContestCategory::Creativity,
-                        "Intelligence" => ContestCategory::Intelligence,
-                        _ => ContestCategory::Strength,
+                        "Strength" => Some(ContestCategory::Strength),
+                        "Creativity" => Some(ContestCategory::Creativity),
+                        "Intelligence" => Some(ContestCategory::Intelligence),
+                        _ => None,
                     });
                 },
+                option { value: "", "-- category --" }
                 option { value: "Strength", "Strength" }
                 option { value: "Creativity", "Creativity" }
                 option { value: "Intelligence", "Intelligence" }
             }
             select {
-                onchange: move |e| contest_ton_won.set(e.value() == "Ton"),
+                value: match contest_ton_won() {
+                    Some(true) => "Ton",
+                    Some(false) => "Uprising",
+                    None => "",
+                },
+                onchange: move |e| {
+                    contest_ton_won.set(match e.value().as_str() {
+                        "Ton" => Some(true),
+                        "Uprising" => Some(false),
+                        _ => None,
+                    });
+                },
+                option { value: "", "-- who won? --" }
                 option { value: "Ton", "Ton won" }
                 option { value: "Uprising", "Uprising won" }
             }
             button {
+                disabled: contest_category().is_none() || contest_ton_won().is_none(),
                 onclick: move |_| {
-                    do_cmd(Command::RecordContestResult {
-                        round: contest_round(),
-                        category: contest_category(),
-                        ton_won: contest_ton_won(),
-                    });
+                    let (Some(category), Some(ton_won)) = (contest_category(), contest_ton_won())
+                    else {
+                        return;
+                    };
+                    do_cmd(Command::RecordContestResult { round: contest_round(), category, ton_won });
+                    contest_category.set(None);
+                    contest_ton_won.set(None);
                 },
                 "Record result"
             }
@@ -1709,10 +1989,17 @@ fn Host() -> Element {
         }
         div {
             h3 { "Intermission lottery" }
-            p { "Draws up to 5 entrants from whoever opted in and is still active -- you don't get a names-and-opt-ins list (same no-ambient-god-view rule as everywhere else), so this runs the draw server-side instead of asking you to pick." }
+            p { "Draws up to 5 entrants from whoever opted in and is still active -- you don't get a names-and-opt-ins list (same no-ambient-god-view rule as everywhere else), so this runs the draw server-side instead of asking you to pick. This can only run once per game, so double-check everyone who wants in has opted in before confirming." }
             button {
-                onclick: move |_| draw_intermission_entrants(),
-                "Draw entrants"
+                onclick: move |_| {
+                    if !draw_armed() {
+                        draw_armed.set(true);
+                        return;
+                    }
+                    draw_armed.set(false);
+                    draw_intermission_entrants();
+                },
+                if draw_armed() { "Confirm draw -- click again" } else { "Draw entrants" }
             }
         }
         div {
@@ -1947,8 +2234,11 @@ fn Display() -> Element {
                 Some(DenouncementView::Discussion { surfaced }) => rsx! {
                     p { "Up for the Denouncement: {names(surfaced, &v.roster)}" }
                 },
-                Some(DenouncementView::Ballot { candidates, .. } | DenouncementView::Runoff { candidates, .. }) => rsx! {
+                Some(DenouncementView::Ballot { candidates, .. }) => rsx! {
                     p { "Ballot open for: {names(candidates, &v.roster)}" }
+                },
+                Some(DenouncementView::Runoff { candidates, .. }) => rsx! {
+                    p { "Runoff -- the first ballot tied. Voting again for: {names(candidates, &v.roster)}" }
                 },
                 None => rsx! { p { "No Denouncement in progress." } },
             }

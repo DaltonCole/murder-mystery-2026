@@ -222,6 +222,21 @@ pub struct PlayerView {
     /// it. See `finale_reveal::martyrdom_message_for`'s doc comment: unlike
     /// `finale_reveal` above, this isn't gated to the Finale at all.
     pub martyrdom_message: Option<String>,
+    /// Whether the setup raffle has been run and setup finalized -- public
+    /// to every viewer kind, unlike anyone's actual faction/character. A UX
+    /// review found the Host console gave zero on-screen confirmation that
+    /// clicking "Run the raffle" actually did anything; this is purely so
+    /// the Host UI can show a plain success/pending state, not a new secret.
+    pub raffle_closed: bool,
+    /// How many Cult recruitment slots are currently available to spend --
+    /// `Viewer::Host` ONLY (a Cult Leader player already gets their own
+    /// copy of this via `my_abilities.recruitment_slots_available`). A
+    /// count, not an identity -- doesn't reveal who the Cult Leader is or
+    /// who's been recruited, just a number the Host needs to sanity-check
+    /// before acting on the Cult Leader's "convert them now" instruction in
+    /// the Convert panel (`AbilityStatus::recruitment_slots_available`'s
+    /// own doc comment names exactly this gap).
+    pub recruitment_slots_available_for_host: Option<usize>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -356,6 +371,11 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         .unwrap_or_default();
     let martyrdom_message =
         viewer_id.and_then(|id| finale_reveal::martyrdom_message_for(state, id));
+    let recruitment_slots_available_for_host = if is_host {
+        Some(state.available_recruitment_slots())
+    } else {
+        None
+    };
 
     PlayerView {
         roster,
@@ -385,6 +405,8 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         finale_reveal: finale_reveal_for_host,
         finale_cast_out_reveal,
         martyrdom_message,
+        raffle_closed: state.raffle_closed(),
+        recruitment_slots_available_for_host,
     }
 }
 
@@ -1767,6 +1789,65 @@ mod tests {
             .interest_levels
             .is_empty());
         assert!(view_for(&state, Viewer::Display).interest_levels.is_empty());
+    }
+
+    #[test]
+    fn raffle_closed_is_visible_to_every_viewer_kind() {
+        let mut state = GameState::new();
+        let alice = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Alice".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+
+        assert!(!view_for(&state, Viewer::Host).raffle_closed);
+        assert!(!view_for(&state, Viewer::Player(alice)).raffle_closed);
+        assert!(!view_for(&state, Viewer::Display).raffle_closed);
+
+        apply_command(&mut state, Command::CloseRaffle).unwrap();
+
+        assert!(view_for(&state, Viewer::Host).raffle_closed);
+        assert!(view_for(&state, Viewer::Player(alice)).raffle_closed);
+        assert!(view_for(&state, Viewer::Display).raffle_closed);
+    }
+
+    #[test]
+    fn recruitment_slots_available_for_host_is_visible_to_the_host_only() {
+        let mut state = GameState::new();
+        let alice = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Alice".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+
+        assert_eq!(
+            view_for(&state, Viewer::Host).recruitment_slots_available_for_host,
+            Some(0)
+        );
+        assert_eq!(
+            view_for(&state, Viewer::Player(alice)).recruitment_slots_available_for_host,
+            None
+        );
+        assert_eq!(
+            view_for(&state, Viewer::Display).recruitment_slots_available_for_host,
+            None
+        );
     }
 
     #[test]
