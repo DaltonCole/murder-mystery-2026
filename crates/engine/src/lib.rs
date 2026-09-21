@@ -40,7 +40,7 @@ pub use event::DomainEvent;
 pub use finale_reveal::{
     martyrdom_message_for, reveal as finale_reveal, FinaleReveal, PlayerReveal,
 };
-pub use player::{Faction, Player, PlayerId};
+pub use player::{Faction, Player, PlayerId, MAX_PLAYERS, MAX_PLAYER_NAME_LEN};
 pub use raffle::{
     raffle_priority, raffle_winners, ticket_count, ticket_slots, MAX_INTEREST_LEVEL,
     MIN_INTEREST_LEVEL, RAFFLED_ROLES,
@@ -49,7 +49,7 @@ pub use recruitment::recruitment_window_size;
 pub use round::Round;
 pub use servant::GalleryPrediction;
 pub use state::{apply_command, GameState};
-pub use task::{TaskDef, TaskId, TaskTier};
+pub use task::{TaskDef, TaskId, TaskTier, MAX_LOCATION_CODE_LEN, MAX_TASK_PROMPT_LEN};
 pub use view::{view_for, DenouncementView, PlayerView, RosterEntry, TaskView, Viewer};
 pub use whistledown::{posts as whistledown_posts, WhistledownPost};
 pub use win_condition::{evaluate as evaluate_win_conditions, CultPath, GameOutcome};

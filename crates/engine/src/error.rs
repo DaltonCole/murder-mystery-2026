@@ -177,8 +177,22 @@ pub enum GameError {
     #[error("Gallery predictions can only be resolved once the Last Denouncement has closed")]
     GalleryResolutionTooEarly,
 
-    #[error("bio field {field} is {len} characters, over rules.md's 32-character cap")]
-    BioFieldTooLong { field: &'static str, len: usize },
+    /// Generic over-length rejection for any capped free-text field --
+    /// originally Bio-specific (`field: "occupation"`, etc., capped at
+    /// rules.md's 32 characters), now reused for anything else a client
+    /// supplies with no inherent size limit of its own (a player's name, a
+    /// Host-authored task prompt, a location task's code): a
+    /// reliability/security review found none of those had a cap at all,
+    /// making a multi-megabyte string a real memory/bandwidth amplifier
+    /// against the one process running the whole live event, since every
+    /// successful mutation broadcasts a freshly-cloned `PlayerView` to
+    /// every connected client.
+    #[error("{field} is {len} characters, over the {max}-character cap")]
+    FieldTooLong {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
 
     #[error("interest level {0} is outside rules.md §1's 1-10 range")]
     InterestLevelOutOfRange(u8),
@@ -188,4 +202,7 @@ pub enum GameError {
 
     #[error("task {0:?} is not a location task -- use AttemptTask, not AttemptLocationTask")]
     NotALocationTask(TaskId),
+
+    #[error("the roster is already at its {max}-player cap")]
+    TooManyPlayers { max: usize },
 }

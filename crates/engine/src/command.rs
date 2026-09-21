@@ -134,9 +134,15 @@ pub enum Command {
 
     /// The King/Queen's once-per-game, self-triggered escape hatch
     /// (rules.md §3.1) -- voluntarily hands the title to `new_holder`
-    /// before Round 5. Rejected once already used, rejected from Round 5
-    /// onward.
-    TransferKingQueen { new_holder: PlayerId },
+    /// before Round 5. Rejected unless `player` currently holds
+    /// `Character::KingQueen` (a security review found this check missing
+    /// entirely -- every other self-service ability enforces actor
+    /// identity via `require_character`; this is the fix), once already
+    /// used, or rejected from Round 5 onward.
+    TransferKingQueen {
+        player: PlayerId,
+        new_holder: PlayerId,
+    },
 
     /// The Denouncement's outcome for one player: removes them from active
     /// play and, depending on which title (if any) they held, triggers the

@@ -2,6 +2,19 @@ use crate::player::PlayerId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+/// A security/reliability review found `PushTask`'s `prompt` had no length
+/// cap -- unlike `Bio`'s fields, a Host-only command any raw connection can
+/// currently issue (see `main.rs`'s documented auth gap) could push a
+/// multi-megabyte prompt, broadcast to every connected client for as long
+/// as the task stays open. Generous enough for a real riddle; not a
+/// rules.md quote.
+pub const MAX_TASK_PROMPT_LEN: usize = 200;
+
+/// Same review, for a location task's code (`PushTask`'s `expected_code`
+/// and a player's own guess in `AttemptLocationTask`) -- physical codes are
+/// short by nature, so this is already generous.
+pub const MAX_LOCATION_CODE_LEN: usize = 64;
+
 /// Stable identifier for a task, assigned in creation order across the
 /// whole game (not per-round) -- see `PlayerId` for the same rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

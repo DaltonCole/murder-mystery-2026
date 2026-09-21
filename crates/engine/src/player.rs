@@ -1,6 +1,20 @@
 use crate::character::{Character, PlayerStatus};
 use serde::{Deserialize, Serialize};
 
+/// A security/reliability review found `Command::AddPlayer`'s `name` had no
+/// length cap at all -- unlike `Bio`'s fields (`bio::MAX_FIELD_LEN`), a
+/// client could join with a multi-megabyte name, and since every successful
+/// mutation broadcasts a freshly-cloned `PlayerView` (including the full
+/// roster) to every connected client, that's a real memory/bandwidth
+/// amplifier against the one process running the whole live event. 64 is
+/// generous for a real name while closing that off; not a rules.md quote.
+pub const MAX_PLAYER_NAME_LEN: usize = 64;
+
+/// Same review: no cap on total roster size either, so repeated joins alone
+/// could grow `GameState` unboundedly. Far above the real 20-30 player
+/// target (rules.md §1) -- this is a safety backstop, not a game rule.
+pub const MAX_PLAYERS: usize = 100;
+
 /// Stable identifier for a player, assigned in join order.
 ///
 /// Newtype (rather than a bare `u32`) so `PlayerId` can never be silently

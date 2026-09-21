@@ -63,6 +63,29 @@ pub fn reveal(state: &GameState) -> Option<FinaleReveal> {
     if state.current_round() != Round::Finale || state.denouncement_phase().is_some() {
         return None;
     }
+    // `denouncement_phase().is_some()` alone can't distinguish "never
+    // opened" from "opened, then closed" -- `close_denouncement` resets the
+    // field to `None` rather than leaving a terminal "Closed" phase behind,
+    // so both states look identical from here. A security/reliability
+    // review found that gap meant `reveal` returned the full walkthrough
+    // (everyone's true faction/character/conversion) the instant
+    // `Round::Finale` began, *before* `OpenDenouncement` for the Last
+    // Denouncement was ever called -- reachable through the real intended
+    // driving pattern (advancing to the Finale round is a separate step
+    // from opening its Denouncement). Track "opened this round" the same
+    // way `whistledown::posts` already does: scan for `DenouncementOpened`
+    // since the last `RoundAdvanced`.
+    let mut opened_this_round = false;
+    for event in state.event_log() {
+        match event {
+            DomainEvent::RoundAdvanced { .. } => opened_this_round = false,
+            DomainEvent::DenouncementOpened => opened_this_round = true,
+            _ => {}
+        }
+    }
+    if !opened_this_round {
+        return None;
+    }
 
     let everyone = state
         .players()
@@ -107,13 +130,18 @@ pub fn reveal(state: &GameState) -> Option<FinaleReveal> {
 /// currently-converted title-holder(s) triggered it. Unlike `reveal`
 /// above, this isn't gated to the Finale: martyrdom can trigger at any
 /// Denouncement the Cult Leader is personally Cast Out at, per rules.md
-/// §2's Path D. Scoped to whoever *currently* holds a converted title --
-/// see the module-level judgment-call note in this function's own doc
-/// comment history for why that's the practical reading, not a rules.md
-/// quote: the title-holder who triggered martyrdom is the one still
-/// holding it in the overwhelmingly common case (a Cast-Out or succeeded
-/// title-holder is replaced by a fresh, unconverted one, per
-/// `state::resolve_cast_out`).
+/// §2's Path D. Scoped to whoever holds a converted King/Queen or
+/// Revolutionary Leader *character* -- not the current title *slot*
+/// (`state.king_queen()`/`state.revolutionary_leader()`): a reliability
+/// review found those diverge for a converted King/Queen specifically,
+/// since `convert()`'s own cascade reassigns the slot to a fresh player
+/// while the original convert keeps `character == Some(KingQueen)` forever
+/// (rules.md: "a converted player keeps their original character"). Once
+/// that cascade fires in a realistic game (any other eligible Ton player
+/// exists), checking the slot meant *neither* player ever got the
+/// message: the new holder isn't converted, and the real convert no
+/// longer equals `state.king_queen()`. `character` has no such split --
+/// it's permanent on the player it was assigned to.
 pub fn martyrdom_message_for(state: &GameState, viewer: PlayerId) -> Option<String> {
     if !state.martyrdom_triggered() {
         return None;
@@ -122,9 +150,11 @@ pub fn martyrdom_message_for(state: &GameState, viewer: PlayerId) -> Option<Stri
     if !player.converted {
         return None;
     }
-    let holds_a_title =
-        state.king_queen() == Some(viewer) || state.revolutionary_leader() == Some(viewer);
-    if !holds_a_title {
+    let holds_a_convertible_title = matches!(
+        player.character,
+        Some(Character::KingQueen) | Some(Character::RevolutionaryLeader)
+    );
+    if !holds_a_convertible_title {
         return None;
     }
     let cult_leader_name = state
@@ -187,6 +217,29 @@ mod tests {
         assert_eq!(state.current_round(), Round::Finale);
         apply_command(&mut state, Command::OpenDenouncement).unwrap();
         assert!(reveal(&state).is_none());
+    }
+
+    #[test]
+    fn no_reveal_at_the_finale_before_its_denouncement_has_even_opened() {
+        // Security regression: `denouncement_phase().is_some()` alone
+        // can't tell "never opened" apart from "opened, then closed" --
+        // both are `None`. Without the fix, `reveal` returned the full
+        // walkthrough (everyone's true faction/character/conversion) the
+        // instant `Round::Finale` began, before `OpenDenouncement` was
+        // ever called -- reachable through the real driving pattern, since
+        // advancing to the Finale round is a separate step from opening
+        // its Denouncement.
+        let mut state = GameState::new();
+        add_player(&mut state, "Alice", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        for _ in 0..5 {
+            apply_command(&mut state, Command::AdvanceRound).unwrap();
+        }
+        assert_eq!(state.current_round(), Round::Finale);
+        assert!(
+            reveal(&state).is_none(),
+            "must not reveal before the Last Denouncement has even opened"
+        );
     }
 
     #[test]
@@ -289,5 +342,92 @@ mod tests {
 
         assert_eq!(martyrdom_message_for(&state, king_queen), None);
         assert_eq!(martyrdom_message_for(&state, bystander), None);
+    }
+
+    #[test]
+    fn martyrdom_message_still_reaches_the_original_convert_after_the_king_queen_cascade_reassigns_the_crown(
+    ) {
+        // Regression: `convert()`'s King/Queen cascade reassigns
+        // `state.king_queen()` to a fresh player while the original
+        // convert keeps `character == Some(KingQueen)` forever (rules.md:
+        // "a converted player keeps their original character"). Checking
+        // the title *slot* here used to mean neither player ever got the
+        // martyrdom message once a real replacement existed -- the
+        // original test above never caught this because its 2-player
+        // setup has no eligible replacement, so the cascade never actually
+        // moves the crown.
+        let mut state = GameState::new();
+        let cult_leader = add_player(&mut state, "CultLeader", Faction::Cult);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: cult_leader,
+                character: Character::CultLeader,
+            },
+        )
+        .unwrap();
+        let king_queen = add_player(&mut state, "King", Faction::Ton);
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: king_queen,
+                character: Character::KingQueen,
+            },
+        )
+        .unwrap();
+        // A second, untitled Ton player -- the cascade's actual replacement.
+        let extra_ton = add_player(&mut state, "ExtraTon", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, opens a recruitment slot
+
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: king_queen,
+            },
+        )
+        .unwrap();
+        // Confirm the cascade actually reassigned the crown -- this test
+        // is meaningless if it didn't.
+        assert_eq!(state.king_queen(), Some(extra_ton));
+
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: extra_ton,
+                nominee: cult_leader,
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseNomination).unwrap();
+        apply_command(&mut state, Command::OpenBallot).unwrap();
+        apply_command(
+            &mut state,
+            Command::CastBallot {
+                voter: extra_ton,
+                ballot: crate::denouncement::Ballot::For(cult_leader),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CloseBallot {
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(state.martyrdom_triggered());
+
+        let message = martyrdom_message_for(&state, king_queen).expect(
+            "the original convert should still get the message despite losing the title slot",
+        );
+        assert!(message.contains("CultLeader"));
+        assert_eq!(
+            martyrdom_message_for(&state, extra_ton),
+            None,
+            "the new, unconverted title-holder must not get the message"
+        );
     }
 }

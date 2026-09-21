@@ -482,6 +482,7 @@ impl PlayerBot {
             if let Some(target) = active_others(&view.roster, self.id).choose(&mut self.rng) {
                 self.transfer_king_queen_attempts += 1;
                 self.send(Command::TransferKingQueen {
+                    player: self.id,
                     new_holder: target.id,
                 })
                 .await?;

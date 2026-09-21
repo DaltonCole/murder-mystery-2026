@@ -234,6 +234,17 @@ pub struct GameState {
     /// Computed once, automatically, at `FinalizeSetup` -- starting
     /// knowledge, not something anyone activates.
     cell_leader_knows: Vec<PlayerId>,
+    /// Guards `cell_leader_knows` so it's genuinely computed only once, not
+    /// merely documented as such: `FinalizeSetup` is safely repeatable (its
+    /// own doc comment: "after adding more players"), and a security
+    /// review found that without this flag, a later re-call would silently
+    /// recompute the set from *current* state -- e.g. after a Revolutionary
+    /// Leader succession, dropping the old Leader's name and adding the
+    /// new one, a visible change letting the Cell Leader deduce the new
+    /// (secret) Leader's identity. An `is_empty()` check would have the
+    /// same bug in a game with zero eligible Uprising candidates at first
+    /// call, so this is a dedicated flag instead.
+    cell_leader_knowledge_computed: bool,
 
     // --- Phase 2: info-check family (rules.md §3.1-3.3) ---
     /// Oracle: how many checks are currently available (one after every
@@ -313,6 +324,7 @@ impl Default for GameState {
             gallery_predictions: BTreeMap::new(),
             gallery_resolved: false,
             cell_leader_knows: Vec::new(),
+            cell_leader_knowledge_computed: false,
             oracle_checks_available: 0,
             almanac_used: false,
             spymaster_used: false,
@@ -776,23 +788,7 @@ impl GameState {
 /// unchanged.
 pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
     let events = match cmd {
-        Command::AddPlayer { name } => {
-            let id = PlayerId(state.next_player_id);
-            state.next_player_id += 1;
-            state.players.insert(id, Player::new(id, name.clone()));
-            let mut events = vec![DomainEvent::PlayerAdded { id, name }];
-            // Rules.md §1: "late arrivals become Servants" -- the raffle
-            // has already closed, so this player never gets a shot at a
-            // named role; see `Command::AddPlayer`'s doc comment.
-            if state.raffle_closed {
-                state.players.get_mut(&id).unwrap().faction = Faction::Servant;
-                events.push(DomainEvent::FactionAssigned {
-                    player: id,
-                    faction: Faction::Servant,
-                });
-            }
-            events
-        }
+        Command::AddPlayer { name } => add_player(state, name)?,
 
         Command::SubmitInterestLevel { player, level } => {
             submit_interest_level(state, player, level)?
@@ -829,7 +825,9 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             designate_successor(state, leader, successor)?
         }
 
-        Command::TransferKingQueen { new_holder } => transfer_king_queen(state, new_holder)?,
+        Command::TransferKingQueen { player, new_holder } => {
+            transfer_king_queen(state, player, new_holder)?
+        }
 
         Command::CastOut {
             player,
@@ -912,7 +910,7 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             tier,
             qualifying_players,
             expected_code,
-        } => push_task(state, prompt, tier, qualifying_players, expected_code),
+        } => push_task(state, prompt, tier, qualifying_players, expected_code)?,
 
         Command::CloseTasks => close_tasks(state),
 
@@ -1111,26 +1109,33 @@ fn finalize_setup(state: &mut GameState) -> Vec<DomainEvent> {
     // as starting knowledge rather than something activated -- deterministic
     // lowest-PlayerId selection (the `first_eligible` convention) among
     // active Uprising members, excluding the Leader (never revealed) and the
-    // Cell Leader themself.
-    if let Some(cell_leader) = state
-        .players
-        .values()
-        .find(|p| p.character == Some(Character::CellLeader))
-        .map(|p| p.id)
-    {
-        let leader = state.revolutionary_leader;
-        state.cell_leader_knows = state
+    // Cell Leader themself. Guarded by `cell_leader_knowledge_computed` so a
+    // later, legitimately-repeated `FinalizeSetup` call (its own doc
+    // comment: safe to call again after adding more players) can never
+    // silently recompute this from *current* state -- see that flag's own
+    // doc comment for the information-leak this prevents.
+    if !state.cell_leader_knowledge_computed {
+        if let Some(cell_leader) = state
             .players
             .values()
-            .filter(|p| {
-                p.faction == Faction::Uprising
-                    && p.status == PlayerStatus::Active
-                    && p.id != cell_leader
-                    && Some(p.id) != leader
-            })
+            .find(|p| p.character == Some(Character::CellLeader))
             .map(|p| p.id)
-            .take(2)
-            .collect();
+        {
+            let leader = state.revolutionary_leader;
+            state.cell_leader_knows = state
+                .players
+                .values()
+                .filter(|p| {
+                    p.faction == Faction::Uprising
+                        && p.status == PlayerStatus::Active
+                        && p.id != cell_leader
+                        && Some(p.id) != leader
+                })
+                .map(|p| p.id)
+                .take(2)
+                .collect();
+            state.cell_leader_knowledge_computed = true;
+        }
     }
 
     vec![DomainEvent::SetupFinalized]
@@ -1167,7 +1172,11 @@ fn submit_bio(
         return Err(GameError::UnknownPlayer(player));
     }
     if let Some((field, len)) = bio.first_oversized_field() {
-        return Err(GameError::BioFieldTooLong { field, len });
+        return Err(GameError::FieldTooLong {
+            field,
+            len,
+            max: crate::bio::MAX_FIELD_LEN,
+        });
     }
     state.bios.insert(player, bio.clone());
     Ok(vec![DomainEvent::BioSubmitted { player, bio }])
@@ -1310,8 +1319,13 @@ fn designate_successor(
 
 fn transfer_king_queen(
     state: &mut GameState,
+    player: PlayerId,
     new_holder: PlayerId,
 ) -> Result<Vec<DomainEvent>, GameError> {
+    // A security review found this actor check missing entirely: without
+    // it, any command could force the King/Queen's once-per-game transfer
+    // for anyone, burning it without the real King/Queen's involvement.
+    require_character(state, player, Character::KingQueen)?;
     if state.king_queen_transfer_used {
         return Err(GameError::KingQueenTransferAlreadyUsed);
     }
@@ -1862,13 +1876,64 @@ fn close_runoff(
     Ok(events)
 }
 
+fn add_player(state: &mut GameState, name: String) -> Result<Vec<DomainEvent>, GameError> {
+    let len = name.chars().count();
+    if len > crate::player::MAX_PLAYER_NAME_LEN {
+        return Err(GameError::FieldTooLong {
+            field: "player name",
+            len,
+            max: crate::player::MAX_PLAYER_NAME_LEN,
+        });
+    }
+    if state.players.len() >= crate::player::MAX_PLAYERS {
+        return Err(GameError::TooManyPlayers {
+            max: crate::player::MAX_PLAYERS,
+        });
+    }
+
+    let id = PlayerId(state.next_player_id);
+    state.next_player_id += 1;
+    state.players.insert(id, Player::new(id, name.clone()));
+    let mut events = vec![DomainEvent::PlayerAdded { id, name }];
+    // Rules.md §1: "late arrivals become Servants" -- the raffle has
+    // already closed, so this player never gets a shot at a named role;
+    // see `Command::AddPlayer`'s doc comment.
+    if state.raffle_closed {
+        state.players.get_mut(&id).unwrap().faction = Faction::Servant;
+        events.push(DomainEvent::FactionAssigned {
+            player: id,
+            faction: Faction::Servant,
+        });
+    }
+    Ok(events)
+}
+
 fn push_task(
     state: &mut GameState,
     prompt: String,
     tier: TaskTier,
     qualifying_players: BTreeSet<PlayerId>,
     expected_code: Option<String>,
-) -> Vec<DomainEvent> {
+) -> Result<Vec<DomainEvent>, GameError> {
+    let prompt_len = prompt.chars().count();
+    if prompt_len > crate::task::MAX_TASK_PROMPT_LEN {
+        return Err(GameError::FieldTooLong {
+            field: "task prompt",
+            len: prompt_len,
+            max: crate::task::MAX_TASK_PROMPT_LEN,
+        });
+    }
+    if let Some(code) = &expected_code {
+        let code_len = code.chars().count();
+        if code_len > crate::task::MAX_LOCATION_CODE_LEN {
+            return Err(GameError::FieldTooLong {
+                field: "location task code",
+                len: code_len,
+                max: crate::task::MAX_LOCATION_CODE_LEN,
+            });
+        }
+    }
+
     let id = TaskId(state.next_task_id);
     state.next_task_id += 1;
     state.tasks.insert(
@@ -1882,7 +1947,7 @@ fn push_task(
         },
     );
     state.open_tasks.insert(id);
-    vec![DomainEvent::TaskPushed { id, prompt, tier }]
+    Ok(vec![DomainEvent::TaskPushed { id, prompt, tier }])
 }
 
 fn close_tasks(state: &mut GameState) -> Vec<DomainEvent> {
@@ -2221,6 +2286,14 @@ fn attempt_location_task(
     }
     if state.task_attempts.contains_key(&(player, task)) {
         return Err(GameError::AlreadyAttemptedTask { player, task });
+    }
+    let code_len = code.chars().count();
+    if code_len > crate::task::MAX_LOCATION_CODE_LEN {
+        return Err(GameError::FieldTooLong {
+            field: "location task code guess",
+            len: code_len,
+            max: crate::task::MAX_LOCATION_CODE_LEN,
+        });
     }
 
     let credited = code.trim().eq_ignore_ascii_case(expected.trim());
@@ -2571,6 +2644,20 @@ fn activate_potion_immunity(
             character: Character::PotionMaker,
         });
     }
+    // A security/reliability review found this ability (and 3 siblings --
+    // the Magistrate/Firebrand double vote, the vote shield, and the Grand
+    // Inquisitor) could be armed with no Denouncement open at all, then
+    // silently get consumed by whatever *unrelated* Denouncement happened
+    // to close next -- the exact hazard `duelist_challenge`'s doc comment
+    // already names for a different ability ("arming it any earlier would
+    // risk a later, unrelated Denouncement... consuming it instead").
+    // Checked after the "already used" case above, not before, so an
+    // ability that's genuinely spent reports that -- the more specific,
+    // more useful reason -- rather than "no Denouncement open" just
+    // because its own Denouncement has since closed.
+    if state.denouncement.is_none() {
+        return Err(GameError::NoDenouncementOpen);
+    }
     if !state.is_active(target) {
         return Err(GameError::NotActive(target));
     }
@@ -2593,35 +2680,43 @@ fn activate_double_vote(
         return Err(GameError::NotActive(player));
     }
     let character = state.players.get(&player).and_then(|p| p.character);
+    if !matches!(
+        character,
+        Some(Character::Magistrate) | Some(Character::Firebrand)
+    ) {
+        // Reports `Magistrate` even for a player who's neither --
+        // `NotCharacter` only carries one `required` character, and
+        // this command legitimately accepts two. Cosmetically
+        // incomplete (doesn't mention Firebrand as the other valid
+        // option) but not misleading: the player genuinely holds
+        // neither.
+        return Err(GameError::NotCharacter {
+            player,
+            required: Character::Magistrate,
+        });
+    }
+    let already_used = match character {
+        Some(Character::Magistrate) => state.magistrate_double_vote_used,
+        Some(Character::Firebrand) => state.firebrand_double_vote_used,
+        _ => unreachable!("already rejected above"),
+    };
+    if already_used {
+        return Err(GameError::AbilityNotAvailable {
+            character: character.unwrap(),
+        });
+    }
+    // See `activate_potion_immunity`'s comment: without an open-Denouncement
+    // check, this could be armed at any point and silently consumed by
+    // whatever unrelated Denouncement happens to close next. Checked after
+    // the "already used" case above so a genuinely-spent ability reports
+    // that, not "no Denouncement open" just because its own has closed.
+    if state.denouncement.is_none() {
+        return Err(GameError::NoDenouncementOpen);
+    }
     match character {
-        Some(Character::Magistrate) => {
-            if state.magistrate_double_vote_used {
-                return Err(GameError::AbilityNotAvailable {
-                    character: Character::Magistrate,
-                });
-            }
-            state.magistrate_double_vote_armed = true;
-        }
-        Some(Character::Firebrand) => {
-            if state.firebrand_double_vote_used {
-                return Err(GameError::AbilityNotAvailable {
-                    character: Character::Firebrand,
-                });
-            }
-            state.firebrand_double_vote_armed = true;
-        }
-        _ => {
-            // Reports `Magistrate` even for a player who's neither --
-            // `NotCharacter` only carries one `required` character, and
-            // this command legitimately accepts two. Cosmetically
-            // incomplete (doesn't mention Firebrand as the other valid
-            // option) but not misleading: the player genuinely holds
-            // neither.
-            return Err(GameError::NotCharacter {
-                player,
-                required: Character::Magistrate,
-            });
-        }
+        Some(Character::Magistrate) => state.magistrate_double_vote_armed = true,
+        Some(Character::Firebrand) => state.firebrand_double_vote_armed = true,
+        _ => unreachable!("already rejected above"),
     }
     Ok(vec![DomainEvent::DoubleVoteActivated {
         player,
@@ -2635,6 +2730,14 @@ fn arm_vote_shield(state: &mut GameState, player: PlayerId) -> Result<Vec<Domain
         return Err(GameError::AbilityNotAvailable {
             character: Character::NormalUprising,
         });
+    }
+    // See `activate_potion_immunity`'s comment: without an open-Denouncement
+    // check, this could be armed at any point and silently consumed by
+    // whatever unrelated Denouncement happens to close next. Checked after
+    // the "already used" case above so a genuinely-spent ability reports
+    // that, not "no Denouncement open" just because its own has closed.
+    if state.denouncement.is_none() {
+        return Err(GameError::NoDenouncementOpen);
     }
     state.vote_shield_armed.insert(player);
     Ok(vec![DomainEvent::VoteShieldArmed { player }])
@@ -2722,6 +2825,14 @@ fn activate_grand_inquisitor(
         return Err(GameError::AbilityNotAvailable {
             character: Character::GrandInquisitor,
         });
+    }
+    // See `activate_potion_immunity`'s comment: without an open-Denouncement
+    // check, this could be armed at any point and silently consumed by
+    // whatever unrelated Denouncement happens to close next. Checked after
+    // the "already used" case above so a genuinely-spent ability reports
+    // that, not "no Denouncement open" just because its own has closed.
+    if state.denouncement.is_none() {
+        return Err(GameError::NoDenouncementOpen);
     }
     state.grand_inquisitor_armed = true;
     Ok(vec![DomainEvent::GrandInquisitorInvoked { player }])
@@ -2819,6 +2930,61 @@ mod tests {
         assert_eq!(state.players().count(), 2);
         assert_eq!(state.event_log().len(), 2);
         assert_eq!(state.player(PlayerId(0)).unwrap().name, "Alice");
+    }
+
+    #[test]
+    fn add_player_rejects_an_over_length_name() {
+        // Security/reliability regression: this had no length cap at all,
+        // making a multi-megabyte name a real memory/bandwidth amplifier
+        // (every successful mutation broadcasts a freshly-cloned
+        // `PlayerView`, roster included, to every connected client).
+        let mut state = GameState::new();
+        let name = "a".repeat(crate::player::MAX_PLAYER_NAME_LEN + 1);
+        let result = apply_command(&mut state, Command::AddPlayer { name });
+        assert_eq!(
+            result,
+            Err(GameError::FieldTooLong {
+                field: "player name",
+                len: crate::player::MAX_PLAYER_NAME_LEN + 1,
+                max: crate::player::MAX_PLAYER_NAME_LEN,
+            })
+        );
+        assert_eq!(state.players().count(), 0);
+    }
+
+    #[test]
+    fn add_player_accepts_a_name_at_exactly_the_cap() {
+        let mut state = GameState::new();
+        let name = "a".repeat(crate::player::MAX_PLAYER_NAME_LEN);
+        apply_command(&mut state, Command::AddPlayer { name }).unwrap();
+        assert_eq!(state.players().count(), 1);
+    }
+
+    #[test]
+    fn add_player_rejects_once_the_roster_is_full() {
+        let mut state = GameState::new();
+        for i in 0..crate::player::MAX_PLAYERS {
+            apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: format!("P{i}"),
+                },
+            )
+            .unwrap();
+        }
+        let result = apply_command(
+            &mut state,
+            Command::AddPlayer {
+                name: "OneTooMany".into(),
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::TooManyPlayers {
+                max: crate::player::MAX_PLAYERS,
+            })
+        );
+        assert_eq!(state.players().count(), crate::player::MAX_PLAYERS);
     }
 
     #[test]
@@ -3318,9 +3484,10 @@ mod tests {
         );
         assert_eq!(
             result,
-            Err(GameError::BioFieldTooLong {
+            Err(GameError::FieldTooLong {
                 field: "occupation",
-                len: 33
+                len: 33,
+                max: crate::bio::MAX_FIELD_LEN,
             })
         );
         assert!(state.bio(king_queen).is_none());
@@ -3609,6 +3776,7 @@ mod tests {
         apply_command(
             &mut state,
             Command::TransferKingQueen {
+                player: king_queen,
                 new_holder: extra_ton,
             },
         )
@@ -3747,6 +3915,7 @@ mod tests {
         apply_command(
             &mut state,
             Command::TransferKingQueen {
+                player: king_queen,
                 new_holder: extra_ton,
             },
         )
@@ -3764,27 +3933,66 @@ mod tests {
     }
 
     #[test]
+    fn transfer_king_queen_rejects_a_non_king_queen_actor() {
+        // Security regression: this actor check was missing entirely --
+        // any command could force the transfer for anyone.
+        let (mut state, king_queen, prince, ..) = setup_full_game();
+        let extra_ton = add_player(&mut state, "ExtraTon", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        let result = apply_command(
+            &mut state,
+            Command::TransferKingQueen {
+                player: prince,
+                new_holder: extra_ton,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::NotCharacter {
+                player: prince,
+                required: Character::KingQueen,
+            })
+        );
+        assert_eq!(
+            state.king_queen(),
+            Some(king_queen),
+            "a rejected transfer attempted by the wrong player must not mutate anything"
+        );
+    }
+
+    #[test]
     fn transfer_king_queen_rejects_reuse() {
-        let (mut state, ..) = setup_full_game();
+        let (mut state, king_queen, ..) = setup_full_game();
         let extra1 = add_player(&mut state, "Extra1", Faction::Ton);
         let extra2 = add_player(&mut state, "Extra2", Faction::Ton);
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
 
         apply_command(
             &mut state,
-            Command::TransferKingQueen { new_holder: extra1 },
+            Command::TransferKingQueen {
+                player: king_queen,
+                new_holder: extra1,
+            },
         )
         .unwrap();
+        // extra1 is the new King/Queen now -- using them as the actor here
+        // confirms this is rejected because the ability is *used up*, not
+        // because of the (also-enforced-but-not-what-this-test-covers)
+        // actor check.
         let result = apply_command(
             &mut state,
-            Command::TransferKingQueen { new_holder: extra2 },
+            Command::TransferKingQueen {
+                player: extra1,
+                new_holder: extra2,
+            },
         );
         assert_eq!(result, Err(GameError::KingQueenTransferAlreadyUsed));
     }
 
     #[test]
     fn transfer_king_queen_rejects_at_round_five_or_later() {
-        let (mut state, ..) = setup_full_game();
+        let (mut state, king_queen, ..) = setup_full_game();
         let extra = add_player(&mut state, "Extra", Faction::Ton);
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
 
@@ -3793,7 +4001,13 @@ mod tests {
         }
         assert_eq!(state.current_round(), Round::Five);
 
-        let result = apply_command(&mut state, Command::TransferKingQueen { new_holder: extra });
+        let result = apply_command(
+            &mut state,
+            Command::TransferKingQueen {
+                player: king_queen,
+                new_holder: extra,
+            },
+        );
         assert_eq!(result, Err(GameError::KingQueenTransferTooLate));
     }
 
@@ -3804,7 +4018,10 @@ mod tests {
         // handing the crown to them would double-title someone.
         let result = apply_command(
             &mut state,
-            Command::TransferKingQueen { new_holder: prince },
+            Command::TransferKingQueen {
+                player: king_queen,
+                new_holder: prince,
+            },
         );
         assert_eq!(
             result,
@@ -3837,6 +4054,7 @@ mod tests {
         let result = apply_command(
             &mut state,
             Command::TransferKingQueen {
+                player: king_queen,
                 new_holder: turncoat,
             },
         );
@@ -5584,6 +5802,88 @@ mod tests {
         assert!(state.is_task_open(second));
         assert_eq!(state.task(first).unwrap().tier, TaskTier::Easy);
         assert_eq!(state.task(second).unwrap().tier, TaskTier::Medium);
+    }
+
+    #[test]
+    fn push_task_rejects_an_over_length_prompt() {
+        // Security/reliability regression: a Host-only command any raw
+        // connection can currently issue (see `main.rs`'s documented auth
+        // gap) had no length cap on `prompt`, making a multi-megabyte
+        // prompt a real memory/bandwidth amplifier -- broadcast to every
+        // connected client for as long as the task stayed open.
+        let (mut state, ..) = setup_game_with_extra_voters(0);
+        let prompt = "a".repeat(crate::task::MAX_TASK_PROMPT_LEN + 1);
+        let len = prompt.chars().count();
+        let result = apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt,
+                tier: TaskTier::Easy,
+                qualifying_players: BTreeSet::new(),
+                expected_code: None,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::FieldTooLong {
+                field: "task prompt",
+                len,
+                max: crate::task::MAX_TASK_PROMPT_LEN,
+            })
+        );
+        assert!(state.open_task_ids().next().is_none());
+    }
+
+    #[test]
+    fn push_task_rejects_an_over_length_location_code() {
+        let (mut state, ..) = setup_game_with_extra_voters(0);
+        let code = "a".repeat(crate::task::MAX_LOCATION_CODE_LEN + 1);
+        let len = code.chars().count();
+        let result = apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "Find the code".into(),
+                tier: TaskTier::Hard,
+                qualifying_players: BTreeSet::new(),
+                expected_code: Some(code),
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::FieldTooLong {
+                field: "location task code",
+                len,
+                max: crate::task::MAX_LOCATION_CODE_LEN,
+            })
+        );
+        assert!(state.open_task_ids().next().is_none());
+    }
+
+    #[test]
+    fn attempt_location_task_rejects_an_over_length_code_guess() {
+        let (mut state, everyone) = setup_game_with_extra_voters(0);
+        let task = push_location_task(&mut state, "Find the code", TaskTier::Hard, "REAL CODE");
+        let guess = "a".repeat(crate::task::MAX_LOCATION_CODE_LEN + 1);
+        let len = guess.chars().count();
+        let result = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: everyone[0],
+                task,
+                code: guess,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::FieldTooLong {
+                field: "location task code guess",
+                len,
+                max: crate::task::MAX_LOCATION_CODE_LEN,
+            })
+        );
+        // An oversized/malformed guess isn't a real attempt -- it shouldn't
+        // burn the player's one shot at the task.
+        assert!(state.task_attempt(everyone[0], task).is_none());
     }
 
     #[test]
@@ -7614,6 +7914,25 @@ mod tests {
     }
 
     #[test]
+    fn activate_potion_immunity_rejects_arming_with_no_denouncement_open() {
+        // Security/reliability regression: this (and 3 sibling abilities --
+        // the Magistrate/Firebrand double vote, the vote shield, and the
+        // Grand Inquisitor) could be armed with no Denouncement open at
+        // all, then silently get consumed by whatever unrelated
+        // Denouncement happened to close next.
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::ActivatePotionImmunity {
+                player: p.potion_maker,
+                target: p.king_queen,
+            },
+        );
+        assert_eq!(result, Err(GameError::NoDenouncementOpen));
+        assert!(state.potion_immunity_target.is_none());
+    }
+
+    #[test]
     fn activate_potion_immunity_rejects_an_inactive_target() {
         let (mut state, p) = setup_phase2_game();
         apply_command(
@@ -7624,6 +7943,7 @@ mod tests {
             },
         )
         .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         let result = apply_command(
             &mut state,
             Command::ActivatePotionImmunity {
@@ -7637,6 +7957,7 @@ mod tests {
     #[test]
     fn potion_immunity_saves_its_named_target_from_the_ballot() {
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ActivatePotionImmunity {
@@ -7646,7 +7967,6 @@ mod tests {
         )
         .unwrap();
 
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -7688,6 +8008,7 @@ mod tests {
     #[test]
     fn potion_immunity_cannot_be_activated_a_second_time() {
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ActivatePotionImmunity {
@@ -7696,7 +8017,6 @@ mod tests {
             },
         )
         .unwrap();
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -7741,6 +8061,20 @@ mod tests {
     // --- Vote-weight pair ---
 
     #[test]
+    fn activate_double_vote_rejects_arming_with_no_denouncement_open() {
+        // See `activate_potion_immunity_rejects_arming_with_no_denouncement_open`.
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::ActivateDoubleVote {
+                player: p.magistrate,
+            },
+        );
+        assert_eq!(result, Err(GameError::NoDenouncementOpen));
+        assert!(!state.magistrate_double_vote_armed);
+    }
+
+    #[test]
     fn activate_double_vote_rejects_a_non_magistrate_non_firebrand() {
         let (mut state, p) = setup_phase2_game();
         let result = apply_command(&mut state, Command::ActivateDoubleVote { player: p.oracle });
@@ -7756,6 +8090,7 @@ mod tests {
     #[test]
     fn magistrates_double_vote_counts_twice_in_the_tally() {
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ActivateDoubleVote {
@@ -7763,8 +8098,6 @@ mod tests {
             },
         )
         .unwrap();
-
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -7820,6 +8153,7 @@ mod tests {
     #[test]
     fn firebrands_double_vote_counts_twice_in_the_tally() {
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ActivateDoubleVote {
@@ -7827,8 +8161,6 @@ mod tests {
             },
         )
         .unwrap();
-
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -7880,6 +8212,7 @@ mod tests {
     #[test]
     fn activate_double_vote_rejects_reuse() {
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ActivateDoubleVote {
@@ -7887,7 +8220,6 @@ mod tests {
             },
         )
         .unwrap();
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -7946,6 +8278,7 @@ mod tests {
     #[test]
     fn vote_shield_negates_one_vote_against_its_holder() {
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ArmVoteShield {
@@ -7953,8 +8286,6 @@ mod tests {
             },
         )
         .unwrap();
-
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -8018,8 +8349,23 @@ mod tests {
     }
 
     #[test]
+    fn arm_vote_shield_rejects_arming_with_no_denouncement_open() {
+        // See `activate_potion_immunity_rejects_arming_with_no_denouncement_open`.
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::ArmVoteShield {
+                player: p.normal_uprising,
+            },
+        );
+        assert_eq!(result, Err(GameError::NoDenouncementOpen));
+        assert!(state.vote_shield_armed.is_empty());
+    }
+
+    #[test]
     fn arm_vote_shield_rejects_reuse() {
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ArmVoteShield {
@@ -8027,7 +8373,6 @@ mod tests {
             },
         )
         .unwrap();
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -8087,6 +8432,77 @@ mod tests {
         expected.sort();
         expected.truncate(2);
         assert_eq!(state.cell_leader_knows, expected);
+    }
+
+    #[test]
+    fn cell_leader_knowledge_does_not_recompute_on_a_later_finalize_setup_call() {
+        // Security regression: `FinalizeSetup` is documented (and used) as
+        // safely repeatable, e.g. after a late-arrival Servant joins. Without
+        // a "computed once" guard, a later call would silently recompute
+        // `cell_leader_knows` from *current* state -- after a Revolutionary
+        // Leader succession, that drops the old Leader's name and can add
+        // the new (secret) Leader's name or drop it depending on who ends
+        // up in the recomputed set, either way a visible change letting the
+        // Cell Leader deduce something about the new Leader's identity.
+        //
+        // Bespoke, tightly-controlled setup rather than `setup_phase2_game`:
+        // the point is to make `member_a` -- deliberately *inside* the
+        // original computed set -- become the new leader via succession, so
+        // recomputing under the old (buggy) leader-exclusion rule would
+        // definitely produce a different set (excluding them as "the
+        // leader" now that they hold the title). `setup_phase2_game`'s
+        // rich, mostly-titled Uprising roster doesn't reliably guarantee
+        // that overlap.
+        let mut state = GameState::new();
+        let leader = assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        let cell_leader = assign_new(
+            &mut state,
+            "CellLeader",
+            Faction::Uprising,
+            Character::CellLeader,
+        );
+        let member_a = add_player(&mut state, "MemberA", Faction::Uprising);
+        let member_b = add_player(&mut state, "MemberB", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        let before = state.cell_leader_knows.clone();
+        assert_eq!(before, vec![member_a, member_b]);
+        assert!(!before.contains(&cell_leader), "must never know themself");
+
+        // member_a (already known, untitled) succeeds the departing leader.
+        apply_command(
+            &mut state,
+            Command::DesignateSuccessor {
+                leader,
+                successor: member_a,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: leader,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.revolutionary_leader(),
+            Some(member_a),
+            "succession must actually have moved the title for this test to be meaningful"
+        );
+
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        assert_eq!(
+            state.cell_leader_knows, before,
+            "cell_leader_knows must not change on a later FinalizeSetup call"
+        );
+        assert_eq!(state.cell_leader_knows, vec![member_a, member_b]);
     }
 
     // --- Normal Ton's reactive safety-net ---
@@ -8243,6 +8659,7 @@ mod tests {
             },
         )
         .unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
 
         apply_command(
             &mut state,
@@ -8355,6 +8772,7 @@ mod tests {
             Some(Character::NormalUprising)
         );
 
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ArmVoteShield {
@@ -8370,7 +8788,6 @@ mod tests {
         )
         .unwrap();
 
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -8434,6 +8851,7 @@ mod tests {
         // target out of it, like Medic -- so the double vote is properly
         // consumed even though King/Queen (the only candidate) survives.
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ActivateDoubleVote {
@@ -8450,7 +8868,6 @@ mod tests {
         )
         .unwrap();
 
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -8489,6 +8906,7 @@ mod tests {
     #[test]
     fn potion_immunity_and_an_armed_vote_shield_both_apply_in_the_same_round() {
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ArmVoteShield {
@@ -8505,7 +8923,6 @@ mod tests {
         )
         .unwrap();
 
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -8928,6 +9345,7 @@ mod tests {
             state.competing_player_count() <= 20,
             "this fixture must stay in the flat 1-slot population tier for the test to be meaningful"
         );
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ActivateGrandInquisitor {
@@ -8935,8 +9353,6 @@ mod tests {
             },
         )
         .unwrap();
-
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -9234,8 +9650,23 @@ mod tests {
     }
 
     #[test]
+    fn activate_grand_inquisitor_rejects_arming_with_no_denouncement_open() {
+        // See `activate_potion_immunity_rejects_arming_with_no_denouncement_open`.
+        let (mut state, p) = setup_phase2_game();
+        let result = apply_command(
+            &mut state,
+            Command::ActivateGrandInquisitor {
+                player: p.grand_inquisitor,
+            },
+        );
+        assert_eq!(result, Err(GameError::NoDenouncementOpen));
+        assert!(!state.grand_inquisitor_armed);
+    }
+
+    #[test]
     fn activate_grand_inquisitor_rejects_reuse() {
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ActivateGrandInquisitor {
@@ -9243,7 +9674,6 @@ mod tests {
             },
         )
         .unwrap();
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
@@ -9296,6 +9726,7 @@ mod tests {
         // this round, and Potion Maker independently protects its one
         // named target from among whoever gets selected.
         let (mut state, p) = setup_phase2_game();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::ActivateGrandInquisitor {
@@ -9312,7 +9743,6 @@ mod tests {
         )
         .unwrap();
 
-        apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
             &mut state,
             Command::Nominate {
