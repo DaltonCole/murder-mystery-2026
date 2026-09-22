@@ -43,6 +43,11 @@ pub enum ServerMsg {
     /// via `Command::PushTask` from its own `TEST_LOCATION_TASKS`, not the
     /// real app's index-based picker).
     LocationTaskTemplates(Vec<(usize, TaskTier, String)>),
+    /// Mirrors `app`'s own `ServerMsg::Timer` -- the shared round/phase
+    /// countdown is a pure display aid with no effect on game rules or
+    /// state (see `game_server::GameTimer`'s doc comment), so this crate
+    /// only needs to parse it, never act on it.
+    Timer(Option<i64>),
 }
 
 #[derive(Debug)]
@@ -202,9 +207,10 @@ impl Conn {
                 }
                 Some(ServerMsg::Failed { error }) => pending_rejection = Some(error),
                 Some(ServerMsg::Joined { .. }) => {}
-                // Never relevant to this crate -- see the variant's own
+                // Never relevant to this crate -- see each variant's own
                 // doc comment for why it still has to be parseable.
                 Some(ServerMsg::LocationTaskTemplates(_)) => {}
+                Some(ServerMsg::Timer(_)) => {}
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -224,6 +230,7 @@ impl Conn {
                 Some(ServerMsg::Failed { error }) => return Err(ConnError::Rejected(error)),
                 Some(ServerMsg::Joined { .. }) => continue,
                 Some(ServerMsg::LocationTaskTemplates(_)) => continue,
+                Some(ServerMsg::Timer(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -236,7 +243,8 @@ impl Conn {
                 Some(ServerMsg::View(v)) => return Ok(v),
                 Some(ServerMsg::Joined { .. })
                 | Some(ServerMsg::Failed { .. })
-                | Some(ServerMsg::LocationTaskTemplates(_)) => continue,
+                | Some(ServerMsg::LocationTaskTemplates(_))
+                | Some(ServerMsg::Timer(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -253,7 +261,9 @@ impl Conn {
             match self.recv().await? {
                 Some(ServerMsg::Joined { player }) => return Ok(player),
                 Some(ServerMsg::Failed { error }) => return Err(ConnError::Rejected(error)),
-                Some(ServerMsg::View(_)) | Some(ServerMsg::LocationTaskTemplates(_)) => continue,
+                Some(ServerMsg::View(_))
+                | Some(ServerMsg::LocationTaskTemplates(_))
+                | Some(ServerMsg::Timer(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }

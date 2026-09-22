@@ -167,6 +167,7 @@ impl PlayerBot {
                 Some(ServerMsg::Failed { .. }) => {}
                 Some(ServerMsg::Joined { .. }) => {}
                 Some(ServerMsg::LocationTaskTemplates(_)) => {}
+                Some(ServerMsg::Timer(_)) => {}
                 None => return Ok(()),
             }
         }

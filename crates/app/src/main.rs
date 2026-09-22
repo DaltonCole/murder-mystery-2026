@@ -157,6 +157,16 @@ enum ClientMsg {
     /// why this is a deliberate, separate Host trigger rather than firing
     /// automatically the instant setup finalizes.
     StartRoundOne,
+    /// `/host` only: (re)starts the shared round/phase timer at this many
+    /// seconds. Not a `Command` -- see `game_server::start_timer`'s doc
+    /// comment on why wall-clock time is an app-layer concept here, never
+    /// part of `GameState`.
+    StartTimer { seconds: u32 },
+    /// `/host` only: adds seconds to the running timer (or starts one if
+    /// none is running). See `game_server::add_timer_seconds`.
+    AddTimerSeconds { seconds: u32 },
+    /// `/host` only: clears the timer entirely.
+    ClearTimer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +184,13 @@ enum ServerMsg {
     /// `game_server::location_task_templates`'s doc comment for why the
     /// code itself never rides along.
     LocationTaskTemplates(Vec<(usize, TaskTier, String)>),
+    /// Sent to every viewer kind (this is rules.md's "shared timer") on
+    /// every `Watch` and every broadcast tick -- seconds remaining, or
+    /// `None` if no timer is currently running. Deliberately not part of
+    /// `PlayerView`/`ServerMsg::View` -- see `game_server::GameTimer`'s
+    /// doc comment on why wall-clock time stays out of the engine's
+    /// deterministic state entirely.
+    Timer(Option<i64>),
 }
 
 #[get("/api/ws")]
@@ -240,6 +257,10 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                             .send(ServerMsg::View(game_server::view(Viewer::Player(id))))
                                             .await
                                             .is_ok()
+                                        && socket
+                                            .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                            .await
+                                            .is_ok()
                                 }
                                 Err(e) => socket
                                     .send(ServerMsg::Failed { error: e.to_string() })
@@ -265,7 +286,11 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                             } else {
                                 true
                             };
-                            sent_view && sent_templates
+                            let sent_timer = socket
+                                .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                .await
+                                .is_ok();
+                            sent_view && sent_templates && sent_timer
                         }
                         ClientMsg::Do(cmd) => respond!(game_server::apply(cmd)),
                         ClientMsg::RunRaffle => respond!(game_server::run_raffle()),
@@ -276,6 +301,30 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                             respond!(game_server::draw_intermission_entrants())
                         }
                         ClientMsg::StartRoundOne => respond!(game_server::start_round_one()),
+                        ClientMsg::StartTimer { seconds } => {
+                            game_server::start_timer(seconds);
+                            drain_self_echo(&mut changed);
+                            socket
+                                .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                .await
+                                .is_ok()
+                        }
+                        ClientMsg::AddTimerSeconds { seconds } => {
+                            game_server::add_timer_seconds(seconds);
+                            drain_self_echo(&mut changed);
+                            socket
+                                .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                .await
+                                .is_ok()
+                        }
+                        ClientMsg::ClearTimer => {
+                            game_server::clear_timer();
+                            drain_self_echo(&mut changed);
+                            socket
+                                .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                .await
+                                .is_ok()
+                        }
                     };
                     if !sent_ok {
                         break;
@@ -286,6 +335,17 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         if socket.send(ServerMsg::View(game_server::view(v))).await.is_err() {
                             break;
                         }
+                    }
+                    // Keeps the round timer display live for everyone even
+                    // when the only thing that happened was the ticker's
+                    // own once-a-second nudge (`game_server::ensure_ticker_running`)
+                    // -- harmless to send on every other kind of change too.
+                    if socket
+                        .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
@@ -301,6 +361,7 @@ fn Play() -> Element {
     let mut my_id = use_signal(|| None::<PlayerId>);
     let mut error = use_signal(|| None::<String>);
     let mut name_draft = use_signal(String::new);
+    let mut timer = use_signal(|| None::<i64>);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
@@ -322,6 +383,7 @@ fn Play() -> Element {
                 // actually arrives here -- see `ServerMsg::LocationTaskTemplates`'s
                 // doc comment.
                 Ok(ServerMsg::LocationTaskTemplates(_)) => {}
+                Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
                 Err(_) => break,
             }
         }
@@ -387,6 +449,7 @@ fn Play() -> Element {
             p { class: "error-text", "{e}" }
         }
         p { "Round: {v.current_round:?}" }
+        TimerDisplay { remaining_secs: timer() }
         if let Some(faction) = v.own_faction {
             if faction == Faction::Unassigned {
                 p { "Waiting for setup to finish..." }
@@ -711,6 +774,33 @@ fn WhistledownPosts(posts: Vec<WhistledownPost>, heading_level: u8) -> Element {
                     class: "whistledown-post",
                     "{post.text}"
                 }
+            }
+        }
+    }
+}
+
+/// The shared round/phase countdown (rules.md's "shared timer") -- read-only
+/// rendering shared by `/play`, `/display`, and (alongside its own start/add/
+/// clear controls) the Host console. Renders nothing while no timer is
+/// running. Once past zero, switches to counting *up* as visible overtime
+/// rather than freezing at "0:00" or disappearing -- a stalled countdown
+/// with no indication of how far over budget the room actually is would be
+/// worse than no timer at all.
+#[component]
+fn TimerDisplay(remaining_secs: Option<i64>) -> Element {
+    let Some(secs) = remaining_secs else {
+        return rsx! {};
+    };
+    let overtime = secs < 0;
+    let abs = secs.unsigned_abs();
+    let (minutes, seconds) = (abs / 60, abs % 60);
+    rsx! {
+        p {
+            class: if overtime { "warning-text" } else { "" },
+            if overtime {
+                "Time's up -- {minutes}:{seconds:02} over"
+            } else {
+                "~{minutes}:{seconds:02} remaining"
             }
         }
     }
@@ -1418,6 +1508,7 @@ fn Host() -> Element {
     let mut view = use_signal(|| None::<PlayerView>);
     let mut error = use_signal(|| None::<String>);
     let mut location_task_templates = use_signal(Vec::<(usize, TaskTier, String)>::new);
+    let mut timer = use_signal(|| None::<i64>);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
@@ -1433,6 +1524,7 @@ fn Host() -> Element {
                 Ok(ServerMsg::LocationTaskTemplates(templates)) => {
                     location_task_templates.set(templates);
                 }
+                Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
                 // The connection is gone -- stop polling it. Without this,
                 // a closed socket makes `recv()` return `Err` immediately
                 // on every call forever, spinning this loop with no yield
@@ -1471,6 +1563,24 @@ fn Host() -> Element {
         error.set(None);
         spawn(async move {
             let _ = socket.send(ClientMsg::DrawIntermissionEntrants).await;
+        });
+    };
+    let start_timer = move |seconds: u32| {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::StartTimer { seconds }).await;
+        });
+    };
+    let add_timer_seconds = move |seconds: u32| {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::AddTimerSeconds { seconds }).await;
+        });
+    };
+    let clear_timer = move || {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::ClearTimer).await;
         });
     };
     let mut start_round_one = move || {
@@ -1526,6 +1636,10 @@ fn Host() -> Element {
     // tracks how many posts Dalton has acknowledged, so a banner can show
     // exactly when there's something new.
     let mut whistledown_seen = use_signal(|| 0usize);
+    // Which preset the "Start timer" button will use -- rules.md's own
+    // Denouncement-phase budgets, plus a plain custom option for Round 1
+    // or a contest, where there's no single rules.md number to default to.
+    let mut timer_seconds = use_signal(|| 120u32);
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
     let interest_levels = view().map(|v| v.interest_levels).unwrap_or_default();
@@ -1595,6 +1709,38 @@ fn Host() -> Element {
         }
         if let Some(e) = error() {
             p { class: "error-text", "{e}" }
+        }
+        div {
+            h3 { "Round timer" }
+            p { "Purely a shared, visible clock -- rules.md's own phase budgets (nomination 2 min, discussion 3-4 min, ballot/resolution 90 sec) are a guide, not a rule the app enforces. It never advances anything by itself; only the buttons above/below do that." }
+            TimerDisplay { remaining_secs: timer() }
+            select {
+                onchange: move |e| timer_seconds.set(e.value().parse().unwrap_or(120)),
+                option { value: "90", "90 sec (ballot/resolution)" }
+                option { value: "120", selected: true, "2 min (nomination)" }
+                option { value: "240", "4 min (discussion)" }
+                option { value: "300", "5 min" }
+                option { value: "600", "10 min" }
+            }
+            button {
+                onclick: move |_| start_timer(timer_seconds()),
+                "Start timer"
+            }
+            button {
+                disabled: timer().is_none(),
+                onclick: move |_| add_timer_seconds(60),
+                "+1 min"
+            }
+            button {
+                disabled: timer().is_none(),
+                onclick: move |_| add_timer_seconds(300),
+                "+5 min"
+            }
+            button {
+                disabled: timer().is_none(),
+                onclick: move |_| clear_timer(),
+                "Clear"
+            }
         }
         if has_new_whistledown {
             div {
@@ -2199,6 +2345,7 @@ fn describe_key_event(event: &DomainEvent, everyone: &[engine::PlayerReveal]) ->
 #[component]
 fn Display() -> Element {
     let mut view = use_signal(|| None::<PlayerView>);
+    let mut timer = use_signal(|| None::<i64>);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
@@ -2206,6 +2353,7 @@ fn Display() -> Element {
         loop {
             match socket.recv().await {
                 Ok(ServerMsg::View(v)) => view.set(Some(v)),
+                Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
                 Ok(
                     ServerMsg::Failed { .. }
                     | ServerMsg::Joined { .. }
@@ -2228,6 +2376,7 @@ fn Display() -> Element {
         div { class: "route-display",
             h1 { "Murder Mystery 2026" }
             h2 { "Round: {v.current_round:?}" }
+            TimerDisplay { remaining_secs: timer() }
             RosterList { roster: v.roster.clone() }
             match &v.denouncement {
                 Some(DenouncementView::Nomination { .. }) => rsx! { p { "Nomination is open." } },

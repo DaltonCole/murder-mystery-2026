@@ -20,7 +20,21 @@ use engine::{
 use rand::seq::SliceRandom;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+
+/// A purely advisory, host-controlled round/phase clock (see
+/// `start_timer`'s doc comment) -- deliberately NOT part of `GameState`.
+/// It never drives any game rule (nothing auto-advances when it hits
+/// zero -- see `crates/app/src/main.rs`'s Host copy for why), so it has
+/// no business living in the engine's deterministic, replayable state;
+/// this is exactly the same "wall-clock time is a caller-supplied,
+/// app-layer concept, not an engine one" boundary this session's earlier
+/// automation work already established for randomness.
+struct GameTimer {
+    started_at: Instant,
+    duration: Duration,
+}
 
 struct GameServer {
     state: Mutex<GameState>,
@@ -30,6 +44,7 @@ struct GameServer {
     // since it's purely an app-level "don't repeat this side effect"
     // guard, not a fact about the game itself.
     auto_tasks_pushed: Mutex<BTreeSet<Round>>,
+    timer: Mutex<Option<GameTimer>>,
 }
 
 fn server() -> &'static GameServer {
@@ -40,8 +55,115 @@ fn server() -> &'static GameServer {
             state: Mutex::new(GameState::new()),
             changed,
             auto_tasks_pushed: Mutex::new(BTreeSet::new()),
+            timer: Mutex::new(None),
         }
     })
+}
+
+/// Spawns the once-per-process background task that keeps the round timer
+/// display live for every connected client even when nobody's taking any
+/// other action (e.g. everyone's mid-discussion, not clicking anything).
+/// Ticks once a second and does nothing but nudge the existing `changed`
+/// broadcast -- the same "something changed, go re-fetch" signal every
+/// other mutation already fires -- so it reuses 100% of the existing push
+/// plumbing rather than inventing a second one. Never touches `GameState`
+/// or any game rule; a missed or delayed tick just means the displayed
+/// number is briefly stale, matching this feature's own "roughly how much
+/// time is remaining" framing. `OnceLock` guarantees this loop is spawned
+/// exactly once no matter how many times a timer gets started.
+fn ensure_ticker_running() {
+    static TICKER: OnceLock<()> = OnceLock::new();
+    TICKER.get_or_init(|| {
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let timer_active = server()
+                    .timer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some();
+                if timer_active {
+                    let _ = server().changed.send(());
+                }
+            }
+        });
+    });
+}
+
+/// Starts (or restarts) the round timer at `seconds` from now -- the Host
+/// console's "Start timer" button. Purely a display aid: rules.md gives
+/// explicit time budgets for each Denouncement phase ("nomination 2 min,
+/// discussion 3-4 min, ballot 90 sec, resolution 90 sec") and frames
+/// Discussion's specifically as "a shared timer that Dalton starts but
+/// doesn't moderate" -- this is that shared, visible clock, generalized to
+/// any round/phase rather than hardcoded to one, since Round 1 ("the round
+/// ends on the timer") and the contest rounds need the same kind of
+/// at-a-glance "how much longer" signal. Deliberately never triggers any
+/// command when it reaches zero -- unlike the Denouncement's own
+/// auto-close (a condition on completed actions, not a clock), a real
+/// countdown-driven auto-advance would need the pause/override safety
+/// infrastructure this project has twice now deliberately deferred
+/// building; this stays informational, so the Host button remains the
+/// only thing that ever actually moves the game forward.
+pub fn start_timer(seconds: u32) {
+    ensure_ticker_running();
+    *server()
+        .timer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(GameTimer {
+        started_at: Instant::now(),
+        duration: Duration::from_secs(u64::from(seconds)),
+    });
+    let _ = server().changed.send(());
+}
+
+/// Extends the running timer by `seconds`, or starts a fresh one at
+/// `seconds` if none is running -- the Host console's "+N min" buttons,
+/// for exactly the live-event reality that a real conversation sometimes
+/// needs more than the stated budget.
+pub fn add_timer_seconds(seconds: u32) {
+    ensure_ticker_running();
+    let mut timer = server()
+        .timer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let extra = Duration::from_secs(u64::from(seconds));
+    match timer.as_mut() {
+        Some(t) => t.duration += extra,
+        None => {
+            *timer = Some(GameTimer {
+                started_at: Instant::now(),
+                duration: extra,
+            })
+        }
+    }
+    drop(timer);
+    let _ = server().changed.send(());
+}
+
+/// Clears the timer entirely -- the Host console's "Clear" button, for
+/// dismissing a finished/no-longer-relevant countdown.
+pub fn clear_timer() {
+    *server()
+        .timer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    let _ = server().changed.send(());
+}
+
+/// Seconds remaining on the current timer, or `None` if none is running --
+/// negative once the timer's run past its duration (rendered as "overtime"
+/// rather than clamped to zero, so the Host can see exactly how far past
+/// budget a phase has run). Computed fresh from a real `Instant` on every
+/// call rather than stored/ticked, so it's never stale by more than however
+/// often a caller asks.
+pub fn timer_remaining_secs() -> Option<i64> {
+    server()
+        .timer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|t| t.duration.as_secs() as i64 - t.started_at.elapsed().as_secs() as i64)
 }
 
 /// How many tasks to push per tier -- `(easy, medium, hard)` -- for each
