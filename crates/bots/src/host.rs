@@ -386,6 +386,13 @@ impl HostDriver {
     /// step confirms its own observable phase transition rather than
     /// trusting reply order, since bots are actively nominating/voting
     /// concurrently by the time this runs.
+    ///
+    /// The server can now auto-close Nomination/Ballot/Runoff itself the
+    /// instant every player has acted
+    /// (`game_server::auto_close_denouncement_phase`), so a `Close*` sent
+    /// here can lose that race and be rejected as stale -- `do_cmd_until`
+    /// itself tolerates this (see its own doc comment), so no special
+    /// handling is needed here beyond that.
     pub async fn run_denouncement(
         &mut self,
         phase_wait: Duration,

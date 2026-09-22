@@ -1731,7 +1731,7 @@ fn Host() -> Element {
         }
         div {
             h3 { "The Denouncement" }
-            p { "Only the button matching the current phase above is enabled -- a review found all five were always clickable regardless of phase, so an out-of-order click just produced a raw error." }
+            p { "Only the button matching the current phase above is enabled. Nomination, the ballot, and any runoff also close themselves automatically the instant everyone who can act has -- no need to wait out the full time budget or watch the room for stragglers. Discussion still needs your own judgment call, so \"Open ballot\" stays a manual click." }
             if denouncement_phase.is_none() && !open_tasks.is_empty() {
                 p { class: "warning-text",
                     "{open_tasks.len()} task(s) are still open -- rules.md locks submissions before nomination starts. Close tasks below first, or open the Denouncement anyway if that's intentional."

@@ -14,8 +14,8 @@
 
 use engine::{
     apply_command, raffle_priority, raffle_winners, task_candidates, ticket_count, ticket_slots,
-    view_for, Command, DomainEvent, Faction, GameError, GameState, PlayerId, PlayerStatus,
-    PlayerView, Round, TaskTier, Viewer,
+    view_for, Command, DenouncementPhase, DomainEvent, Faction, GameError, GameState, PlayerId,
+    PlayerStatus, PlayerView, Round, TaskTier, Viewer,
 };
 use rand::seq::SliceRandom;
 use std::collections::{BTreeMap, BTreeSet};
@@ -181,6 +181,83 @@ pub fn start_round_one() -> Result<Vec<DomainEvent>, String> {
     Ok(events)
 }
 
+/// Every currently-active player who could still nominate/vote this round
+/// -- excludes anyone drunk this round (rules.md: a drunk player "can't
+/// nominate or vote" at all, so waiting on one would mean the phase could
+/// never close early). Used only by `auto_close_denouncement_phase` below;
+/// never exposed to any client view.
+fn must_still_act(state: &GameState) -> BTreeSet<PlayerId> {
+    state
+        .players()
+        .filter(|p| p.status == PlayerStatus::Active && !state.is_drunk(p.id))
+        .map(|p| p.id)
+        .collect()
+}
+
+/// Auto-closes a Denouncement's Nomination, Ballot, or Runoff phase the
+/// instant every player who could still act has -- an automation review
+/// found the Host previously had to watch the room and guess when it was
+/// safe to click "Close nomination"/"Close ballot"/"Close runoff" (five
+/// buttons already correctly gated by phase, see the Host console's
+/// disabled-by-phase fix, but none of them fired themselves). rules.md's
+/// "nomination 2 min, ballot 90 sec" time budgets are an upper bound, not
+/// a requirement to always wait that long -- there's nothing left to wait
+/// for once nobody has anything left to submit.
+///
+/// Deliberately does NOT do this for Discussion: rules.md frames that
+/// phase as "a shared timer that Dalton starts but doesn't moderate," with
+/// no per-player action to detect completion from -- only Dalton, watching
+/// the actual conversation, can judge when it's genuinely run its course.
+/// That phase stays a manual "Open ballot" click, same as every contest
+/// round and `AdvanceRound` itself (this app automates *content* and
+/// *bookkeeping*, never a judgment call rules.md gives to a human).
+///
+/// Never fires while the required set is empty (nobody active, or
+/// everybody drunk) -- an empty set trivially satisfies "everyone's
+/// acted," which would otherwise auto-close a phase nobody could have
+/// participated in at all.
+///
+/// A same-shaped auto-close for the *task* phase (once every active
+/// player has attempted every open task) was tried and deliberately
+/// reverted: unlike Nomination/Ballot/Runoff, which each open as one
+/// atomic action, tasks can be added incrementally over several separate
+/// `PushTask` calls (the Host console's "From player bios"/"Manual entry"
+/// panels are built specifically for pushing one at a time) -- a fast
+/// group finishing the *first* pushed task auto-closed the whole phase
+/// before the Host had pushed the rest they intended, confirmed by a real
+/// bot-test regression. Nomination/Ballot/Runoff don't have that failure
+/// mode: nothing adds *more* candidates/ballots to an already-open phase
+/// the way `PushTask` does.
+fn auto_close_denouncement_phase(state: &mut GameState) -> Vec<DomainEvent> {
+    let required = must_still_act(state);
+    if required.is_empty() {
+        return Vec::new();
+    }
+    let command = match state.denouncement_phase() {
+        Some(DenouncementPhase::Nomination { submitted }) => required
+            .iter()
+            .all(|id| submitted.contains_key(id))
+            .then_some(Command::CloseNomination),
+        Some(DenouncementPhase::Ballot { ballots, .. }) => required
+            .iter()
+            .all(|id| ballots.contains_key(id))
+            .then_some(Command::CloseBallot {
+                fallback_replacement: None,
+            }),
+        Some(DenouncementPhase::Runoff { ballots, .. }) => required
+            .iter()
+            .all(|id| ballots.contains_key(id))
+            .then_some(Command::CloseRunoff {
+                fallback_replacement: None,
+            }),
+        _ => None,
+    };
+    match command {
+        Some(cmd) => apply_command(state, cmd).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
 /// Applies one command against the single canonical `GameState`, holding
 /// the lock only for the mutation itself. The only place in the whole app
 /// allowed to call `engine::apply_command` -- every route-driven mutation
@@ -196,6 +273,7 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let auto_events = auto_push_on_round_advance(&mut state, &events, &mut pushed);
         events.extend(auto_events);
+        events.extend(auto_close_denouncement_phase(&mut state));
     }
     // Errors here just mean nobody's subscribed right now -- fine to
     // ignore, there's nobody waiting to be told.

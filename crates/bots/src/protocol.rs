@@ -159,14 +159,40 @@ impl Conn {
     ) -> Result<PlayerView, ConnError> {
         self.send(&ClientMsg::Do(cmd)).await?;
         let deadline = tokio::time::Instant::now() + timeout;
+        // The app server can now auto-advance some Denouncement phases on
+        // its own the instant every player's acted (see
+        // `game_server::auto_close_denouncement_phase`), so `cmd` here can
+        // lose a genuine race against that automation: by the time it's
+        // processed, the transition it wanted has *already* happened via
+        // that other path, and the server correctly rejects the now-stale
+        // command (e.g. "nomination is not currently open"). A `Failed`
+        // reply also carries no id tying it back to the send that caused
+        // it, so re-querying with a fresh `Watch` here would risk
+        // returning an *already-queued, still-stale* view instead of a
+        // genuinely current one -- the same backlog hazard this method's
+        // own doc comment above describes for broadcast ordering.
+        // Instead, treat `Failed` as non-fatal and keep waiting on this
+        // same receive stream, within the same overall deadline: if the
+        // automation's own broadcast (already in flight, or arriving
+        // shortly) satisfies `done`, that's success; only report the
+        // rejection if nothing does before the deadline.
+        let mut pending_rejection: Option<String> = None;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(ConnError::Timeout(what));
+                return match pending_rejection {
+                    Some(error) => Err(ConnError::Rejected(error)),
+                    None => Err(ConnError::Timeout(what)),
+                };
             }
             let next = match tokio::time::timeout(remaining, self.recv()).await {
                 Ok(result) => result?,
-                Err(_) => return Err(ConnError::Timeout(what)),
+                Err(_) => {
+                    return match pending_rejection {
+                        Some(error) => Err(ConnError::Rejected(error)),
+                        None => Err(ConnError::Timeout(what)),
+                    }
+                }
             };
             match next {
                 Some(ServerMsg::View(v)) => {
@@ -174,7 +200,7 @@ impl Conn {
                         return Ok(v);
                     }
                 }
-                Some(ServerMsg::Failed { error }) => return Err(ConnError::Rejected(error)),
+                Some(ServerMsg::Failed { error }) => pending_rejection = Some(error),
                 Some(ServerMsg::Joined { .. }) => {}
                 // Never relevant to this crate -- see the variant's own
                 // doc comment for why it still has to be parseable.

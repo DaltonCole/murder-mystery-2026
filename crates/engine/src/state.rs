@@ -569,9 +569,12 @@ impl GameState {
 
     /// Whether `viewer` is currently drunk (rules.md §3.2: "the target is
     /// told if drunk" -- the Bartender themself is deliberately never told
-    /// whether it landed, so this is only ever exposed to the drunk player
-    /// about themselves, never to the Bartender or anyone else).
-    pub(crate) fn is_drunk(&self, viewer: PlayerId) -> bool {
+    /// whether it landed, so `view_for` only ever exposes this about the
+    /// viewer's own status, never a full drunk-players list). `pub` (not
+    /// `pub(crate)`) so `app`'s server-side auto-close logic can check it
+    /// directly without going through any client-facing view -- this
+    /// widening doesn't change what any player/Host ever sees.
+    pub fn is_drunk(&self, viewer: PlayerId) -> bool {
         self.drunk_this_round.contains(&viewer)
     }
 
