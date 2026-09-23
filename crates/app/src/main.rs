@@ -580,9 +580,21 @@ fn Play() -> Element {
                 if is_servant {
                     div {
                         h3 { "You're a Servant" }
+                        p { "{faction_flavor(Faction::Servant)}" }
                         p { "You joined after the game started (rules.md: late arrivals become Servants), so there's no character sheet or ability panel for you. You can still nominate, vote, and attempt tasks like everyone else." }
                     }
                 } else {
+                    if let Some(faction) = v.own_faction {
+                        if faction != Faction::Unassigned {
+                            p { "{faction_flavor(faction)}" }
+                        }
+                    }
+                    if let Some(c) = v.own_character {
+                        p { "{character_flavor(c)}" }
+                    }
+                    if let Some(king_queen) = v.known_king_queen {
+                        p { "You now know the King/Queen: {names(&[king_queen], &v.roster)}." }
+                    }
                     if let Some(leader) = v.revealed_leader {
                         p { "You now know the Revolutionary Leader: {names(&[leader], &v.roster)}." }
                     }
@@ -1100,6 +1112,7 @@ fn AbilityPanel(
     rsx! {
         div {
             h3 { "Your ability" }
+            p { "{ability_description(character)}" }
             if !fellow_cultists.is_empty() {
                 p { "Fellow Cultists: {names(&fellow_cultists, &roster)}" }
             }
@@ -1330,6 +1343,43 @@ fn AbilityPanel(
                         "Invoke the office",
                     }
                 },
+                Character::KingQueen => rsx! {
+                    p {
+                        if abilities.king_queen_transfer_available.unwrap_or(false) {
+                            "You may transfer the crown once, before Round 5, to another eligible Ton player -- unmasking both of you."
+                        } else {
+                            "Transfer already used, or it's Round 5 or later."
+                        }
+                    }
+                    {target_picker}
+                    button {
+                        disabled: !abilities.king_queen_transfer_available.unwrap_or(false) || target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command
+                                .call(Command::TransferKingQueen { player: my_id, new_holder: PlayerId(t) });
+                        },
+                        "Transfer the crown",
+                    }
+                },
+                Character::RevolutionaryLeader => rsx! {
+                    p {
+                        if let Some(successor) = abilities.designated_successor {
+                            "Currently designated: {names(&[successor], &roster)}"
+                        } else {
+                            "No successor designated yet -- if you're Cast Out with nobody chosen, it defaults to a random remaining Uprising member."
+                        }
+                    }
+                    {target_picker}
+                    button {
+                        disabled: target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = target() else { return };
+                            on_command.call(Command::DesignateSuccessor { leader: my_id, successor: PlayerId(t) });
+                        },
+                        "Designate successor",
+                    }
+                },
                 _ => rsx! {},
             }
         }
@@ -1516,6 +1566,101 @@ fn character_label(c: Character) -> &'static str {
         Character::NormalTon => "Ton",
         Character::NormalUprising => "Uprising",
         Character::Cultist => "Cultist",
+    }
+}
+
+/// One line of narrative flavor per faction -- rules.md §0's own framing
+/// of the three-way conflict, plus the Servants' separate track (§1).
+/// Shown alongside a player's reveal so "Ton" or "Cult" reads as a real
+/// stake in the night, not just a color-coded label.
+fn faction_flavor(faction: Faction) -> &'static str {
+    match faction {
+        Faction::Ton => "High society -- trying to root out the agitator undermining it.",
+        Faction::Uprising => {
+            "A movement trying to survive the night and keep its leadership intact."
+        }
+        Faction::Cult => {
+            "A hidden third faction, secretly steering both of the above toward its own ends."
+        }
+        Faction::Servant => {
+            "A separate, non-competing track tonight, outside the three-way conflict."
+        }
+        Faction::Unassigned => "Not yet assigned.",
+    }
+}
+
+/// One line of narrative flavor per character -- each role's own "Goal"
+/// column and narrative title from rules.md §3.1-3.3, in second person.
+/// Distinct from `ability_description` below: this is *why* the role
+/// exists in the story, not *what button it presses*.
+fn character_flavor(character: Character) -> &'static str {
+    match character {
+        Character::KingQueen => "Your goal: avoid conversion to the Cult.",
+        Character::PrincePrincess => {
+            "Known as \"the Heir.\" Your goal: protect the King/Queen."
+        }
+        Character::RevolutionaryLeader => {
+            "Your goal: survive to the end. Not even your own faction knows who you are at the start."
+        }
+        Character::CultLeader => "Your goal: achieve any of the Cult's four win paths.",
+        Character::Oracle => "Your goal: find the Revolutionary Leader.",
+        Character::Almanac => "Your goal: narrow the field by elimination.",
+        Character::Spymaster => "Your goal: identify threats.",
+        Character::PriestPriestess => {
+            "Known as \"the Chaperone/Confessor.\" Your goal: protect the King/Queen."
+        }
+        Character::PotionMaker => "Known as \"the Modiste.\" Your goal: protect a target from the vote.",
+        Character::Magistrate => "Your goal: ensure the Denouncement lands correctly.",
+        Character::Bartender => "A footman/valet. Your goal: disrupt threats to the Leader.",
+        Character::DoctorMedic => "Your goal: protect the Leader.",
+        Character::Firebrand => "Your goal: rally the Uprising's numbers.",
+        Character::CellLeader => {
+            "Your goal: coordinate the rank-and-file without exposing the true Leader."
+        }
+        Character::Deceiver => "Your goal: protect the Cult's cover under scrutiny.",
+        Character::Duelist => "Your goal: force a suspect to face judgment.",
+        Character::Agitator => "Your goal: protect the movement through misdirection.",
+        Character::GrandInquisitor => {
+            "Your goal: press the Ton's advantage at a critical Denouncement."
+        }
+        Character::NormalTon => "A member of high society -- no named role, but never underestimate a crowd.",
+        Character::NormalUprising => "A member of the movement -- no named role, but every voice counts.",
+        Character::Cultist => "A secretly recruited member of the Cult. Your goal: support the Cult Leader.",
+    }
+}
+
+/// The mechanical "what does my ability actually do" text for `AbilityPanel`'s
+/// "Your ability" section -- adapted from rules.md §3.1-3.3's own "Ability"
+/// column into second person, one entry per character regardless of
+/// whether that character also gets interactive controls below it (a
+/// purely passive ability, like the Cell Leader's or Cultist's, still gets
+/// an explanation here, just no button). A review found this section
+/// existed as a heading with nothing under it -- every character's
+/// control (where one exists) used to be the only explanation of what it
+/// did.
+fn ability_description(character: Character) -> &'static str {
+    match character {
+        Character::KingQueen => "Once per game, before Round 5, you may transfer the crown to another eligible Ton player -- unmasking you both.",
+        Character::PrincePrincess => "You automatically learn the King/Queen's identity once Round 3 begins -- no action needed.",
+        Character::RevolutionaryLeader => "At any time, you may secretly pre-designate a successor. If you're Cast Out with nobody chosen, succession defaults to a random remaining Uprising member.",
+        Character::CultLeader => "Before each recruitment window, you may query one candidate -- are they Ton-aligned, or are they the Revolutionary Leader? You also designate which recruited Cultist holds the Deceiver title.",
+        Character::Cultist => "You know your fellow Cultists. No active ability beyond that.",
+        Character::Oracle => "After every odd round, you may view one player's full history, locked at that moment. Permanently disabled if the King/Queen is Cast Out.",
+        Character::Almanac => "Once per game, you privately learn 3 players who are definitely not the Revolutionary Leader.",
+        Character::Spymaster => "Once per game, you view a single player's faction color only.",
+        Character::PriestPriestess => "Once per Cult recruitment window, you may protect one person from conversion, without knowing that's what you're protecting against. You can't protect the same person twice all game.",
+        Character::PotionMaker => "Once per game, you may grant execution-immunity, saving whoever the public vote would Cast Out that round.",
+        Character::Magistrate => "Once per game, your ballot counts as two votes at tally.",
+        Character::Firebrand => "Once per game, your ballot counts as two votes at tally -- the Uprising's mirror to the Magistrate.",
+        Character::Bartender => "Once per round, you may target someone with a 50% chance of making them drunk that round. You're never told whether it actually landed.",
+        Character::DoctorMedic => "Once per round, you may protect one person; if they're selected for Cast-Out, they're removed from the resolved list before slots are filled. You can't protect the same person on two consecutive rounds.",
+        Character::Duelist => "Once per game, before nomination closes, you may \"challenge\" one player -- guaranteeing them a spot on the ballot regardless of verbal support.",
+        Character::Agitator => "Once per game, during discussion, you may force the room to spend extra time debating a different player of your choosing instead.",
+        Character::GrandInquisitor => "Once per game, before a ballot closes, you may invoke your office: both of the top two vote-getters are Cast Out that round, regardless of the standard execution-count rule.",
+        Character::NormalTon => "You auto-succeed one failed social task, once per game -- automatic, no action needed.",
+        Character::NormalUprising => "Once per game, you may shield yourself, ignoring one vote cast against you.",
+        Character::CellLeader => "You know 2 other Uprising members (never the Leader). No active ability beyond that.",
+        Character::Deceiver => "Once per game, if targeted by another player's info-check ability, you may force that check to return a false result.",
     }
 }
 

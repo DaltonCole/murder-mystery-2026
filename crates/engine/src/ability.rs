@@ -152,6 +152,19 @@ pub struct AbilityStatus {
     pub duelist_available: Option<bool>,
     pub agitator_available: Option<bool>,
     pub grand_inquisitor_available: Option<bool>,
+    /// King/Queen only. This ability existed in `Command::TransferKingQueen`
+    /// from early in the project but was never actually surfaced to any
+    /// client -- there was no way for a real King/Queen to know it existed,
+    /// let alone use it, until a UX pass wired it up.
+    pub king_queen_transfer_available: Option<bool>,
+    /// Revolutionary Leader only -- their currently pre-designated
+    /// successor, if any (`Command::DesignateSuccessor`'s doc comment: "at
+    /// any time," a standing choice like a bio, not a limited-use ability,
+    /// so there's no matching `_available` flag). `None` covers both "not
+    /// the Leader" and "the Leader, but hasn't designated anyone yet" --
+    /// this field was, like the one above, defined years before any UI
+    /// ever read it.
+    pub designated_successor: Option<PlayerId>,
 }
 
 /// One delivered info-check result, kept so `view_for` can show a querier

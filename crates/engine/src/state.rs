@@ -513,6 +513,13 @@ impl GameState {
             Character::GrandInquisitor => {
                 status.grand_inquisitor_available = Some(!self.grand_inquisitor_used);
             }
+            Character::KingQueen => {
+                status.king_queen_transfer_available =
+                    Some(!self.king_queen_transfer_used && self.current_round < Round::Five);
+            }
+            Character::RevolutionaryLeader => {
+                status.designated_successor = self.revolutionary_leader_successor;
+            }
             _ => {}
         }
         status
@@ -595,6 +602,29 @@ impl GameState {
     pub(crate) fn leader_known_to(&self, viewer: PlayerId) -> Option<PlayerId> {
         if self.leader_known_by.contains(&viewer) {
             self.revolutionary_leader
+        } else {
+            None
+        }
+    }
+
+    /// The King/Queen's identity, for the Prince/Princess only -- rules.md
+    /// §3.1: "Learns the King/Queen's identity after Round 2." Computed
+    /// dynamically (current `self.king_queen`, current `self.character`),
+    /// not a one-time snapshot recorded at the moment Round 3 begins: a
+    /// converted Prince/Princess keeps their character and this knowledge
+    /// (rules.md §3.3, "a converted player keeps their original character
+    /// and abilities"), and if the crown later moves (voluntary transfer,
+    /// a conversion cascade, the Round 3 Cast-Out cascade), rules.md never
+    /// says the Prince/Princess loses track of the new holder -- the whole
+    /// point of the role is protecting *whoever currently wears the
+    /// crown*, not a specific past name.
+    pub(crate) fn king_queen_known_to(&self, viewer: PlayerId) -> Option<PlayerId> {
+        let is_prince_princess = self
+            .players
+            .get(&viewer)
+            .is_some_and(|p| p.character == Some(Character::PrincePrincess));
+        if is_prince_princess && self.current_round >= Round::Three {
+            self.king_queen
         } else {
             None
         }

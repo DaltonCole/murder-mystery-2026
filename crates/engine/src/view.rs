@@ -141,6 +141,13 @@ pub struct PlayerView {
     /// revealed to as one of their Confidants -- `None` for everyone else,
     /// including the Leader's own view of themselves.
     pub revealed_leader: Option<PlayerId>,
+    /// The King/Queen's identity, if the viewer is currently the
+    /// Prince/Princess and it's Round 3 or later (rules.md §3.1: "Learns
+    /// the King/Queen's identity after Round 2") -- `None` for every other
+    /// viewer, and `None` for the Prince/Princess themselves before then.
+    /// See `GameState::king_queen_known_to`'s doc comment for why this is
+    /// computed dynamically rather than snapshotted once.
+    pub known_king_queen: Option<PlayerId>,
     /// Whether the viewer has opted into the Intermission lottery -- only
     /// ever the viewer's own status, never anyone else's. Always `false`
     /// for Host/Display.
@@ -327,6 +334,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         .map(|id| state.confidants_known_to_leader(id))
         .unwrap_or_default();
     let revealed_leader = viewer_id.and_then(|id| state.leader_known_to(id));
+    let known_king_queen = viewer_id.and_then(|id| state.king_queen_known_to(id));
     let i_opted_into_intermission = viewer_id.is_some_and(|id| state.opted_into_intermission(id));
     let intermission_entrants = state.intermission_entrants().map(|e| e.to_vec());
     let contest_results = if is_host {
@@ -391,6 +399,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         i_am_drunk,
         my_confidants,
         revealed_leader,
+        known_king_queen,
         i_opted_into_intermission,
         intermission_entrants,
         servant_leaderboard: state.servant_leaderboard(),
@@ -1091,11 +1100,17 @@ mod tests {
         let oracle_view = view_for(&state, Viewer::Player(oracle));
         assert!(oracle_view.my_abilities.oracle_checks_available.is_some());
 
-        // King/Queen has no ability-bearing character -- every field stays
-        // empty, including `oracle_checks_available`, even though a real
-        // Oracle exists elsewhere in the game.
+        // The King/Queen's own ability (the crown transfer) is populated,
+        // but nothing that belongs to a different character (like the
+        // Oracle's checks) leaks into their view.
         let king_view = view_for(&state, Viewer::Player(king_queen));
-        assert_eq!(king_view.my_abilities, AbilityStatus::default());
+        assert_eq!(
+            king_view.my_abilities,
+            AbilityStatus {
+                king_queen_transfer_available: Some(true),
+                ..AbilityStatus::default()
+            }
+        );
 
         assert_eq!(
             view_for(&state, Viewer::Host).my_abilities,
@@ -1105,6 +1120,181 @@ mod tests {
             view_for(&state, Viewer::Display).my_abilities,
             AbilityStatus::default()
         );
+    }
+
+    #[test]
+    fn king_queen_transfer_available_reflects_use_and_the_round_five_cutoff() {
+        let (mut state, _oracle, king_queen, ..) = phase2_state();
+        let new_holder = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Duke".into(),
+                },
+            )
+            .unwrap();
+            let id = match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_command(
+                &mut state,
+                Command::AssignFaction {
+                    player: id,
+                    faction: Faction::Ton,
+                },
+            )
+            .unwrap();
+            id
+        };
+
+        assert_eq!(
+            view_for(&state, Viewer::Player(king_queen))
+                .my_abilities
+                .king_queen_transfer_available,
+            Some(true)
+        );
+
+        apply_command(
+            &mut state,
+            Command::TransferKingQueen {
+                player: king_queen,
+                new_holder,
+            },
+        )
+        .unwrap();
+
+        // The transfer is used up -- the *original* King/Queen (now a
+        // plain Ton member) no longer even has this field populated at
+        // all, and the new holder's own view now shows it used.
+        assert_eq!(
+            view_for(&state, Viewer::Player(king_queen))
+                .my_abilities
+                .king_queen_transfer_available,
+            None
+        );
+        assert_eq!(
+            view_for(&state, Viewer::Player(new_holder))
+                .my_abilities
+                .king_queen_transfer_available,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn designated_successor_reflects_the_leaders_own_standing_choice() {
+        let (mut state, _oracle, _king_queen, leader, _cell_leader, _cultist) = phase2_state();
+
+        assert_eq!(
+            view_for(&state, Viewer::Player(leader))
+                .my_abilities
+                .designated_successor,
+            None
+        );
+
+        let successor = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Understudy".into(),
+                },
+            )
+            .unwrap();
+            let id = match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_command(
+                &mut state,
+                Command::AssignFaction {
+                    player: id,
+                    faction: Faction::Uprising,
+                },
+            )
+            .unwrap();
+            id
+        };
+        apply_command(
+            &mut state,
+            Command::DesignateSuccessor { leader, successor },
+        )
+        .unwrap();
+
+        assert_eq!(
+            view_for(&state, Viewer::Player(leader))
+                .my_abilities
+                .designated_successor,
+            Some(successor)
+        );
+        // Nobody else -- including the successor themselves -- learns this
+        // standing choice from their own view; it's the Leader's alone.
+        assert_eq!(
+            view_for(&state, Viewer::Player(successor))
+                .my_abilities
+                .designated_successor,
+            None
+        );
+    }
+
+    #[test]
+    fn known_king_queen_is_revealed_to_the_prince_princess_only_from_round_three() {
+        let (mut state, _oracle, king_queen, ..) = phase2_state();
+        let prince = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Prince".into(),
+                },
+            )
+            .unwrap();
+            let id = match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            };
+            apply_command(
+                &mut state,
+                Command::AssignFaction {
+                    player: id,
+                    faction: Faction::Ton,
+                },
+            )
+            .unwrap();
+            apply_command(
+                &mut state,
+                Command::AssignCharacter {
+                    player: id,
+                    character: Character::PrincePrincess,
+                },
+            )
+            .unwrap();
+            id
+        };
+
+        // Round 1, straight out of setup -- not revealed yet.
+        assert_eq!(
+            view_for(&state, Viewer::Player(prince)).known_king_queen,
+            None
+        );
+        // Nobody else ever sees this, including the King/Queen's own view
+        // of themselves and the Host/Display.
+        assert_eq!(
+            view_for(&state, Viewer::Player(king_queen)).known_king_queen,
+            None
+        );
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        assert_eq!(
+            view_for(&state, Viewer::Player(prince)).known_king_queen,
+            None
+        );
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        assert_eq!(
+            view_for(&state, Viewer::Player(prince)).known_king_queen,
+            Some(king_queen)
+        );
+        assert_eq!(view_for(&state, Viewer::Host).known_king_queen, None);
+        assert_eq!(view_for(&state, Viewer::Display).known_king_queen, None);
     }
 
     #[test]
