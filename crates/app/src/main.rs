@@ -179,6 +179,9 @@ enum ClientMsg {
     AddTimerSeconds { seconds: u32 },
     /// `/host` only: clears the timer entirely.
     ClearTimer,
+    /// `/host` only: attempts to log in with this passphrase. See
+    /// `game_server::check_host_password`'s doc comment.
+    HostLogin { password: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +206,11 @@ enum ServerMsg {
     /// doc comment on why wall-clock time stays out of the engine's
     /// deterministic state entirely.
     Timer(Option<i64>),
+    /// `/host` only, direct reply to `ClientMsg::HostLogin`: whether the
+    /// submitted passphrase was correct.
+    HostLoginResult {
+        ok: bool,
+    },
 }
 
 #[get("/api/ws")]
@@ -337,6 +345,14 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                 .await
                                 .is_ok()
                         }
+                        ClientMsg::HostLogin { password } => {
+                            socket
+                                .send(ServerMsg::HostLoginResult {
+                                    ok: game_server::check_host_password(&password),
+                                })
+                                .await
+                                .is_ok()
+                        }
                     };
                     if !sent_ok {
                         break;
@@ -367,6 +383,20 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
 
 // --- /play -----------------------------------------------------------------
 
+/// The three screens a player sees once the game has actually started
+/// (`raffle_closed`) -- before that, `Play` is a single "Character
+/// Creation" screen instead, since there's no round/game state yet worth
+/// splitting into tabs. Grouped by subject rather than by game phase so
+/// the tab a player wants is always the same one, round after round:
+/// "who am I" (Character), "what do I need to do right now" (Round), and
+/// "what's happening across the whole game" (Game).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PlayTab {
+    Character,
+    Round,
+    Game,
+}
+
 #[component]
 fn Play() -> Element {
     let mut view = use_signal(|| None::<PlayerView>);
@@ -391,10 +421,10 @@ fn Play() -> Element {
                 // instead, only on this player's own next action.
                 Ok(ServerMsg::View(v)) => view.set(Some(v)),
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
-                // `/play` never watches as `Viewer::Host`, so this never
-                // actually arrives here -- see `ServerMsg::LocationTaskTemplates`'s
-                // doc comment.
-                Ok(ServerMsg::LocationTaskTemplates(_)) => {}
+                // `/play` never watches as `Viewer::Host`, and never sends
+                // `HostLogin` either -- see `ServerMsg::LocationTaskTemplates`'s
+                // doc comment for why these still have to be parseable.
+                Ok(ServerMsg::LocationTaskTemplates(_) | ServerMsg::HostLoginResult { .. }) => {}
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
                 Err(_) => break,
             }
@@ -418,6 +448,12 @@ fn Play() -> Element {
     // with nothing to actually press or hold. Once tripped, stays revealed
     // for the rest of the game -- there's no reason to re-hide it.
     let mut revealed = use_signal(|| false);
+    // Which of the three post-game-start screens is showing. Only
+    // meaningful once the game's actually started (see `PlayTab`'s own
+    // doc comment) -- pre-game there's nothing yet worth splitting into
+    // Round/Game tabs, so that phase stays a single "Character Creation"
+    // screen instead.
+    let mut active_tab = use_signal(|| PlayTab::Character);
 
     let mut do_join = move || {
         let name = name_draft.peek().trim().to_string();
@@ -455,6 +491,20 @@ fn Play() -> Element {
         return rsx! { p { "Connecting..." } };
     };
 
+    // Late arrivals (rules.md: "late arrivals become Servants") -- the
+    // only players who ever reach the tabbed view below without going
+    // through Character Creation first, since `Faction::Servant` is only
+    // ever assigned after the raffle's closed. See `PlayTab`'s doc
+    // comment for why this and `is_cast_out` are computed once here
+    // rather than re-checked inline at each of their several call sites
+    // below (a review found the same `roster.iter().any(...)` check
+    // repeated three times over).
+    let is_servant = v.own_faction == Some(Faction::Servant);
+    let is_cast_out = v
+        .roster
+        .iter()
+        .any(|r| r.id == id && r.status == PlayerStatus::CastOut);
+
     rsx! {
         h1 { "Murder Mystery 2026" }
         if let Some(e) = error() {
@@ -483,169 +533,215 @@ fn Play() -> Element {
                 }
             }
         }
-        if v.i_am_drunk {
-            p { class: "error-text", "You're drunk this round -- you can't nominate or vote." }
-        }
-        if let Some(leader) = v.revealed_leader {
-            p { "You now know the Revolutionary Leader: {names(&[leader], &v.roster)}." }
-        }
-        if !v.my_confidants.is_empty() {
-            p { "These people now know you're the Revolutionary Leader: {names(&v.my_confidants, &v.roster)}." }
-        }
-        if let Some(message) = &v.martyrdom_message {
-            p { class: "martyrdom-message",
-                "{message}"
-                br {}
-                em { "(private -- only you can see this)" }
-            }
-        }
         FinaleCastOutReveal { reveal: v.finale_cast_out_reveal.clone(), heading_level: 4u8 }
-        if v.own_character.is_none() {
-            InterestLevelForm {
-                my_id: id,
-                own_interest_level: v.own_interest_level,
-                on_command: send_cmd,
-            }
-        }
-        div {
-            h4 { "Intermission" }
-            if let Some(entrants) = &v.intermission_entrants {
-                p { "Entrants: {names(entrants, &v.roster)}" }
-            } else if v.i_opted_into_intermission {
-                p { "You're in the pool. Entrants haven't been drawn yet." }
-            } else if v.roster.iter().any(|r| r.id == id && r.status == PlayerStatus::CastOut) {
-                p { "Cast-Out players aren't eligible for the Intermission lottery." }
-            } else {
-                button {
-                    onclick: move |_| send_cmd(Command::OptIntoIntermission { player: id }),
-                    "Opt into the Intermission lottery",
+        if !v.raffle_closed {
+            // rules.md §1's "Character creation" -- a new player's very
+            // first task, before there's any round/game state worth
+            // showing. Servants never reach this branch (they only ever
+            // join once `raffle_closed` is already true), so there's no
+            // "how involved do you want to be" or "create your character"
+            // prompt for them at all -- both are meaningless once the
+            // raffle they'd feed into has already run.
+            div {
+                h2 { "Character Creation" }
+                p { "Welcome! The game hasn't started yet -- rate how involved you'd like to be, then create your character below." }
+                InterestLevelForm {
+                    my_id: id,
+                    own_interest_level: v.own_interest_level,
+                    on_command: send_cmd,
+                }
+                BioForm {
+                    my_id: id,
+                    own_bio: v.own_bio.clone(),
+                    locked: false,
+                    on_command: send_cmd,
                 }
             }
-        }
-        if v.roster.iter().any(|r| r.id == id && r.status == PlayerStatus::CastOut) {
+        } else {
             div {
-                h4 { "The Gallery" }
-                if v.current_round != Round::Finale {
-                    p { "The Gallery opens once the Finale begins." }
+                class: "tab-nav",
+                button {
+                    class: if active_tab() == PlayTab::Character { "tab-active" },
+                    onclick: move |_| active_tab.set(PlayTab::Character),
+                    "Character",
+                }
+                button {
+                    class: if active_tab() == PlayTab::Round { "tab-active" },
+                    onclick: move |_| active_tab.set(PlayTab::Round),
+                    "Round",
+                }
+                button {
+                    class: if active_tab() == PlayTab::Game { "tab-active" },
+                    onclick: move |_| active_tab.set(PlayTab::Game),
+                    "Game",
+                }
+            }
+            if active_tab() == PlayTab::Character {
+                if is_servant {
+                    div {
+                        h3 { "You're a Servant" }
+                        p { "You joined after the game started (rules.md: late arrivals become Servants), so there's no character sheet or ability panel for you. You can still nominate, vote, and attempt tasks like everyone else." }
+                    }
                 } else {
-                    p { "Predict who gets Cast Out, or which faction wins -- scored against the Servant leaderboard once the Finale resolves." }
-                    select {
-                        onchange: move |e| gallery_pick.set(e.value().parse().ok()),
-                        option { value: "", "-- who gets Cast Out? --" }
-                        for r in v.roster.iter().filter(|r| r.status == PlayerStatus::Active) {
-                            option { value: "{r.id.0}", "{r.name}" }
+                    if let Some(leader) = v.revealed_leader {
+                        p { "You now know the Revolutionary Leader: {names(&[leader], &v.roster)}." }
+                    }
+                    if !v.my_confidants.is_empty() {
+                        p { "These people now know you're the Revolutionary Leader: {names(&v.my_confidants, &v.roster)}." }
+                    }
+                    if let Some(message) = &v.martyrdom_message {
+                        p { class: "martyrdom-message",
+                            "{message}"
+                            br {}
+                            em { "(private -- only you can see this)" }
                         }
                     }
-                    button {
-                        disabled: gallery_pick().is_none(),
-                        onclick: move |_| {
-                            let Some(t) = gallery_pick() else { return };
-                            send_cmd(Command::SubmitGalleryPrediction {
-                                player: id,
-                                prediction: GalleryPrediction::CastOutIs(PlayerId(t)),
-                            });
-                        },
-                        "Predict this Cast-Out",
+                    BioForm {
+                        my_id: id,
+                        own_bio: v.own_bio.clone(),
+                        locked: true,
+                        on_command: send_cmd,
                     }
-                    select {
-                        onchange: move |e| {
-                            gallery_faction_pick.set(match e.value().as_str() {
-                                "Ton" => Some(Faction::Ton),
-                                "Uprising" => Some(Faction::Uprising),
-                                "Cult" => Some(Faction::Cult),
-                                _ => None,
-                            });
-                        },
-                        option { value: "", "-- who wins? --" }
-                        option { value: "Ton", "Ton" }
-                        option { value: "Uprising", "Uprising" }
-                        option { value: "Cult", "Cult" }
-                    }
-                    button {
-                        disabled: gallery_faction_pick().is_none(),
-                        onclick: move |_| {
-                            let Some(f) = gallery_faction_pick() else { return };
-                            send_cmd(Command::SubmitGalleryPrediction {
-                                player: id,
-                                prediction: GalleryPrediction::FactionWins(f),
-                            });
-                        },
-                        "Predict this winner",
+                    AbilityPanel {
+                        my_id: id,
+                        own_character: v.own_character,
+                        abilities: v.my_abilities.clone(),
+                        my_info_checks: v.my_info_checks.clone(),
+                        fellow_cultists: v.fellow_cultists.clone(),
+                        known_uprising_members: v.known_uprising_members.clone(),
+                        roster: v.roster.clone(),
+                        on_command: send_cmd,
                     }
                 }
             }
-        }
-        if !v.servant_leaderboard.is_empty() {
-            div {
-                h4 { "Servant leaderboard" }
-                ul {
-                    for (pid , points) in v.servant_leaderboard.clone() {
-                        li { key: "{pid.0}", "{names(&[pid], &v.roster)}: {points}" }
+            if active_tab() == PlayTab::Round {
+                if v.i_am_drunk {
+                    p { class: "error-text", "You're drunk this round -- you can't nominate or vote." }
+                }
+                for task in v.open_tasks.clone() {
+                    if task.is_location_task {
+                        LocationTaskAttemptForm {
+                            key: "{task.id.0}",
+                            my_id: id,
+                            task,
+                            on_command: send_cmd,
+                        }
+                    } else {
+                        TaskAttemptForm {
+                            key: "{task.id.0}",
+                            my_id: id,
+                            task,
+                            roster: v.roster.clone(),
+                            on_command: send_cmd,
+                        }
+                    }
+                }
+                if is_cast_out {
+                    p { "You've been Cast Out -- you're spectating the rest of the Denouncement." }
+                } else {
+                    DenouncementPanel {
+                        my_id: id,
+                        denouncement: v.denouncement.clone(),
+                        roster: v.roster.clone(),
+                        on_command: send_cmd,
+                    }
+                }
+                if is_cast_out {
+                    div {
+                        h4 { "The Gallery" }
+                        if v.current_round != Round::Finale {
+                            p { "The Gallery opens once the Finale begins." }
+                        } else {
+                            p { "Predict who gets Cast Out, or which faction wins -- scored against the Servant leaderboard once the Finale resolves." }
+                            select {
+                                onchange: move |e| gallery_pick.set(e.value().parse().ok()),
+                                option { value: "", "-- who gets Cast Out? --" }
+                                for r in v.roster.iter().filter(|r| r.status == PlayerStatus::Active) {
+                                    option { value: "{r.id.0}", "{r.name}" }
+                                }
+                            }
+                            button {
+                                disabled: gallery_pick().is_none(),
+                                onclick: move |_| {
+                                    let Some(t) = gallery_pick() else { return };
+                                    send_cmd(Command::SubmitGalleryPrediction {
+                                        player: id,
+                                        prediction: GalleryPrediction::CastOutIs(PlayerId(t)),
+                                    });
+                                },
+                                "Predict this Cast-Out",
+                            }
+                            select {
+                                onchange: move |e| {
+                                    gallery_faction_pick.set(match e.value().as_str() {
+                                        "Ton" => Some(Faction::Ton),
+                                        "Uprising" => Some(Faction::Uprising),
+                                        "Cult" => Some(Faction::Cult),
+                                        _ => None,
+                                    });
+                                },
+                                option { value: "", "-- who wins? --" }
+                                option { value: "Ton", "Ton" }
+                                option { value: "Uprising", "Uprising" }
+                                option { value: "Cult", "Cult" }
+                            }
+                            button {
+                                disabled: gallery_faction_pick().is_none(),
+                                onclick: move |_| {
+                                    let Some(f) = gallery_faction_pick() else { return };
+                                    send_cmd(Command::SubmitGalleryPrediction {
+                                        player: id,
+                                        prediction: GalleryPrediction::FactionWins(f),
+                                    });
+                                },
+                                "Predict this winner",
+                            }
+                        }
                     }
                 }
             }
-        }
-        WhistledownPosts { posts: v.whistledown.clone(), heading_level: 4u8 }
-        BioForm {
-            my_id: id,
-            own_bio: v.own_bio.clone(),
-            on_command: send_cmd,
-        }
-        RosterList { roster: v.roster.clone() }
-        // Repeated here, not just at the top of the page -- a review found
-        // a rejected ability/vote produced an error banner far above these
-        // action panels, easy to miss on a long phone-width page without
-        // scrolling back up.
-        if let Some(e) = error() {
-            p { class: "error-text", "{e}" }
-        }
-        AbilityPanel {
-            my_id: id,
-            own_character: v.own_character,
-            abilities: v.my_abilities.clone(),
-            my_info_checks: v.my_info_checks.clone(),
-            fellow_cultists: v.fellow_cultists.clone(),
-            known_uprising_members: v.known_uprising_members.clone(),
-            roster: v.roster.clone(),
-            on_command: send_cmd,
-        }
-        if v.roster.iter().any(|r| r.id == id && r.status == PlayerStatus::CastOut) {
-            p { "You've been Cast Out -- you're spectating the rest of the Denouncement." }
-        } else {
-            DenouncementPanel {
-                my_id: id,
-                denouncement: v.denouncement.clone(),
-                roster: v.roster.clone(),
-                on_command: send_cmd,
-            }
-        }
-        for task in v.open_tasks.clone() {
-            if task.is_location_task {
-                LocationTaskAttemptForm {
-                    key: "{task.id.0}",
-                    my_id: id,
-                    task,
-                    on_command: send_cmd,
+            if active_tab() == PlayTab::Game {
+                div {
+                    h4 { "Intermission" }
+                    if let Some(entrants) = &v.intermission_entrants {
+                        p { "Entrants: {names(entrants, &v.roster)}" }
+                    } else if v.i_opted_into_intermission {
+                        p { "You're in the pool. Entrants haven't been drawn yet." }
+                    } else if is_cast_out || is_servant {
+                        p { "Cast-Out players and Servants aren't eligible for the Intermission lottery." }
+                    } else {
+                        button {
+                            onclick: move |_| send_cmd(Command::OptIntoIntermission { player: id }),
+                            "Opt into the Intermission lottery",
+                        }
+                    }
                 }
-            } else {
-                TaskAttemptForm {
-                    key: "{task.id.0}",
-                    my_id: id,
-                    task,
-                    roster: v.roster.clone(),
-                    on_command: send_cmd,
+                if !v.servant_leaderboard.is_empty() {
+                    div {
+                        h4 { "Servant leaderboard" }
+                        ul {
+                            for (pid , points) in v.servant_leaderboard.clone() {
+                                li { key: "{pid.0}", "{names(&[pid], &v.roster)}: {points}" }
+                            }
+                        }
+                    }
                 }
+                WhistledownPosts { posts: v.whistledown.clone(), heading_level: 4u8 }
+                RosterList { roster: v.roster.clone() }
             }
         }
     }
 }
 
-/// rules.md §1's signup interest rating -- only shown before the setup
-/// raffle has given the viewer a character (`own_character` still `None`
-/// in `Play`'s caller); once it has, there's nothing left to rate. A
-/// standing choice like `SubmitBio` -- resubmitting silently replaces (see
-/// `Command::SubmitInterestLevel`'s doc comment), so this doesn't need a
-/// separate "already submitted, lock it in" state.
+/// rules.md §1's signup interest rating -- only shown during Character
+/// Creation, before the setup raffle has closed (`Play`'s caller gates
+/// this on `!v.raffle_closed`, not `own_character.is_none()` -- a review
+/// found the old character-based gate never actually hid this from a
+/// Servant, since a late arrival's `own_character` stays `None` forever,
+/// not just until the raffle runs). A standing choice like `SubmitBio` --
+/// resubmitting silently replaces (see `Command::SubmitInterestLevel`'s
+/// doc comment), so this doesn't need a separate "already submitted, lock
+/// it in" state.
 #[component]
 fn InterestLevelForm(
     my_id: PlayerId,
@@ -826,7 +922,12 @@ fn TimerDisplay(remaining_secs: Option<i64>) -> Element {
 /// retyping, matching this Phase 1-era "basic shell" UI's overall level of
 /// polish elsewhere.
 #[component]
-fn BioForm(my_id: PlayerId, own_bio: Option<Bio>, on_command: EventHandler<Command>) -> Element {
+fn BioForm(
+    my_id: PlayerId,
+    own_bio: Option<Bio>,
+    locked: bool,
+    on_command: EventHandler<Command>,
+) -> Element {
     let mut character_name = use_signal(String::new);
     let mut real_name = use_signal(String::new);
     let mut occupation = use_signal(String::new);
@@ -857,6 +958,16 @@ fn BioForm(my_id: PlayerId, own_bio: Option<Bio>, on_command: EventHandler<Comma
                     }
                 }
             }
+            // Once the game has started, a character sheet is locked --
+            // rules.md's task pool and any bio-derived info-checks already
+            // read whatever was submitted before setup finalized, so a
+            // late edit would silently diverge from what the game itself
+            // is already using.
+            if locked {
+                if own_bio.is_none() {
+                    p { "Character sheets are locked now that the game has started." }
+                }
+            } else {
             input {
                 placeholder: "Character name",
                 maxlength: "32",
@@ -933,6 +1044,7 @@ fn BioForm(my_id: PlayerId, own_bio: Option<Bio>, on_command: EventHandler<Comma
                         });
                 },
                 if own_bio.is_some() { "Update bio" } else { "Submit bio" }
+            }
             }
         }
     }
@@ -1521,10 +1633,22 @@ fn Host() -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut location_task_templates = use_signal(Vec::<(usize, TaskTier, String)>::new);
     let mut timer = use_signal(|| None::<i64>);
+    // Gates the whole console behind `game_server::check_host_password` --
+    // a UI-level lock only (per the user's own explicit choice over full
+    // per-command server-side enforcement): the raw websocket protocol
+    // still has no real access control (see the module doc comment's
+    // KNOWN GAP), but this stops the console from being reachable, or any
+    // Host-privileged data from even being requested, without the
+    // passphrase. Deliberately doesn't persist across a reload (no
+    // localStorage) -- simpler and lower-risk than adding a new browser
+    // API dependency this session can't test end to end; re-entering the
+    // passphrase once per reload is a small, known, accepted tradeoff.
+    let mut authed = use_signal(|| false);
+    let mut login_failed = use_signal(|| false);
+    let mut password_draft = use_signal(String::new);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
-        let _ = socket.send(ClientMsg::Watch(Viewer::Host)).await;
         loop {
             match socket.recv().await {
                 // Deliberately NOT clearing `error` here -- see `Play`'s
@@ -1537,6 +1661,19 @@ fn Host() -> Element {
                     location_task_templates.set(templates);
                 }
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
+                Ok(ServerMsg::HostLoginResult { ok }) => {
+                    authed.set(ok);
+                    login_failed.set(!ok);
+                    // Only start watching as Host -- and so only start
+                    // receiving Host-privileged data at all -- once the
+                    // passphrase actually checks out.
+                    if ok {
+                        let socket = socket;
+                        spawn(async move {
+                            let _ = socket.send(ClientMsg::Watch(Viewer::Host)).await;
+                        });
+                    }
+                }
                 // The connection is gone -- stop polling it. Without this,
                 // a closed socket makes `recv()` return `Err` immediately
                 // on every call forever, spinning this loop with no yield
@@ -1548,6 +1685,39 @@ fn Host() -> Element {
             }
         }
     });
+
+    let login = move || {
+        let password = password_draft.peek().clone();
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::HostLogin { password }).await;
+        });
+    };
+
+    if !authed() {
+        return rsx! {
+            h1 { "Host Console" }
+            p { "Enter the host passphrase to continue." }
+            if login_failed() {
+                p { class: "error-text", "Incorrect passphrase." }
+            }
+            input {
+                r#type: "password",
+                placeholder: "Passphrase",
+                value: "{password_draft}",
+                oninput: move |e| password_draft.set(e.value()),
+                onkeydown: move |e: Event<KeyboardData>| {
+                    if e.key() == Key::Enter {
+                        login();
+                    }
+                },
+            }
+            button {
+                onclick: move |_| login(),
+                "Log in"
+            }
+        };
+    }
 
     let mut do_cmd = move |cmd: Command| {
         let socket = socket;
@@ -2369,7 +2539,8 @@ fn Display() -> Element {
                 Ok(
                     ServerMsg::Failed { .. }
                     | ServerMsg::Joined { .. }
-                    | ServerMsg::LocationTaskTemplates(_),
+                    | ServerMsg::LocationTaskTemplates(_)
+                    | ServerMsg::HostLoginResult { .. },
                 ) => {}
                 // See the identical comment in `Host` -- without this, a
                 // closed connection spins this loop forever with no yield.

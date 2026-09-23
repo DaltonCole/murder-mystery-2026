@@ -48,6 +48,17 @@ pub enum ServerMsg {
     /// state (see `game_server::GameTimer`'s doc comment), so this crate
     /// only needs to parse it, never act on it.
     Timer(Option<i64>),
+    /// Mirrors `app`'s own `ServerMsg::HostLoginResult`. Unlike
+    /// `LocationTaskTemplates`/`Timer` above, this one is never actually
+    /// sent to a bots connection in practice -- it's only ever a direct
+    /// reply to `ClientMsg::HostLogin`, which this crate's own `ClientMsg`
+    /// mirror doesn't even have a variant for, so bots can't trigger it.
+    /// Mirrored anyway for the same reason every other server-sendable
+    /// variant is: silent protocol drift should fail loudly here, not
+    /// stay latent until some future change makes this reachable after all.
+    HostLoginResult {
+        ok: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -211,6 +222,7 @@ impl Conn {
                 // doc comment for why it still has to be parseable.
                 Some(ServerMsg::LocationTaskTemplates(_)) => {}
                 Some(ServerMsg::Timer(_)) => {}
+                Some(ServerMsg::HostLoginResult { .. }) => {}
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -231,6 +243,7 @@ impl Conn {
                 Some(ServerMsg::Joined { .. }) => continue,
                 Some(ServerMsg::LocationTaskTemplates(_)) => continue,
                 Some(ServerMsg::Timer(_)) => continue,
+                Some(ServerMsg::HostLoginResult { .. }) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -244,7 +257,8 @@ impl Conn {
                 Some(ServerMsg::Joined { .. })
                 | Some(ServerMsg::Failed { .. })
                 | Some(ServerMsg::LocationTaskTemplates(_))
-                | Some(ServerMsg::Timer(_)) => continue,
+                | Some(ServerMsg::Timer(_))
+                | Some(ServerMsg::HostLoginResult { .. }) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -263,7 +277,8 @@ impl Conn {
                 Some(ServerMsg::Failed { error }) => return Err(ConnError::Rejected(error)),
                 Some(ServerMsg::View(_))
                 | Some(ServerMsg::LocationTaskTemplates(_))
-                | Some(ServerMsg::Timer(_)) => continue,
+                | Some(ServerMsg::Timer(_))
+                | Some(ServerMsg::HostLoginResult { .. }) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }

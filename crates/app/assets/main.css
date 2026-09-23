@@ -238,6 +238,24 @@ strong {
   font-size: 2.4rem;
 }
 
+/* The Character/Round/Game tab switcher on /play, once the game's
+ * started -- distinct from `.route-nav` below (that one moves between
+ * whole pages; this one just swaps which section of the same page shows). */
+.tab-nav {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.tab-nav button {
+  flex: 1;
+}
+
+.tab-nav .tab-active {
+  background: var(--color-primary-dark);
+  color: var(--color-bg-card);
+}
+
 /* The tiny Play/Host/Display wayfinding nav at the very top of every
  * route (App()) -- small and muted on purpose so it doesn't compete with
  * the actual game content or look out of place on the shared /display

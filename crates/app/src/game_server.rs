@@ -166,6 +166,29 @@ pub fn timer_remaining_secs() -> Option<i64> {
         .map(|t| t.duration.as_secs() as i64 - t.started_at.elapsed().as_secs() as i64)
 }
 
+/// Whether `password` matches the configured Host passphrase, read fresh
+/// from the `HOST_PASSWORD` environment variable on every call (so a
+/// changed `.env` takes effect on the next login attempt, no restart
+/// needed for `dx serve`'s own reload). A UI-level gate only, matching the
+/// user's own explicit choice over enforcing this on every host-only
+/// `Command` too -- the raw websocket protocol still has no real access
+/// control (see `main.rs`'s module doc comment's KNOWN GAP); this only
+/// keeps the Host console from being reachable, and Host-privileged data
+/// from even being requested, without the passphrase.
+///
+/// Deliberately open (`true`) when `HOST_PASSWORD` isn't set at all --
+/// the Makefile's own `.env` support has said "ready for when the host
+/// console needs a password" since before this feature existed, and
+/// defaulting to *locked* instead would silently break `make run` for
+/// every local dev/test session that's never set one. Set `HOST_PASSWORD`
+/// before a real event to actually gate this.
+pub fn check_host_password(password: &str) -> bool {
+    match std::env::var("HOST_PASSWORD") {
+        Ok(configured) => configured == password,
+        Err(_) => true,
+    }
+}
+
 /// How many tasks to push per tier -- `(easy, medium, hard)` -- for each
 /// odd round's task phase (rules.md §4: Rounds 1, 3, 5 have tasks; 2 and 4
 /// are contest rounds; see `push_tasks_for_round`). Round 1's count is
