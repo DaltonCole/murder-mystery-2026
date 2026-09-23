@@ -106,10 +106,22 @@ fn App() -> Element {
         // found there was no navigation between routes anywhere in the
         // app. This tiny nav is the whole fix: which route to use is
         // self-explanatory from the labels, no further guidance needed.
+        //
+        // Plain `a` tags, not `dioxus_router::components::Link` -- `Link`
+        // requires rendering *inside* a `Router`'s subtree to reach its
+        // routing context, but this nav sits as `Router::<Route>`'s
+        // sibling here, not its child, so it has none. Confirmed the hard
+        // way: `Link` outside that subtree panics the whole page at
+        // render time ("must have access to a parent router"), a
+        // real-browser-only failure `cargo check`/`cargo test` can't
+        // catch since neither ever renders this component tree. A plain
+        // anchor doesn't need that context at all -- a full page
+        // navigation between these three routes is perfectly fine, each
+        // one opens its own fresh websocket connection either way.
         nav { class: "route-nav",
-            Link { to: Route::Play {}, "Play" }
-            Link { to: Route::Host {}, "Host" }
-            Link { to: Route::Display {}, "Display" }
+            a { href: "/", "Play" }
+            a { href: "/host", "Host" }
+            a { href: "/display", "Display" }
         }
         Router::<Route> {}
     }
