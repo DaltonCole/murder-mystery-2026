@@ -170,6 +170,7 @@ impl PlayerBot {
                 Some(ServerMsg::Timer(_)) => {}
                 Some(ServerMsg::HostLoginResult { .. }) => {}
                 Some(ServerMsg::ViewedPlayer(_)) => {}
+                Some(ServerMsg::BannedTaskPrompts(_)) => {}
                 None => return Ok(()),
             }
         }

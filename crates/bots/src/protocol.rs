@@ -71,6 +71,15 @@ pub enum ServerMsg {
     /// which this crate's own `ClientMsg` mirror has no variant for).
     /// Mirrored anyway for the same "protocol drift fails loudly" reason.
     ViewedPlayer(Option<PlayerView>),
+    /// Mirrors `app`'s own `ServerMsg::BannedTaskPrompts`. Unlike
+    /// `HostLoginResult`/`ViewedPlayer` above, this one genuinely IS sent
+    /// to a real bots connection: `HostDriver::connect` calls
+    /// `watch(Viewer::Host)`, and the server sends this unconditionally
+    /// right after any `Watch(Viewer::Host)` succeeds -- confirmed the
+    /// hard way, by a real `full_game_with_bots` test failing with an
+    /// "unknown variant" JSON error the first time this was added to the
+    /// real server without a matching mirror here.
+    BannedTaskPrompts(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -236,6 +245,7 @@ impl Conn {
                 Some(ServerMsg::Timer(_)) => {}
                 Some(ServerMsg::HostLoginResult { .. }) => {}
                 Some(ServerMsg::ViewedPlayer(_)) => {}
+                Some(ServerMsg::BannedTaskPrompts(_)) => {}
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -258,6 +268,7 @@ impl Conn {
                 Some(ServerMsg::Timer(_)) => continue,
                 Some(ServerMsg::HostLoginResult { .. }) => continue,
                 Some(ServerMsg::ViewedPlayer(_)) => continue,
+                Some(ServerMsg::BannedTaskPrompts(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -273,7 +284,8 @@ impl Conn {
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
                 | Some(ServerMsg::HostLoginResult { .. })
-                | Some(ServerMsg::ViewedPlayer(_)) => continue,
+                | Some(ServerMsg::ViewedPlayer(_))
+                | Some(ServerMsg::BannedTaskPrompts(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -294,7 +306,8 @@ impl Conn {
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
                 | Some(ServerMsg::HostLoginResult { .. })
-                | Some(ServerMsg::ViewedPlayer(_)) => continue,
+                | Some(ServerMsg::ViewedPlayer(_))
+                | Some(ServerMsg::BannedTaskPrompts(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -321,7 +334,8 @@ impl Conn {
                 | Some(ServerMsg::Failed { .. })
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
-                | Some(ServerMsg::ViewedPlayer(_)) => continue,
+                | Some(ServerMsg::ViewedPlayer(_))
+                | Some(ServerMsg::BannedTaskPrompts(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }

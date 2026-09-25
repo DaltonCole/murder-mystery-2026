@@ -45,6 +45,14 @@ struct GameServer {
     // guard, not a fact about the game itself.
     auto_tasks_pushed: Mutex<BTreeSet<Round>>,
     timer: Mutex<Option<GameTimer>>,
+    // Bio-derived task prompts (rules.md §4, Rounds 1/3/5's auto-push
+    // pool) the Host has banned from ever being auto-selected -- see
+    // `push_tasks_for_round`'s doc comment. Empty by default ("all tasks
+    // should be available by default," Dalton's own explicit instruction)
+    // -- process-local, not persisted `GameState`, the same "host
+    // operational preference, not a fact about the game itself" shape as
+    // `auto_tasks_pushed`.
+    banned_task_prompts: Mutex<BTreeSet<String>>,
 }
 
 fn server() -> &'static GameServer {
@@ -56,8 +64,47 @@ fn server() -> &'static GameServer {
             changed,
             auto_tasks_pushed: Mutex::new(BTreeSet::new()),
             timer: Mutex::new(None),
+            banned_task_prompts: Mutex::new(BTreeSet::new()),
         }
     })
+}
+
+/// Bans `prompt` from ever being auto-selected for Round 1/3/5's task push
+/// (see `push_tasks_for_round`) -- the Host console's "Ban" button next to
+/// a bio-derived candidate. Doesn't affect pushing the same prompt
+/// manually (the "Manual entry"/location-task pickers) -- banning only
+/// scopes the automatic pool, matching the actual feature request ("tasks
+/// should be assigned automatically... allow the admin to ban a certain
+/// task"), not a blanket block on that exact text ever being used at all.
+pub fn ban_task_prompt(prompt: String) {
+    server()
+        .banned_task_prompts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(prompt);
+    let _ = server().changed.send(());
+}
+
+/// Reverses `ban_task_prompt` -- the Host console's "Unban" button.
+pub fn unban_task_prompt(prompt: &str) {
+    server()
+        .banned_task_prompts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(prompt);
+    let _ = server().changed.send(());
+}
+
+/// Every currently-banned task prompt, for the Host console's own list of
+/// what's excluded right now.
+pub fn banned_task_prompts() -> Vec<String> {
+    server()
+        .banned_task_prompts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .cloned()
+        .collect()
 }
 
 /// Spawns the once-per-process background task that keeps the round timer
@@ -214,13 +261,16 @@ fn auto_task_counts(round: Round) -> (usize, usize, usize) {
 /// `auto_push_on_round_advance` below) and automatically for Round 1, the
 /// moment setup finalizes (see `run_raffle`).
 ///
-/// For each tier, shuffles `bio::task_candidates`'s pool with real,
-/// OS-backed entropy (the same "randomness at the boundary" shape as
-/// `run_raffle`/`draw_intermission_entrants`) and pushes
+/// For each tier, excludes any banned prompt (`banned_task_prompts` --
+/// "all tasks should be available by default," so this is normally a
+/// no-op filter), then shuffles the remaining `bio::task_candidates` pool
+/// with real, OS-backed entropy (the same "randomness at the boundary"
+/// shape as `run_raffle`/`draw_intermission_entrants`) and pushes
 /// `auto_task_counts`'s configured count from the front -- capped at
 /// however many distinct candidates actually exist, so a too-small bio
-/// pool (a tiny playtest game, or a tier nobody's bio happens to fill)
-/// just pushes fewer tasks rather than erroring.
+/// pool (a tiny playtest game, or a tier nobody's bio happens to fill, or
+/// every candidate in a tier happening to be banned) just pushes fewer
+/// tasks rather than erroring.
 fn push_tasks_for_round(
     state: &mut GameState,
     round: Round,
@@ -230,6 +280,11 @@ fn push_tasks_for_round(
         return Vec::new();
     }
 
+    let banned = server()
+        .banned_task_prompts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     let (easy, medium, hard) = auto_task_counts(round);
     let mut rng = rand::rng();
     let mut new_events = Vec::new();
@@ -238,7 +293,10 @@ fn push_tasks_for_round(
         (TaskTier::Medium, medium),
         (TaskTier::Hard, hard),
     ] {
-        let mut candidates = task_candidates(state, tier);
+        let mut candidates: Vec<_> = task_candidates(state, tier)
+            .into_iter()
+            .filter(|c| !banned.contains(&c.prompt))
+            .collect();
         candidates.shuffle(&mut rng);
         for candidate in candidates.into_iter().take(count) {
             if let Ok(events) = apply_command(

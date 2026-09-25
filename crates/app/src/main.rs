@@ -192,6 +192,14 @@ enum ClientMsg {
     /// Host connection issue a `Command` *as* that player -- see
     /// `PlayerPageReadOnly`'s doc comment.
     ViewPlayer(Option<PlayerId>),
+    /// `/host` only: bans `prompt` from ever being auto-selected for
+    /// Round 1/3/5's bio-derived task push -- doesn't affect pushing the
+    /// same prompt manually. Not a plain `Command` -- this is a Host
+    /// operational preference, not `GameState`. See
+    /// `game_server::ban_task_prompt`'s doc comment.
+    BanTaskPrompt { prompt: String },
+    /// `/host` only: reverses `BanTaskPrompt`.
+    UnbanTaskPrompt { prompt: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +235,10 @@ enum ServerMsg {
     /// requesting connection's own `Viewer::Host` view) so a Host
     /// connection can hold both at once.
     ViewedPlayer(Option<PlayerView>),
+    /// `/host` only, sent once right after `Watch(Viewer::Host)` succeeds
+    /// and again after every `BanTaskPrompt`/`UnbanTaskPrompt` -- every
+    /// currently-banned bio-derived task prompt.
+    BannedTaskPrompts(Vec<String>),
 }
 
 /// The `PlayerId` a `Command` acts as, if it names one at all --
@@ -459,11 +471,21 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                 } else {
                                     true
                                 };
+                                let sent_banned = if matches!(v, Viewer::Host) {
+                                    socket
+                                        .send(ServerMsg::BannedTaskPrompts(
+                                            game_server::banned_task_prompts(),
+                                        ))
+                                        .await
+                                        .is_ok()
+                                } else {
+                                    true
+                                };
                                 let sent_timer = socket
                                     .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
                                     .await
                                     .is_ok();
-                                sent_view && sent_templates && sent_timer
+                                sent_view && sent_templates && sent_banned && sent_timer
                             }
                         }
                         ClientMsg::Do(cmd) => {
@@ -557,6 +579,34 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                     .is_ok()
                             }
                         }
+                        ClientMsg::BanTaskPrompt { prompt } => {
+                            if !is_host_authed {
+                                reject!("host login required")
+                            } else {
+                                game_server::ban_task_prompt(prompt);
+                                drain_self_echo(&mut changed);
+                                socket
+                                    .send(ServerMsg::BannedTaskPrompts(
+                                        game_server::banned_task_prompts(),
+                                    ))
+                                    .await
+                                    .is_ok()
+                            }
+                        }
+                        ClientMsg::UnbanTaskPrompt { prompt } => {
+                            if !is_host_authed {
+                                reject!("host login required")
+                            } else {
+                                game_server::unban_task_prompt(&prompt);
+                                drain_self_echo(&mut changed);
+                                socket
+                                    .send(ServerMsg::BannedTaskPrompts(
+                                        game_server::banned_task_prompts(),
+                                    ))
+                                    .await
+                                    .is_ok()
+                            }
+                        }
                     };
                     if !sent_ok {
                         break;
@@ -639,13 +689,14 @@ fn Play() -> Element {
                 Ok(ServerMsg::View(v)) => view.set(Some(v)),
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
                 // `/play` never watches as `Viewer::Host`, and never sends
-                // `HostLogin`/`ViewPlayer` either -- see
+                // `HostLogin`/`ViewPlayer`/task-ban commands either -- see
                 // `ServerMsg::LocationTaskTemplates`'s doc comment for why
                 // these still have to be parseable.
                 Ok(
                     ServerMsg::LocationTaskTemplates(_)
                     | ServerMsg::HostLoginResult { .. }
-                    | ServerMsg::ViewedPlayer(_),
+                    | ServerMsg::ViewedPlayer(_)
+                    | ServerMsg::BannedTaskPrompts(_),
                 ) => {}
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
                 Err(_) => break,
@@ -2451,6 +2502,7 @@ fn Host() -> Element {
     let mut view = use_signal(|| None::<PlayerView>);
     let mut error = use_signal(|| None::<String>);
     let mut location_task_templates = use_signal(Vec::<(usize, TaskTier, String)>::new);
+    let mut banned_task_prompts: Signal<Vec<String>> = use_signal(Vec::new);
     let mut timer = use_signal(|| None::<i64>);
     // Gates the whole console behind `game_server::check_host_password` --
     // the server itself now enforces this too (`command_authorized`/the
@@ -2494,6 +2546,7 @@ fn Host() -> Element {
                 }
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
                 Ok(ServerMsg::ViewedPlayer(v)) => viewed_player.set(v),
+                Ok(ServerMsg::BannedTaskPrompts(prompts)) => banned_task_prompts.set(prompts),
                 Ok(ServerMsg::HostLoginResult { ok }) => {
                     authed.set(ok);
                     login_failed.set(!ok);
@@ -2606,6 +2659,18 @@ fn Host() -> Element {
         let socket = socket;
         spawn(async move {
             let _ = socket.send(ClientMsg::ViewPlayer(id)).await;
+        });
+    };
+    let ban_task = move |prompt: String| {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::BanTaskPrompt { prompt }).await;
+        });
+    };
+    let unban_task = move |prompt: String| {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::UnbanTaskPrompt { prompt }).await;
         });
     };
 
@@ -2907,25 +2972,59 @@ fn Host() -> Element {
             button { onclick: move |_| do_cmd(Command::CloseTasks), "Close tasks" }
             p { "The controls below are for a manual top-up or fix-up only." }
             h4 { "From player bios (rules.md §4, Rounds 3/5)" }
+            p { "Every candidate here is available to the automatic Round 1/3/5 draw by default -- \"Ban\" excludes just that exact prompt from ever being auto-selected (it doesn't stop you from pushing it by hand right here)." }
             for (tier , candidates) in task_candidates.clone() {
                 div {
                     key: "{tier:?}",
                     p { "{tier:?} ({candidates.len()} candidates):" }
-                    for candidate in candidates.into_iter().take(8) {
-                        button {
+                    for candidate in candidates
+                        .into_iter()
+                        .filter(|c| !banned_task_prompts().contains(&c.prompt))
+                        .take(8)
+                    {
+                        span {
                             key: "{candidate.prompt}",
-                            onclick: {
-                                let candidate = candidate.clone();
-                                move |_| {
-                                    do_cmd(Command::PushTask {
-                                        prompt: candidate.prompt.clone(),
-                                        tier,
-                                        qualifying_players: candidate.qualifying_players.iter().copied().collect(),
-                                        expected_code: None,
-                                    });
-                                }
-                            },
-                            "{candidate.prompt}"
+                            button {
+                                onclick: {
+                                    let candidate = candidate.clone();
+                                    move |_| {
+                                        do_cmd(Command::PushTask {
+                                            prompt: candidate.prompt.clone(),
+                                            tier,
+                                            qualifying_players: candidate.qualifying_players.iter().copied().collect(),
+                                            expected_code: None,
+                                        });
+                                    }
+                                },
+                                "{candidate.prompt}"
+                            }
+                            button {
+                                onclick: {
+                                    let prompt = candidate.prompt.clone();
+                                    move |_| ban_task(prompt.clone())
+                                },
+                                "Ban"
+                            }
+                        }
+                    }
+                }
+            }
+            h4 { "Banned tasks" }
+            if banned_task_prompts().is_empty() {
+                p { "None banned -- every bio-derived task is available by default." }
+            } else {
+                ul {
+                    for prompt in banned_task_prompts() {
+                        li {
+                            key: "{prompt}",
+                            "{prompt} "
+                            button {
+                                onclick: {
+                                    let prompt = prompt.clone();
+                                    move |_| unban_task(prompt.clone())
+                                },
+                                "Unban"
+                            }
                         }
                     }
                 }
@@ -3329,7 +3428,8 @@ fn Display() -> Element {
                     | ServerMsg::Joined { .. }
                     | ServerMsg::LocationTaskTemplates(_)
                     | ServerMsg::HostLoginResult { .. }
-                    | ServerMsg::ViewedPlayer(_),
+                    | ServerMsg::ViewedPlayer(_)
+                    | ServerMsg::BannedTaskPrompts(_),
                 ) => {}
                 // See the identical comment in `Host` -- without this, a
                 // closed connection spins this loop forever with no yield.
