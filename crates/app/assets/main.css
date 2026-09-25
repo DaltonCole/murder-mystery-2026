@@ -260,8 +260,7 @@ strong {
 }
 
 /* The Character/Round/Game tab switcher on /play, once the game's
- * started -- distinct from `.route-nav` below (that one moves between
- * whole pages; this one just swaps which section of the same page shows). */
+ * started -- swaps which section of the same page shows. */
 .tab-nav {
   display: flex;
   gap: 0.5rem;
@@ -275,32 +274,6 @@ strong {
 .tab-nav .tab-active {
   background: var(--color-primary-dark);
   color: var(--color-bg-card);
-}
-
-/* The tiny Play/Host/Display wayfinding nav at the very top of every
- * route (App()) -- small and muted on purpose so it doesn't compete with
- * the actual game content or look out of place on the shared /display
- * screen, but still gives a first-time host a way to discover /host and
- * /display exist at all. */
-.route-nav {
-  display: flex;
-  gap: 0.9rem;
-  justify-content: center;
-  font-family: var(--font-heading);
-  font-size: 0.85rem;
-  letter-spacing: 0.03em;
-  padding-bottom: 0.5rem;
-  margin-bottom: 0.5rem;
-  border-bottom: 1px solid var(--color-border);
-}
-
-.route-nav a {
-  color: var(--color-primary);
-  text-decoration: none;
-}
-
-.route-nav a:hover {
-  text-decoration: underline;
 }
 
 /* Every "something went wrong" message shares this class now instead of

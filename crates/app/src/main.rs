@@ -113,28 +113,13 @@ fn App() -> Element {
         // control on this phone-first app would show up tiny and
         // require pinch-zoom. A review pass found this missing entirely.
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
-        // A first-time host landing on the bare `/` join screen has no
-        // way to discover `/host`/`/display` exist -- a review pass
-        // found there was no navigation between routes anywhere in the
-        // app. This tiny nav is the whole fix: which route to use is
-        // self-explanatory from the labels, no further guidance needed.
-        //
-        // Plain `a` tags, not `dioxus_router::components::Link` -- `Link`
-        // requires rendering *inside* a `Router`'s subtree to reach its
-        // routing context, but this nav sits as `Router::<Route>`'s
-        // sibling here, not its child, so it has none. Confirmed the hard
-        // way: `Link` outside that subtree panics the whole page at
-        // render time ("must have access to a parent router"), a
-        // real-browser-only failure `cargo check`/`cargo test` can't
-        // catch since neither ever renders this component tree. A plain
-        // anchor doesn't need that context at all -- a full page
-        // navigation between these three routes is perfectly fine, each
-        // one opens its own fresh websocket connection either way.
-        nav { class: "route-nav",
-            a { href: "/", "Play" }
-            a { href: "/host", "Host" }
-            a { href: "/display", "Display" }
-        }
+        // Deliberately no Play/Host/Display navigation menu -- Dalton's own
+        // explicit instruction: `/`, `/host`, and `/display` are known URLs
+        // only he hands out (to players, to himself, to the projector
+        // laptop), not something every visitor should be able to discover
+        // and switch between from a shared menu. An earlier version had one
+        // here specifically to fix "no way to discover the other routes
+        // exist" -- since deliberately removed for the opposite reason.
         Router::<Route> {}
     }
 }
