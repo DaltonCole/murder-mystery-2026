@@ -2496,11 +2496,6 @@ fn Host() -> Element {
     // of flavor + ability text), and most of the Host console's other
     // panels are things Dalton needs open at a glance during live play.
     let mut show_role_reference = use_signal(|| false);
-    let mut new_name = use_signal(String::new);
-    let mut faction_player = use_signal(|| None::<u32>);
-    let mut faction_choice = use_signal(|| Faction::Ton);
-    let mut character_player = use_signal(|| None::<u32>);
-    let mut character_choice = use_signal(|| Character::KingQueen);
     let mut task_prompt = use_signal(String::new);
     let mut task_tier = use_signal(|| TaskTier::Easy);
     let mut task_qualifier = use_signal(|| None::<u32>);
@@ -2671,21 +2666,6 @@ fn Host() -> Element {
         WhistledownPosts { posts: whistledown.clone(), heading_level: 3u8 }
         div {
             h3 { "Setup" }
-            input {
-                placeholder: "New player name",
-                value: "{new_name}",
-                oninput: move |e| new_name.set(e.value()),
-            }
-            button {
-                onclick: move |_| {
-                    let name = new_name.peek().trim().to_string();
-                    if !name.is_empty() {
-                        do_cmd(Command::AddPlayer { name });
-                        new_name.set(String::new());
-                    }
-                },
-                "Add player"
-            }
             p {
                 "{interest_levels.len()} of {roster.len()} players have rated their interest so far (rules.md §1)."
             }
@@ -2704,82 +2684,16 @@ fn Host() -> Element {
                 }
             }
             if raffle_closed {
-                p { "Setup finalized -- roles and factions are assigned. The controls below are for a manual fix-up, or for designating the Deceiver mid-game." }
+                p { "Setup finalized -- roles and factions are assigned. Anyone who joins from now on becomes a Servant automatically." }
             } else {
                 button {
                     onclick: move |_| run_raffle(),
-                    "Run the raffle"
+                    "Finalize setup"
                 }
                 p {
-                    "Running the raffle assigns every named role by weighted ticket (higher interest = more tickets), splits everyone else across Ton/Uprising, then finalizes setup -- anyone added afterward joins as a Servant automatically."
+                    "Assigns every named role by weighted ticket (higher interest = more tickets), splits everyone else across Ton/Uprising, and starts Round 1 -- anyone who joins from now on becomes a Servant automatically."
                 }
             }
-            p { "Manual path (skip this if you used \"Run the raffle\" above): assign a faction to every player first, assign the four titles below to their holders, then Finalize -- everyone else gets a generic character automatically." }
-            div {
-                PlayerSelect {
-                    roster: roster.clone(),
-                    placeholder: "-- player --",
-                    on_change: move |e: FormEvent| faction_player.set(e.value().parse().ok()),
-                }
-                select {
-                    onchange: move |e| {
-                        faction_choice.set(match e.value().as_str() {
-                            "Uprising" => Faction::Uprising,
-                            "Cult" => Faction::Cult,
-                            "Servant" => Faction::Servant,
-                            _ => Faction::Ton,
-                        });
-                    },
-                    option { value: "Ton", "Ton" }
-                    option { value: "Uprising", "Uprising" }
-                    option { value: "Cult", "Cult" }
-                    option { value: "Servant", "Servant" }
-                }
-                button {
-                    disabled: faction_player().is_none(),
-                    onclick: move |_| {
-                        let Some(player) = faction_player() else { return };
-                        do_cmd(Command::AssignFaction {
-                            player: PlayerId(player),
-                            faction: faction_choice(),
-                        });
-                    },
-                    "Assign faction"
-                }
-            }
-            div {
-                PlayerSelect {
-                    roster: roster.clone(),
-                    placeholder: "-- player --",
-                    on_change: move |e: FormEvent| character_player.set(e.value().parse().ok()),
-                }
-                select {
-                    onchange: move |e| {
-                        character_choice.set(match e.value().as_str() {
-                            "PrincePrincess" => Character::PrincePrincess,
-                            "RevolutionaryLeader" => Character::RevolutionaryLeader,
-                            "CultLeader" => Character::CultLeader,
-                            _ => Character::KingQueen,
-                        });
-                    },
-                    option { value: "KingQueen", "King/Queen" }
-                    option { value: "PrincePrincess", "Prince/Princess" }
-                    option { value: "RevolutionaryLeader", "Revolutionary Leader" }
-                    option { value: "CultLeader", "Cult Leader" }
-                }
-                button {
-                    disabled: character_player().is_none(),
-                    onclick: move |_| {
-                        let Some(player) = character_player() else { return };
-                        do_cmd(Command::AssignCharacter {
-                            player: PlayerId(player),
-                            character: character_choice(),
-                        });
-                    },
-                    "Assign title"
-                }
-            }
-            button { onclick: move |_| do_cmd(Command::FinalizeSetup), "Finalize setup" }
         }
         div {
             h3 { "Role reference" }
