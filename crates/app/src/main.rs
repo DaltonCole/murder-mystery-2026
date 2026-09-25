@@ -59,12 +59,15 @@
 //! SECOND KNOWN GAP: no reconnect story. Every route's `use_websocket` call
 //! uses a plain `WebSocketOptions::new()`, not
 //! `.with_automatic_reconnect()`; once a connection drops (a WiFi hiccup,
-//! laptop sleep, a `dx serve` restart), that tab just goes quiet with no
-//! user-visible indicator -- the only recovery is a manual page reload.
-//! Deliberately not wiring up automatic reconnect in this pass: doing so
-//! safely also requires re-verifying the receive-loop's error handling
-//! (see the `Err(_) => break` comments in `Play`/`Host`/`Display` below)
-//! against real reconnect behavior in an actual browser, which this
+//! laptop sleep, a `dx serve` restart), the only recovery is a manual page
+//! reload. `Host` now at least shows a visible "reload now" banner the
+//! moment this happens (a reliability review found it previously gave zero
+//! indication at all, worst for this route specifically since the Host is
+//! the one person running the whole live event) -- `Play`/`Display` still
+//! don't. Deliberately not wiring up automatic reconnect in this pass:
+//! doing so safely also requires re-verifying the receive-loop's error
+//! handling (see the `Err(_) => break` comments in `Play`/`Host`/`Display`
+//! below) against real reconnect behavior in an actual browser, which this
 //! environment can't do -- see the session summary for why. Over a
 //! multi-hour live event on venue WiFi, this is worth fixing for real
 //! before Phase 5, with a real browser available to verify it.
@@ -276,6 +279,98 @@ enum ServerMsg {
     ViewedPlayer(Option<PlayerView>),
 }
 
+/// The `PlayerId` a `Command` acts as, if it names one at all --
+/// `Command::CastBallot { voter, .. }` returns `voter`, `Command::Convert {
+/// converter, .. }` returns `converter`, and so on for every variant that
+/// carries the acting player's own identity. The ~18 purely administrative
+/// variants (`AdvanceRound`, `OpenDenouncement`, `CastOut`, `PushTask`,
+/// ...) return `None` -- these are things the Host clicks a button for,
+/// never a player's own self-service action, regardless of what `player`
+/// fields might appear elsewhere in their payload (e.g. `CastOut`'s
+/// `player` names who's being removed, not who's asking).
+///
+/// A security review (2026-09-25) found `game_ws` enforced none of this at
+/// all: any raw websocket connection could send any `Command` claiming to
+/// act as any player, with nothing tying the claim to who actually sent
+/// it. `command_authorized` below is what fixes that, using this function
+/// to decide "does this command's claimed actor match who this connection
+/// actually joined as." Deliberately exhaustive with no wildcard arm: a
+/// future `Command` variant added to the engine without a decision made
+/// here is a compile error, not a silent new hole.
+///
+/// `#[cfg(feature = "server")]`: only `game_ws`'s real (server-side) body
+/// calls this -- the `web`/WASM build compiles a network-calling stub for
+/// `game_ws` instead (see the `#[get(...)]` server-function macro), so
+/// without this gate the `web` build would see both functions below as
+/// dead code.
+#[cfg(feature = "server")]
+fn command_actor(cmd: &Command) -> Option<PlayerId> {
+    match cmd {
+        Command::AddPlayer { .. }
+        | Command::CloseRaffle
+        | Command::AssignFaction { .. }
+        | Command::AssignCharacter { .. }
+        | Command::FinalizeSetup
+        | Command::CastOut { .. }
+        | Command::AdvanceRound
+        | Command::OpenDenouncement
+        | Command::CloseNomination
+        | Command::OpenBallot
+        | Command::CloseBallot { .. }
+        | Command::CloseRunoff { .. }
+        | Command::PushTask { .. }
+        | Command::CloseTasks
+        | Command::RecordContestResult { .. }
+        | Command::DrawIntermissionEntrants { .. }
+        | Command::AwardServantPoints { .. }
+        | Command::ResolveGalleryPredictions { .. } => None,
+
+        Command::SubmitInterestLevel { player, .. }
+        | Command::SubmitBio { player, .. }
+        | Command::TransferKingQueen { player, .. }
+        | Command::AttemptTask { player, .. }
+        | Command::AttemptLocationTask { player, .. }
+        | Command::UseOracle { player, .. }
+        | Command::UseAlmanac { player }
+        | Command::UseSpymaster { player, .. }
+        | Command::CultLeaderQuery { player, .. }
+        | Command::SetDeceiverArmed { player, .. }
+        | Command::PriestProtect { player, .. }
+        | Command::MedicProtect { player, .. }
+        | Command::BartenderTarget { player, .. }
+        | Command::ActivatePotionImmunity { player, .. }
+        | Command::ActivateDoubleVote { player }
+        | Command::DuelistChallenge { player, .. }
+        | Command::AgitatorRedirect { player, .. }
+        | Command::ActivateGrandInquisitor { player }
+        | Command::ArmVoteShield { player }
+        | Command::OptIntoIntermission { player }
+        | Command::SubmitGalleryPrediction { player, .. } => Some(*player),
+
+        Command::Convert { converter, .. } => Some(*converter),
+        Command::DesignateSuccessor { leader, .. } => Some(*leader),
+        Command::Nominate { voter, .. } => Some(*voter),
+        Command::CastBallot { voter, .. } => Some(*voter),
+    }
+}
+
+/// Whether this connection may submit `cmd`: either it's logged in as
+/// Host (trusted for everything -- including driving some player
+/// abilities on a player's behalf, e.g. `Convert`, which has no
+/// self-service `/play` UI at all and is always Host-relayed by design),
+/// or `cmd` names exactly the player this connection itself joined as.
+/// Every purely administrative command (`command_actor` returns `None`)
+/// requires the Host login regardless, since there's no player identity
+/// for it to ever match.
+#[cfg(feature = "server")]
+fn command_authorized(
+    cmd: &Command,
+    is_host_authed: bool,
+    own_player_id: Option<PlayerId>,
+) -> bool {
+    is_host_authed || command_actor(cmd).is_some_and(|actor| own_player_id == Some(actor))
+}
+
 #[get("/api/ws")]
 async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, ServerMsg>> {
     Ok(options.on_upgrade(move |mut socket| async move {
@@ -285,6 +380,16 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
         // `Some(Viewer::Host)`) so watching a player's page never replaces
         // the Host's own view.
         let mut viewing_player: Option<PlayerId> = None;
+        // The player identity this specific connection actually joined
+        // as (set once, by `ClientMsg::Join`'s own success) -- the source
+        // of truth `command_authorized`/`Watch` check a claimed actor
+        // against. Never set by anything the client merely *claims*.
+        let mut own_player_id: Option<PlayerId> = None;
+        // Set once `ClientMsg::HostLogin` succeeds. See `command_authorized`
+        // and this file's module doc comment for what this now actually
+        // gates -- before this field existed, `HostLogin`'s reply was
+        // purely informational and gated nothing server-side at all.
+        let mut is_host_authed = false;
         let mut changed = game_server::subscribe();
 
         // `game_server::apply` broadcasts on every successful mutation, this
@@ -325,6 +430,20 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
             };
         }
 
+        // Sends an authorization-failure `Failed` reply -- the same shape
+        // `respond!`'s `Err` arm uses, just without a real `GameError` to
+        // format (this rejection never reaches `apply_command` at all).
+        macro_rules! reject {
+            ($msg:expr) => {
+                socket
+                    .send(ServerMsg::Failed {
+                        error: $msg.to_string(),
+                    })
+                    .await
+                    .is_ok()
+            };
+        }
+
         loop {
             tokio::select! {
                 incoming = socket.recv() => {
@@ -339,6 +458,7 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                         continue;
                                     };
                                     viewer = Some(Viewer::Player(id));
+                                    own_player_id = Some(id);
                                     drain_self_echo(&mut changed);
                                     socket.send(ServerMsg::Joined { player: id }).await.is_ok()
                                         && socket
@@ -357,81 +477,142 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                             }
                         }
                         ClientMsg::Watch(v) => {
-                            viewer = Some(v);
-                            let sent_view = socket.send(ServerMsg::View(game_server::view(v))).await.is_ok();
-                            // The Host's location-task picker needs the safe
-                            // template metadata once, right after it starts
-                            // watching -- see `ServerMsg::LocationTaskTemplates`'s
-                            // doc comment for why this doesn't ride along
-                            // inside `PlayerView` itself.
-                            let sent_templates = if matches!(v, Viewer::Host) {
-                                socket
-                                    .send(ServerMsg::LocationTaskTemplates(
-                                        game_server::location_task_templates(),
-                                    ))
-                                    .await
-                                    .is_ok()
-                            } else {
-                                true
+                            // A security review found this previously accepted
+                            // ANY `Viewer`, letting a crafted client read any
+                            // player's private data or the Host's aggregate
+                            // view just by claiming it. Now: a player may only
+                            // watch as the id they themselves joined as, Host
+                            // requires a successful login, and Display (never
+                            // privileged -- see `view_for`) stays open to all.
+                            let allowed = match v {
+                                Viewer::Player(id) => own_player_id == Some(id),
+                                Viewer::Host => is_host_authed,
+                                Viewer::Display => true,
                             };
-                            let sent_timer = socket
-                                .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
-                                .await
-                                .is_ok();
-                            sent_view && sent_templates && sent_timer
+                            if !allowed {
+                                reject!("not authorized to watch as this viewer")
+                            } else {
+                                viewer = Some(v);
+                                let sent_view = socket.send(ServerMsg::View(game_server::view(v))).await.is_ok();
+                                // The Host's location-task picker needs the safe
+                                // template metadata once, right after it starts
+                                // watching -- see `ServerMsg::LocationTaskTemplates`'s
+                                // doc comment for why this doesn't ride along
+                                // inside `PlayerView` itself.
+                                let sent_templates = if matches!(v, Viewer::Host) {
+                                    socket
+                                        .send(ServerMsg::LocationTaskTemplates(
+                                            game_server::location_task_templates(),
+                                        ))
+                                        .await
+                                        .is_ok()
+                                } else {
+                                    true
+                                };
+                                let sent_timer = socket
+                                    .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                    .await
+                                    .is_ok();
+                                sent_view && sent_templates && sent_timer
+                            }
                         }
-                        ClientMsg::Do(cmd) => respond!(game_server::apply(cmd)),
-                        ClientMsg::RunRaffle => respond!(game_server::run_raffle()),
+                        ClientMsg::Do(cmd) => {
+                            if command_authorized(&cmd, is_host_authed, own_player_id) {
+                                respond!(game_server::apply(cmd))
+                            } else {
+                                reject!("not authorized to perform this action")
+                            }
+                        }
+                        ClientMsg::RunRaffle => {
+                            if is_host_authed {
+                                respond!(game_server::run_raffle())
+                            } else {
+                                reject!("host login required")
+                            }
+                        }
                         ClientMsg::PushLocationTask { index } => {
-                            respond!(game_server::push_location_task(index))
+                            if is_host_authed {
+                                respond!(game_server::push_location_task(index))
+                            } else {
+                                reject!("host login required")
+                            }
                         }
                         ClientMsg::DrawIntermissionEntrants => {
-                            respond!(game_server::draw_intermission_entrants())
+                            if is_host_authed {
+                                respond!(game_server::draw_intermission_entrants())
+                            } else {
+                                reject!("host login required")
+                            }
                         }
-                        ClientMsg::StartRoundOne => respond!(game_server::start_round_one()),
+                        ClientMsg::StartRoundOne => {
+                            if is_host_authed {
+                                respond!(game_server::start_round_one())
+                            } else {
+                                reject!("host login required")
+                            }
+                        }
                         ClientMsg::StartTimer { seconds } => {
-                            game_server::start_timer(seconds);
-                            drain_self_echo(&mut changed);
-                            socket
-                                .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
-                                .await
-                                .is_ok()
+                            if !is_host_authed {
+                                reject!("host login required")
+                            } else {
+                                game_server::start_timer(seconds);
+                                drain_self_echo(&mut changed);
+                                socket
+                                    .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                    .await
+                                    .is_ok()
+                            }
                         }
                         ClientMsg::AddTimerSeconds { seconds } => {
-                            game_server::add_timer_seconds(seconds);
-                            drain_self_echo(&mut changed);
-                            socket
-                                .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
-                                .await
-                                .is_ok()
+                            if !is_host_authed {
+                                reject!("host login required")
+                            } else {
+                                game_server::add_timer_seconds(seconds);
+                                drain_self_echo(&mut changed);
+                                socket
+                                    .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                    .await
+                                    .is_ok()
+                            }
                         }
                         ClientMsg::ClearTimer => {
-                            game_server::clear_timer();
-                            drain_self_echo(&mut changed);
-                            socket
-                                .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
-                                .await
-                                .is_ok()
+                            if !is_host_authed {
+                                reject!("host login required")
+                            } else {
+                                game_server::clear_timer();
+                                drain_self_echo(&mut changed);
+                                socket
+                                    .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                    .await
+                                    .is_ok()
+                            }
                         }
                         ClientMsg::HostLogin { password } => {
+                            is_host_authed = game_server::check_host_password(&password);
                             socket
-                                .send(ServerMsg::HostLoginResult {
-                                    ok: game_server::check_host_password(&password),
-                                })
+                                .send(ServerMsg::HostLoginResult { ok: is_host_authed })
                                 .await
                                 .is_ok()
                         }
                         ClientMsg::TransferKingQueen { player } => {
-                            respond!(game_server::transfer_king_queen_randomly(player))
+                            if is_host_authed || own_player_id == Some(player) {
+                                respond!(game_server::transfer_king_queen_randomly(player))
+                            } else {
+                                reject!("not authorized to transfer this crown")
+                            }
                         }
                         ClientMsg::ViewPlayer(target) => {
-                            viewing_player = target;
-                            socket
-                                .send(ServerMsg::ViewedPlayer(
-                                    target.map(|id| game_server::view(Viewer::Player(id))),
-                                ))
-                                .await
-                                .is_ok()
+                            if !is_host_authed {
+                                reject!("host login required")
+                            } else {
+                                viewing_player = target;
+                                socket
+                                    .send(ServerMsg::ViewedPlayer(
+                                        target.map(|id| game_server::view(Viewer::Player(id))),
+                                    ))
+                                    .await
+                                    .is_ok()
+                            }
                         }
                     };
                     if !sent_ok {
@@ -2185,21 +2366,31 @@ fn Host() -> Element {
     let mut location_task_templates = use_signal(Vec::<(usize, TaskTier, String)>::new);
     let mut timer = use_signal(|| None::<i64>);
     // Gates the whole console behind `game_server::check_host_password` --
-    // a UI-level lock only (per the user's own explicit choice over full
-    // per-command server-side enforcement): the raw websocket protocol
-    // still has no real access control (see the module doc comment's
-    // KNOWN GAP), but this stops the console from being reachable, or any
-    // Host-privileged data from even being requested, without the
-    // passphrase. Deliberately doesn't persist across a reload (no
-    // localStorage) -- simpler and lower-risk than adding a new browser
-    // API dependency this session can't test end to end; re-entering the
-    // passphrase once per reload is a small, known, accepted tradeoff.
+    // the server itself now enforces this too (`command_authorized`/the
+    // `Watch`/`ViewPlayer`/etc. checks in `game_ws`), not just this UI
+    // choosing not to render controls before login succeeds, but this
+    // local gate still exists on its own merits: it keeps Host-privileged
+    // data from even being *requested* without the passphrase, not merely
+    // rejected once asked for. Deliberately doesn't persist across a
+    // reload (no localStorage) -- simpler and lower-risk than adding a new
+    // browser API dependency this session can't test end to end;
+    // re-entering the passphrase once per reload is a small, known,
+    // accepted tradeoff.
     let mut authed = use_signal(|| false);
     let mut login_failed = use_signal(|| false);
     let mut password_draft = use_signal(String::new);
     // The "view a player's page" panel -- see `ClientMsg::ViewPlayer`'s
     // doc comment. `None` means the panel is closed/not requested.
     let mut viewed_player: Signal<Option<PlayerView>> = use_signal(|| None);
+    // A reliability review found a dropped connection here gives zero
+    // visible sign -- the receive loop just quietly stops and every
+    // subsequent button click silently does nothing, which is worst for
+    // exactly this route: the Host is the one person running the whole
+    // live event, and every phase-advancing action funnels through this
+    // one tab. This is a visibility fix only, not real reconnect support
+    // (see the module doc comment's SECOND KNOWN GAP) -- the fix is
+    // telling Dalton to reload, not attempting to recover automatically.
+    let mut connected = use_signal(|| true);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
@@ -2235,8 +2426,12 @@ fn Host() -> Element {
                 // point and pegging the tab's CPU instead of just going
                 // idle. There's no reconnect story yet either way (see the
                 // module doc comment), so a closed connection just stays
-                // closed until the page is reloaded.
-                Err(_) => break,
+                // closed until the page is reloaded -- `connected` is what
+                // now actually tells Dalton that's happened.
+                Err(_) => {
+                    connected.set(false);
+                    break;
+                }
             }
         }
     });
@@ -2456,6 +2651,13 @@ fn Host() -> Element {
 
     rsx! {
         h1 { "Host Console" }
+        if !connected() {
+            div {
+                class: "error-text",
+                style: "font-weight:bold;border:2px solid;padding:0.5em;margin-bottom:0.5em;",
+                "⚠ Disconnected from the server -- reload this page now. Nothing below will take effect until you do."
+            }
+        }
         div {
             style: "font-weight:bold;padding:0.5em 0;",
             "{phase_summary}"

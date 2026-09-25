@@ -97,6 +97,15 @@ pub struct Roles {
 impl HostDriver {
     pub async fn connect(url: &str) -> Result<Self, ConnError> {
         let mut conn = Conn::connect(url).await?;
+        // Required now that the server actually enforces `HostLogin`
+        // (see `Conn::host_login`'s doc comment) -- without this,
+        // `watch(Viewer::Host)` below and every host-only command this
+        // driver issues afterward would be rejected as unauthorized.
+        if !conn.host_login("bots-test-password").await? {
+            return Err(ConnError::Rejected(
+                "HostDriver::connect: host login was rejected".to_string(),
+            ));
+        }
         conn.watch(Viewer::Host).await?;
         Ok(HostDriver {
             conn,
@@ -211,6 +220,11 @@ impl HostDriver {
         // `self.conn`) has no broadcast backlog to misattribute a reply
         // from, unlike the long-lived, already-subscribed Host connection.
         let mut setup_conn = Conn::connect(&self.url).await?;
+        if !setup_conn.host_login("bots-test-password").await? {
+            return Err(ConnError::Rejected(
+                "setup_game: host login was rejected on the fresh setup connection".to_string(),
+            ));
+        }
         setup_conn.watch(Viewer::Host).await?;
 
         for &(character, player) in &winners {

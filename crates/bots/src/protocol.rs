@@ -21,9 +21,20 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
-    Join { name: String },
+    Join {
+        name: String,
+    },
     Watch(Viewer),
     Do(Command),
+    /// Mirrors `app`'s own `ClientMsg::HostLogin`. A security review found
+    /// the server previously enforced nothing beyond this reply -- now
+    /// every host-only `Command`/`ClientMsg` requires a connection to have
+    /// actually sent this with the right password first (see
+    /// `app::main::command_authorized`), so `HostDriver::connect` sends it
+    /// before doing anything else.
+    HostLogin {
+        password: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,14 +59,9 @@ pub enum ServerMsg {
     /// state (see `game_server::GameTimer`'s doc comment), so this crate
     /// only needs to parse it, never act on it.
     Timer(Option<i64>),
-    /// Mirrors `app`'s own `ServerMsg::HostLoginResult`. Unlike
-    /// `LocationTaskTemplates`/`Timer` above, this one is never actually
-    /// sent to a bots connection in practice -- it's only ever a direct
-    /// reply to `ClientMsg::HostLogin`, which this crate's own `ClientMsg`
-    /// mirror doesn't even have a variant for, so bots can't trigger it.
-    /// Mirrored anyway for the same reason every other server-sendable
-    /// variant is: silent protocol drift should fail loudly here, not
-    /// stay latent until some future change makes this reachable after all.
+    /// Mirrors `app`'s own `ServerMsg::HostLoginResult` -- the direct reply
+    /// to `ClientMsg::HostLogin`, which `Conn::host_login` now sends and
+    /// waits for.
     HostLoginResult {
         ok: bool,
     },
@@ -288,6 +294,33 @@ impl Conn {
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
                 | Some(ServerMsg::HostLoginResult { .. })
+                | Some(ServerMsg::ViewedPlayer(_)) => continue,
+                None => return Err(ConnError::ClosedEarly),
+            }
+        }
+    }
+
+    /// Logs in as Host (mirrors `app::main::ClientMsg::HostLogin`) --
+    /// required before any host-only `Command`/`ClientMsg` succeeds now
+    /// that the server enforces this itself (`command_authorized` in
+    /// `app::main`; previously it enforced nothing at all, a security
+    /// review found). This crate's own test environment never sets
+    /// `HOST_PASSWORD` (tests run via `cargo test`, never through the
+    /// Makefile's `.env` loading), so `check_host_password` accepts any
+    /// string here by design -- see that function's own doc comment.
+    pub async fn host_login(&mut self, password: &str) -> Result<bool, ConnError> {
+        self.send(&ClientMsg::HostLogin {
+            password: password.to_string(),
+        })
+        .await?;
+        loop {
+            match self.recv().await? {
+                Some(ServerMsg::HostLoginResult { ok }) => return Ok(ok),
+                Some(ServerMsg::Joined { .. })
+                | Some(ServerMsg::View(_))
+                | Some(ServerMsg::Failed { .. })
+                | Some(ServerMsg::LocationTaskTemplates(_))
+                | Some(ServerMsg::Timer(_))
                 | Some(ServerMsg::ViewedPlayer(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
