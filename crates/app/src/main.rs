@@ -882,6 +882,7 @@ fn Play() -> Element {
                     BioForm {
                         my_id: id,
                         own_bio: v.own_bio.clone(),
+                        own_interest_level: None,
                         locked: true,
                         on_command: send_cmd,
                     }
@@ -1029,6 +1030,7 @@ fn Play() -> Element {
                 BioForm {
                     my_id: id,
                     own_bio: v.own_bio.clone(),
+                    own_interest_level: None,
                     locked: true,
                     on_command: send_cmd,
                 }
@@ -1075,71 +1077,13 @@ fn Play() -> Element {
             div {
                 h2 { "Character Creation" }
                 p { "Welcome! The game hasn't started yet -- rate how involved you'd like to be, then create your character below." }
-                InterestLevelForm {
-                    my_id: id,
-                    own_interest_level: v.own_interest_level,
-                    on_command: send_cmd,
-                }
                 BioForm {
                     my_id: id,
                     own_bio: v.own_bio.clone(),
+                    own_interest_level: v.own_interest_level,
                     locked: false,
                     on_command: send_cmd,
                 }
-            }
-        }
-    }
-}
-
-/// rules.md §1's signup interest rating -- only shown during Character
-/// Creation, before the setup raffle has closed (`Play`'s caller gates
-/// this on `!v.raffle_closed`, not `own_character.is_none()` -- a review
-/// found the old character-based gate never actually hid this from a
-/// Servant, since a late arrival's `own_character` stays `None` forever,
-/// not just until the raffle runs). A standing choice like `SubmitBio` --
-/// resubmitting silently replaces (see `Command::SubmitInterestLevel`'s
-/// doc comment), so this doesn't need a separate "already submitted, lock
-/// it in" state.
-#[component]
-fn InterestLevelForm(
-    my_id: PlayerId,
-    own_interest_level: Option<u8>,
-    on_command: EventHandler<Command>,
-) -> Element {
-    let mut level = use_signal(|| own_interest_level.unwrap_or(5));
-    rsx! {
-        div {
-            h4 { "How involved do you want to be tonight?" }
-            p {
-                "A higher interest level means you'll be more likely to have an important role tonight, and to be more involved."
-            }
-            input {
-                r#type: "number",
-                min: "1",
-                max: "10",
-                value: "{level}",
-                oninput: move |e| {
-                    if let Ok(n) = e.value().parse::<u8>() {
-                        level.set(n.clamp(1, 10));
-                    }
-                },
-            }
-            button {
-                onclick: move |_| {
-                    on_command
-                        .call(Command::SubmitInterestLevel {
-                            player: my_id,
-                            level: level(),
-                        });
-                },
-                if own_interest_level.is_some() {
-                    "Update my interest"
-                } else {
-                    "Submit my interest"
-                }
-            }
-            if let Some(submitted) = own_interest_level {
-                p { "You rated your interest: {submitted}. Waiting for setup to finish." }
             }
         }
     }
@@ -1285,10 +1229,21 @@ fn TimerDisplay(remaining_secs: Option<i64>) -> Element {
 /// `first_underfilled_category`, the actual source of truth this mirrors
 /// client-side purely so a player finds out *before* submitting, not from
 /// a rejected round-trip).
+///
+/// Also owns the interest-level rating (rules.md §1) when unlocked, and
+/// submits both in the same click -- a review found these used to be two
+/// entirely separate forms with two separate submit buttons on the same
+/// Character Creation screen, so a player who filled in their bio and
+/// clicked *that* submit button without ever touching the interest
+/// slider's own button stayed stuck showing as "hasn't rated interest"
+/// on the Host's Setup page forever, with no indication anything was
+/// still missing. Folding them into one action removes that gap
+/// entirely rather than just explaining it better.
 #[component]
 fn BioForm(
     my_id: PlayerId,
     own_bio: Option<Bio>,
+    own_interest_level: Option<u8>,
     locked: bool,
     on_command: EventHandler<Command>,
 ) -> Element {
@@ -1299,6 +1254,7 @@ fn BioForm(
     let mut clothing_features =
         use_signal(|| std::array::from_fn::<String, 5, _>(|_| String::new()));
     let mut skills = use_signal(|| std::array::from_fn::<String, 5, _>(|_| String::new()));
+    let mut interest_level = use_signal(|| own_interest_level.unwrap_or(5));
 
     let filled_count =
         |values: &[String; 5]| values.iter().filter(|s| !s.trim().is_empty()).count();
@@ -1341,6 +1297,21 @@ fn BioForm(
                     p { "Character sheets are locked now that the game has started." }
                 }
             } else {
+            h4 { "How involved do you want to be tonight?" }
+            p {
+                "A higher interest level means you'll be more likely to have an important role tonight, and to be more involved."
+            }
+            input {
+                r#type: "number",
+                min: "1",
+                max: "10",
+                value: "{interest_level}",
+                oninput: move |e| {
+                    if let Ok(n) = e.value().parse::<u8>() {
+                        interest_level.set(n.clamp(1, 10));
+                    }
+                },
+            }
             input {
                 placeholder: "Character name (required)",
                 maxlength: "32",
@@ -1409,6 +1380,17 @@ fn BioForm(
             button {
                 disabled: !is_valid,
                 onclick: move |_| {
+                    // Interest level always has a valid value (defaults to
+                    // 5) so it's safe to send unconditionally here, not
+                    // just when the player explicitly changed it -- see
+                    // this component's own doc comment for why bundling
+                    // it into the same click is the actual fix, not just
+                    // a nice-to-have.
+                    on_command
+                        .call(Command::SubmitInterestLevel {
+                            player: my_id,
+                            level: interest_level(),
+                        });
                     on_command
                         .call(Command::SubmitBio {
                             player: my_id,
@@ -2219,7 +2201,13 @@ fn PlayerPageReadOnly(id: PlayerId, v: PlayerView) -> Element {
                     p { class: "martyrdom-message", "{message}" }
                 }
             }
-            BioForm { my_id: id, own_bio: v.own_bio.clone(), locked: true, on_command: |_| {} }
+            BioForm {
+                my_id: id,
+                own_bio: v.own_bio.clone(),
+                own_interest_level: None,
+                locked: true,
+                on_command: |_| {},
+            }
 
             h4 { "Round" }
             if v.i_am_drunk {
