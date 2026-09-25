@@ -995,7 +995,7 @@ fn InterestLevelForm(
         div {
             h4 { "How involved do you want to be tonight?" }
             p {
-                "Rate your interest 1-10 -- a higher rating gives you more tickets in the raffle for a major role (rules.md §1). The host runs the raffle once everyone's rated themselves."
+                "A higher interest level means you'll be more likely to have an important role tonight, and to be more involved."
             }
             input {
                 r#type: "number",
@@ -1023,7 +1023,7 @@ fn InterestLevelForm(
                 }
             }
             if let Some(submitted) = own_interest_level {
-                p { "You rated your interest: {submitted}. Waiting for the host to run the raffle." }
+                p { "You rated your interest: {submitted}. Waiting for setup to finish." }
             }
         }
     }
