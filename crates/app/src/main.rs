@@ -1478,6 +1478,7 @@ fn AbilityPanel(
                     }
                 },
                 Character::Almanac => rsx! {
+                    p { "Locked until Ton has won 2 rounds -- you won't be told the running count, only once it's unlocked." }
                     button {
                         disabled: !abilities.almanac_available.unwrap_or(false),
                         onclick: move |_| on_command.call(Command::UseAlmanac { player: my_id }),
@@ -1996,7 +1997,7 @@ fn ability_description(character: Character) -> &'static str {
         Character::CultLeader => "Before each recruitment window, you may query one candidate -- are they Ton-aligned, or are they the Revolutionary Leader? You also designate which recruited Cultist holds the Deceiver title.",
         Character::Cultist => "You know your fellow Cultists. No active ability beyond that.",
         Character::Oracle => "After every odd round, you may view one player's full history, locked at that moment. Permanently disabled if the King/Queen is Cast Out.",
-        Character::Almanac => "Once per game, you privately learn 3 players who are definitely not the Revolutionary Leader.",
+        Character::Almanac => "Once per game, once Ton has won 2 rounds, you privately learn 3 players who are definitely not the Revolutionary Leader.",
         Character::Spymaster => "Once per game, you view a single player's faction color only.",
         Character::PriestPriestess => "Once per Cult recruitment window, you may protect one person from conversion, without knowing that's what you're protecting against. You can't protect the same person twice all game.",
         Character::PotionMaker => "Once per game, you may grant execution-immunity, saving whoever the public vote would Cast Out that round.",

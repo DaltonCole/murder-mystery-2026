@@ -516,7 +516,12 @@ impl GameState {
                     self.oracle_checks_available
                 });
             }
-            Character::Almanac => status.almanac_available = Some(!self.almanac_used),
+            Character::Almanac => {
+                status.almanac_available = Some(
+                    !self.almanac_used
+                        && self.rounds_ton_has_won() >= ALMANAC_MIN_ROUNDS_TON_MUST_WIN,
+                );
+            }
             Character::Spymaster => status.spymaster_available = Some(!self.spymaster_used),
             Character::CultLeader => {
                 status.cult_leader_queries_available = Some(self.cult_leader_queries_available);
@@ -725,6 +730,39 @@ impl GameState {
     /// going unnoticed for the rest of a live event.
     pub(crate) fn contest_results_for_host(&self) -> Vec<((Round, ContestCategory), bool)> {
         self.contest_results.iter().map(|(&k, &v)| (k, v)).collect()
+    }
+
+    /// Whether Ton won `round` overall -- Dalton's own explicit ruling:
+    /// winning 2 of that round's 3 contest categories (Strength/Creativity/
+    /// Intelligence) wins the round, the "even round" ("a Duel," in
+    /// Bridgerton terms) itself. Doesn't wait for the third category to be
+    /// recorded: 2 wins is already an unbeatable majority of 3, so this
+    /// can flip true the moment the second one lands, matching how the
+    /// Almanac gate that consumes this (`use_almanac`) is meant to unlock
+    /// as soon as it's genuinely earned rather than only after every
+    /// category's tapped in. Meaningless for an odd (social) round --
+    /// always `false` there, since `record_contest_result` itself already
+    /// rejects recording anything outside `Round::Two`/`Round::Four`.
+    fn ton_won_round(&self, round: Round) -> bool {
+        self.contest_results
+            .iter()
+            .filter(|(&(r, _), &ton_won)| r == round && ton_won)
+            .count()
+            >= 2
+    }
+
+    /// How many rounds Ton has won so far -- currently only ever 0, 1, or 2,
+    /// since `Round::Two` and `Round::Four` are the only rounds
+    /// `ton_won_round` can ever be true for (see its own doc comment).
+    /// Backs the Almanac's "Ton must win at least 2 rounds first" gate
+    /// (Dalton's own explicit instruction) -- with only two winnable
+    /// rounds in the whole game, that gate can only ever unlock once Ton
+    /// has swept both.
+    pub(crate) fn rounds_ton_has_won(&self) -> usize {
+        [Round::Two, Round::Four]
+            .into_iter()
+            .filter(|&round| self.ton_won_round(round))
+            .count()
     }
 
     /// The one faction currently winning, if any (`win_condition::evaluate`
@@ -2584,6 +2622,13 @@ fn use_oracle(
     ))
 }
 
+/// Ton must have won at least this many rounds (see
+/// `GameState::rounds_ton_has_won`'s doc comment) before the Almanac may be
+/// used at all -- Dalton's own explicit instruction. With only `Round::Two`
+/// and `Round::Four` ever winnable, this is only reachable after Ton has
+/// swept both.
+const ALMANAC_MIN_ROUNDS_TON_MUST_WIN: usize = 2;
+
 /// Almanac: once per game, learns 3 players who are definitely not the
 /// Revolutionary Leader. Deterministic lowest-PlayerId selection (the same
 /// fixed, test-reproducible convention as `first_eligible`) among active
@@ -2592,7 +2637,7 @@ fn use_oracle(
 /// result, and excluding it keeps every entry informative.
 fn use_almanac(state: &mut GameState, player: PlayerId) -> Result<Vec<DomainEvent>, GameError> {
     require_character(state, player, Character::Almanac)?;
-    if state.almanac_used {
+    if state.almanac_used || state.rounds_ton_has_won() < ALMANAC_MIN_ROUNDS_TON_MUST_WIN {
         return Err(GameError::AbilityNotAvailable {
             character: Character::Almanac,
         });
@@ -7142,9 +7187,34 @@ mod tests {
         assert_eq!(result, Err(GameError::UnknownPlayer(bogus)));
     }
 
+    /// Advances to `Round::Four` (so both contest rounds are recordable --
+    /// `RecordContestResult` rejects recording a round past
+    /// `current_round`) and records 2-of-3 Ton wins in each of Round::Two
+    /// and Round::Four -- exactly the "Ton has won 2 rounds" precondition
+    /// the Almanac's own gate requires (see `GameState::rounds_ton_has_won`).
+    fn make_ton_win_two_rounds(state: &mut GameState) {
+        for _ in 0..3 {
+            apply_command(state, Command::AdvanceRound).unwrap();
+        }
+        for round in [Round::Two, Round::Four] {
+            for category in [ContestCategory::Strength, ContestCategory::Creativity] {
+                apply_command(
+                    state,
+                    Command::RecordContestResult {
+                        round,
+                        category,
+                        ton_won: true,
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
     #[test]
     fn use_almanac_picks_three_non_leader_active_players_excluding_self() {
         let (mut state, p) = setup_phase2_game();
+        make_ton_win_two_rounds(&mut state);
         let events = apply_command(&mut state, Command::UseAlmanac { player: p.almanac }).unwrap();
         match &events[0] {
             DomainEvent::InfoCheckDelivered {
@@ -7173,6 +7243,7 @@ mod tests {
     #[test]
     fn use_almanac_rejects_a_second_use() {
         let (mut state, p) = setup_phase2_game();
+        make_ton_win_two_rounds(&mut state);
         apply_command(&mut state, Command::UseAlmanac { player: p.almanac }).unwrap();
         let result = apply_command(&mut state, Command::UseAlmanac { player: p.almanac });
         assert_eq!(
@@ -7184,8 +7255,85 @@ mod tests {
     }
 
     #[test]
+    fn use_almanac_rejects_before_ton_has_won_2_rounds() {
+        let (mut state, p) = setup_phase2_game();
+        // No rounds won at all yet.
+        let result = apply_command(&mut state, Command::UseAlmanac { player: p.almanac });
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Almanac,
+            })
+        );
+        assert!(!state.almanac_used, "a rejected use must not consume it");
+
+        // Exactly 1 round won (only Round::Two, not Round::Four yet) --
+        // still short of the 2-round requirement.
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.rounds_ton_has_won(), 1);
+        let result = apply_command(&mut state, Command::UseAlmanac { player: p.almanac });
+        assert_eq!(
+            result,
+            Err(GameError::AbilityNotAvailable {
+                character: Character::Almanac,
+            })
+        );
+    }
+
+    #[test]
+    fn rounds_ton_has_won_counts_a_majority_without_waiting_for_the_third_category() {
+        let mut state = GameState::new();
+        for _ in 0..3 {
+            apply_command(&mut state, Command::AdvanceRound).unwrap();
+        }
+        assert_eq!(state.rounds_ton_has_won(), 0);
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        // Only 1 of 3 categories in -- not yet a majority.
+        assert_eq!(state.rounds_ton_has_won(), 0);
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        // 2 of 3 -- an unbeatable majority, counted immediately without
+        // waiting for Intelligence to be recorded at all.
+        assert_eq!(state.rounds_ton_has_won(), 1);
+    }
+
+    #[test]
     fn deceiver_armed_does_not_affect_almanac() {
         let (mut state, p) = setup_phase2_game();
+        make_ton_win_two_rounds(&mut state);
         apply_command(
             &mut state,
             Command::SetDeceiverArmed {
