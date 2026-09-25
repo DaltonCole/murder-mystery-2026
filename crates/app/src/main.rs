@@ -7,54 +7,25 @@
 //! a real LAN playtest, not the final visual design (that's Phase 4). See
 //! `/home/drc/.claude/plans/piped-crunching-lighthouse.md`.
 //!
-//! KNOWN GAP, not an oversight: there is no session/auth layer yet, and
-//! it's broader than just view privacy. `game_ws` accepts any `ClientMsg`
-//! from any connection with no identity check at all -- `HostLogin`
-//! (`check_host_password`) is the one exception in name only: it gates
-//! nothing else here, it's purely a reply to that one message, so every
-//! other arm below runs identically whether or not a connection ever logs
-//! in. A security review (2026-09-25) confirmed and enumerated the full
-//! reachable surface, worse than this comment's original scope:
-//! - `ViewPlayer(Some(id))` is the single worst item: a silent,
-//!   zero-interaction dump of any player's ENTIRE private `PlayerView`
-//!   (true faction, character, bio, ability status, info-check results) --
-//!   no game participation needed at all, just a raw websocket connection
-//!   and a guessed `PlayerId` (a plain sequential `u32`, trivial to
-//!   enumerate). This UI never sends it itself except from an
-//!   already-logged-in `/host` tab, but nothing enforces that server-side.
-//! - `Watch(Viewer::Player(id))` (and `Viewer::Host`/`Viewer::Display`) lets
-//!   a crafted client read any view directly, the same way. This UI never
-//!   sends `Watch(Viewer::Player(id))` itself -- a fresh `/play` connection
-//!   only ever watches the id its own `Join` call just received -- but
-//!   nothing stops a deliberately crafted client from doing so.
-//! - `Do(Command)` goes further: since commands like `CastBallot`,
-//!   `Nominate`, `AttemptTask`, and `TransferKingQueen` carry the acting
-//!   player's id as a plain field with nothing tying it to the sending
-//!   connection, any client can impersonate *any* player's writes, not
-//!   just reads -- vote as someone else, submit fake task attempts, or (in
-//!   combination with the `ViewPlayer` leak above to first find out who
-//!   holds the crown) force the King/Queen's once-per-game transfer
-//!   without them.
-//! - Every host-only command reachable through `Do(Command)` (`AddPlayer`,
-//!   `FinalizeSetup`, `AdvanceRound`, `OpenDenouncement`,
-//!   `CloseNomination`, `OpenBallot`, `CloseBallot`, `CloseRunoff`,
-//!   `PushTask`, `CloseTasks`, `AssignFaction`, `AssignCharacter`,
-//!   `CastOut`, `RecordContestResult`, `ResolveGalleryPredictions`,
-//!   `AwardServantPoints`, `DrawIntermissionEntrants` (also a plain
-//!   `Command`, letting a caller hand-pick the "random" Intermission
-//!   entrants directly), ...) can be issued from a raw connection to
-//!   `/api/ws` regardless of which route it came through -- nothing
-//!   distinguishes a Host console's socket from a Player's. The same is
-//!   true of every host-only `ClientMsg` variant that isn't a plain
-//!   `Command` either (`RunRaffle`, `PushLocationTask`,
-//!   `DrawIntermissionEntrants`, `StartRoundOne`, `StartTimer`,
-//!   `AddTimerSeconds`, `ClearTimer`, `ViewPlayer`).
-//!
-//! Real per-player join tokens and a real Host credential enforced on every
-//! message server-side (not just the `HostLogin` reply and the Host UI's
-//! own choice not to render controls before it succeeds -- see the plan's
-//! "Session" section) must land before this runs at a real event over
-//! shared WiFi with guests who aren't fully trusted.
+//! FIXED, formerly a KNOWN GAP: a security review (2026-09-25) found
+//! `game_ws` originally accepted any `ClientMsg` from any connection with
+//! no identity check at all -- `ViewPlayer(Some(id))` could silently dump
+//! any player's entire private view, `Watch`/`Do(Command)` could read or
+//! act as any player or the Host with nothing tying a claim to who
+//! actually sent it, and every host-only command was reachable from a
+//! plain, unauthenticated connection. This is now enforced server-side,
+//! not just by the Host UI's own choice not to render controls: every
+//! connection tracks `own_player_id` (set once, only by that connection's
+//! own successful `Join`) and `is_host_authed` (set only by a successful
+//! `HostLogin`), and every `ClientMsg`/`Command` is checked against them
+//! -- see `command_actor`/`command_authorized` and the `Watch`/`ViewPlayer`
+//! checks in `game_ws` below for exactly what's enforced. Still not a full
+//! session layer: `own_player_id` lives only in this one connection's own
+//! in-memory state, set once from `Join`'s reply -- there's no token a
+//! player's browser could use to reclaim the same identity after a dropped
+//! connection or reload (`Join` always mints a brand-new `PlayerId`, never
+//! re-attaches to an existing one). See the SECOND KNOWN GAP below, which
+//! is the same underlying "no reconnect story" limitation.
 //!
 //! SECOND KNOWN GAP: no reconnect story. Every route's `use_websocket` call
 //! uses a plain `WebSocketOptions::new()`, not
@@ -204,12 +175,6 @@ enum ClientMsg {
     /// `Viewer::Host` (see `game_server::draw_intermission_entrants`'s doc
     /// comment). The server reads `GameState` directly instead.
     DrawIntermissionEntrants,
-    /// `/host` only: pushes Round 1's randomly-selected tasks on demand.
-    /// Not a plain `Command` -- needs the same server-side real RNG as
-    /// `RunRaffle`. See `game_server::start_round_one`'s doc comment for
-    /// why this is a deliberate, separate Host trigger rather than firing
-    /// automatically the instant setup finalizes.
-    StartRoundOne,
     /// `/host` only: (re)starts the shared round/phase timer at this many
     /// seconds. Not a `Command` -- see `game_server::start_timer`'s doc
     /// comment on why wall-clock time is an app-layer concept here, never
@@ -540,13 +505,6 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         ClientMsg::DrawIntermissionEntrants => {
                             if is_host_authed {
                                 respond!(game_server::draw_intermission_entrants())
-                            } else {
-                                reject!("host login required")
-                            }
-                        }
-                        ClientMsg::StartRoundOne => {
-                            if is_host_authed {
-                                respond!(game_server::start_round_one())
                             } else {
                                 reject!("host login required")
                             }
@@ -2515,13 +2473,6 @@ fn Host() -> Element {
             let _ = socket.send(ClientMsg::ClearTimer).await;
         });
     };
-    let mut start_round_one = move || {
-        let socket = socket;
-        error.set(None);
-        spawn(async move {
-            let _ = socket.send(ClientMsg::StartRoundOne).await;
-        });
-    };
     let view_player = move |id: Option<PlayerId>| {
         let socket = socket;
         spawn(async move {
@@ -2877,8 +2828,7 @@ fn Host() -> Element {
         }
         div {
             h3 { "Tasks" }
-            p { "Rounds 3 and 5 each auto-push their own bio-derived tasks the moment that round's task phase begins -- no action needed there. Round 1's two tasks wait for you: click below once you've given the live intro and everyone's revealed their character." }
-            button { onclick: move |_| start_round_one(), "Start Round 1 (push tasks)" }
+            p { "Every round's tasks push automatically -- Round 1's the moment setup finalizes, Rounds 3 and 5 the moment that round's task phase begins. No action needed here." }
             if open_tasks.is_empty() {
                 p { "No tasks currently open." }
             } else {

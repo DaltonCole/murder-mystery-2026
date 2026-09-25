@@ -210,9 +210,9 @@ fn auto_task_counts(round: Round) -> (usize, usize, usize) {
 /// Pushes `round`'s configured tasks (see `auto_task_counts`), unless
 /// they've already been pushed (`pushed`, this process's own idempotency
 /// guard -- see `GameServer::auto_tasks_pushed`'s doc comment). Shared by
-/// both ways a round's tasks get pushed: automatically for Round 3/5 (see
-/// `auto_push_on_round_advance` below) and on-demand for Round 1 (see
-/// `start_round_one`).
+/// every way a round's tasks get pushed: automatically for Round 3/5 (see
+/// `auto_push_on_round_advance` below) and automatically for Round 1, the
+/// moment setup finalizes (see `run_raffle`).
 ///
 /// For each tier, shuffles `bio::task_candidates`'s pool with real,
 /// OS-backed entropy (the same "randomness at the boundary" shape as
@@ -266,9 +266,10 @@ fn push_tasks_for_round(
 /// free-text "Manual entry" fallback stay in the Host console regardless,
 /// for a live-event fix-up.
 ///
-/// Round 1 is deliberately NOT triggered from here -- see `start_round_one`
-/// for why it needs its own explicit trigger instead of firing the instant
-/// setup finalizes.
+/// Round 1 is deliberately NOT triggered from here -- it's pushed at the
+/// end of `run_raffle` instead, the moment setup itself finalizes (Dalton's
+/// own explicit instruction: no admin action should be needed to get any
+/// round's tasks moving, Round 1 included).
 ///
 /// Triggered by scanning `events` (whatever command was just applied) for
 /// `DomainEvent::RoundAdvanced` reaching `Round::Three`/`Round::Five`.
@@ -287,43 +288,6 @@ fn auto_push_on_round_advance(
         return Vec::new();
     };
     push_tasks_for_round(state, round, pushed)
-}
-
-/// Pushes Round 1's tasks (rules.md §4: "exactly 2 fixed tasks") on
-/// demand -- the Host console's "Start Round 1" button. Deliberately a
-/// separate, explicit trigger rather than firing automatically the instant
-/// `FinalizeSetup` succeeds (an earlier version of this automation did
-/// that): rules.md's own Round 1 sequence has Dalton give a live scripted
-/// intro and every player privately reveal their character *before* tasks
-/// get pushed, and setup can finish (the raffle run, roles/factions
-/// assigned) well before Dalton is actually ready to start that -- pushing
-/// tasks the instant setup finalizes closed that gap entirely. This keeps
-/// task *content* selection automatic (still random, still no admin
-/// picking which task) while leaving the *timing* of Round 1's actual
-/// start as a deliberate Host action, the same shape as every other phase
-/// transition in this app (`AdvanceRound`, `OpenDenouncement`, ...).
-///
-/// `String` error (not `GameError`) since both failure modes -- not
-/// currently at Round 1, or a double-click re-pushing -- are app-level UI
-/// mistakes, not domain rejections, matching `run_raffle`'s precedent.
-pub fn start_round_one() -> Result<Vec<DomainEvent>, String> {
-    let events;
-    {
-        let mut state = lock_state();
-        if state.current_round() != Round::One {
-            return Err("the game is not currently at Round 1".to_string());
-        }
-        let mut pushed = server()
-            .auto_tasks_pushed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pushed.contains(&Round::One) {
-            return Err("Round 1's tasks have already been pushed".to_string());
-        }
-        events = push_tasks_for_round(&mut state, Round::One, &mut pushed);
-    }
-    let _ = server().changed.send(());
-    Ok(events)
 }
 
 /// Transfers the crown from `player` (the current King/Queen) to a
@@ -457,20 +421,25 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
     Ok(events)
 }
 
-/// Runs rules.md §1's weighted setup raffle over the current roster and
-/// finalizes setup, all under one lock acquisition -- the Host console's
-/// "Run the raffle" button is the only caller. This is where the one
-/// genuinely random step actually happens (see `engine::raffle`'s module
-/// doc comment on "randomness at the boundary": the engine only computes,
-/// it never generates its own randomness) -- this function runs natively
-/// on the server, so a plain `rand::rng()` is a real OS-backed source,
-/// unlike the WASM client half of this same binary.
+/// Runs rules.md §1's weighted setup raffle over the current roster,
+/// finalizes setup, and pushes Round 1's tasks, all under one lock
+/// acquisition -- the Host console's "Run the raffle" button is the only
+/// caller. This is where the one genuinely random step actually happens
+/// (see `engine::raffle`'s module doc comment on "randomness at the
+/// boundary": the engine only computes, it never generates its own
+/// randomness) -- this function runs natively on the server, so a plain
+/// `rand::rng()` is a real OS-backed source, unlike the WASM client half
+/// of this same binary.
 ///
-/// Mirrors `bots::HostDriver::setup_game` step for step (ticket-weighted
-/// draw, `AssignCharacter` for every winner, ~60/40 Ton/Uprising split for
-/// the leftovers, then `CloseRaffle`/`FinalizeSetup`) -- that's the
+/// Mirrors `bots::HostDriver::setup_game` (ticket-weighted draw,
+/// `AssignCharacter` for every winner, ~60/40 Ton/Uprising split for the
+/// leftovers, then `CloseRaffle`/`FinalizeSetup`) -- that's the
 /// network-driven equivalent of this same sequence for the bot test
-/// harness; this is the real one a live host actually presses.
+/// harness; this is the real one a live host actually presses. Round 1's
+/// task push at the end is NOT mirrored there -- `HostDriver` pushes its
+/// own separate hardcoded test content instead, via the standalone
+/// `run_round_one_tasks`, deliberately independent of this function's
+/// real bio-derived random selection.
 ///
 /// `String` error (not `GameError`, matching `push_location_task`'s
 /// precedent) since the one way this can fail -- a double-click re-running
@@ -543,10 +512,20 @@ pub fn run_raffle() -> Result<Vec<DomainEvent>, String> {
         events.extend(apply_command(&mut state, Command::CloseRaffle).map_err(|e| e.to_string())?);
         events
             .extend(apply_command(&mut state, Command::FinalizeSetup).map_err(|e| e.to_string())?);
-        // Round 1's own tasks deliberately do NOT get pushed here -- see
-        // `start_round_one`'s doc comment for why that needs its own
-        // explicit Host trigger instead of firing the instant setup
-        // finalizes.
+        // Round 1's tasks push automatically right here, the instant setup
+        // finalizes -- Dalton's own explicit instruction: no admin action
+        // should be needed to get any round's tasks moving, Round 1
+        // included, matching how Round 3/5 already auto-push on
+        // `AdvanceRound` (see `auto_push_on_round_advance`). An earlier
+        // version deliberately deferred this to a separate "Start Round 1"
+        // Host button, reasoning Dalton needs to give a live scripted
+        // intro before tasks appear -- since removed: that intro now
+        // happens before this button is pressed at all, not after.
+        let mut pushed = server()
+            .auto_tasks_pushed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events.extend(push_tasks_for_round(&mut state, Round::One, &mut pushed));
     }
     // Same reasoning as `apply` above: nobody subscribed is a fine outcome
     // to ignore, there's just nobody waiting to be told.
