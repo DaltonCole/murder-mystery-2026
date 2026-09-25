@@ -73,8 +73,10 @@ pub enum DenouncementView {
 }
 
 /// A viewer-safe projection of one open task. Never carries
-/// `qualifying_players` or `expected_code` -- see the doc comment on
-/// [`crate::task::TaskDef`].
+/// `qualifying_players` or `expected_code` for a Player or Display viewer
+/// -- see the doc comment on [`crate::task::TaskDef`]. The Host is the one
+/// deliberate exception: see `answer_qualifying_players`/`answer_code`
+/// below.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
     pub id: TaskId,
@@ -91,6 +93,17 @@ pub struct TaskView {
     /// task this is reveals nothing a player doesn't already see in
     /// `prompt` once it's pushed.
     pub is_location_task: bool,
+    /// Host-only: the task's actual qualifying-player set (empty for a
+    /// location task, and empty for every non-Host viewer). Dalton's own
+    /// explicit instruction -- "allow me to see the answer to all tasks" --
+    /// a deliberate reversal of the privacy guarantee this field held since
+    /// Phase 1; a Player/Display view never carries it, matching
+    /// `TaskDef`'s doc comment.
+    pub answer_qualifying_players: Vec<PlayerId>,
+    /// Host-only: the task's actual code (`None` for a bio-derived task,
+    /// and `None` for every non-Host viewer). Same deliberate reversal as
+    /// `answer_qualifying_players`.
+    pub answer_code: Option<String>,
 }
 
 /// What a single connection is allowed to see, fully pre-filtered
@@ -316,6 +329,16 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
             tier: def.tier,
             my_outcome: viewer_id.and_then(|viewer_id| state.task_attempt(viewer_id, def.id)),
             is_location_task: def.expected_code.is_some(),
+            answer_qualifying_players: if is_host {
+                def.qualifying_players.iter().copied().collect()
+            } else {
+                Vec::new()
+            },
+            answer_code: if is_host {
+                def.expected_code.clone()
+            } else {
+                None
+            },
         })
         .collect();
 
@@ -831,7 +854,8 @@ mod tests {
     }
 
     #[test]
-    fn open_tasks_never_leak_the_qualifying_set_and_show_only_the_viewers_own_outcome() {
+    fn open_tasks_hide_the_qualifying_set_from_non_host_viewers_and_show_only_the_viewers_own_outcome(
+    ) {
         let mut state = three_player_state();
         apply_command(
             &mut state,
@@ -878,13 +902,20 @@ mod tests {
         let carol = view_for(&state, Viewer::Player(PlayerId(2)));
         assert_eq!(carol.open_tasks[0].my_outcome, None);
 
-        for viewer in [Viewer::Player(PlayerId(0)), Viewer::Host, Viewer::Display] {
-            let serialized = serde_json::to_string(&view_for(&state, viewer)).unwrap();
-            assert!(
-                !serialized.contains("qualifying"),
-                "a view leaked the task's qualifying-player set: {serialized}"
+        // Player/Display never see the qualifying set -- the Host is the
+        // one deliberate exception (Dalton's own explicit instruction:
+        // "allow me to see the answer to all tasks").
+        for viewer in [Viewer::Player(PlayerId(0)), Viewer::Display] {
+            assert_eq!(
+                view_for(&state, viewer).open_tasks[0].answer_qualifying_players,
+                Vec::new(),
+                "a non-Host view leaked the task's qualifying-player set"
             );
         }
+        assert_eq!(
+            view_for(&state, Viewer::Host).open_tasks[0].answer_qualifying_players,
+            vec![PlayerId(1)],
+        );
     }
 
     #[test]
@@ -916,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn location_tasks_are_flagged_in_the_view_but_never_leak_the_code() {
+    fn location_tasks_are_flagged_in_the_view_and_the_code_is_host_only() {
         let mut state = three_player_state();
         apply_command(
             &mut state,
@@ -952,14 +983,35 @@ mod tests {
             .unwrap();
         assert!(!talk_task.is_location_task);
         assert!(location_task.is_location_task);
+        assert_eq!(talk_task.answer_code, None);
+        assert_eq!(location_task.answer_code, None);
 
-        for viewer in [Viewer::Player(PlayerId(0)), Viewer::Host, Viewer::Display] {
+        // Player/Display never see the code -- the Host is the one
+        // deliberate exception (Dalton's own explicit instruction: "allow
+        // me to see the answer to all tasks").
+        for viewer in [Viewer::Player(PlayerId(0)), Viewer::Display] {
             let serialized = serde_json::to_string(&view_for(&state, viewer)).unwrap();
             assert!(
                 !serialized.contains("SUPER SECRET CODE"),
-                "a view leaked the location task's code: {serialized}"
+                "a non-Host view leaked the location task's code: {serialized}"
             );
         }
+        let host_view = view_for(&state, Viewer::Host);
+        let host_location_task = host_view
+            .open_tasks
+            .iter()
+            .find(|t| t.prompt == "Find the code at the bar")
+            .unwrap();
+        assert_eq!(
+            host_location_task.answer_code.as_deref(),
+            Some("SUPER SECRET CODE")
+        );
+        let host_talk_task = host_view
+            .open_tasks
+            .iter()
+            .find(|t| t.prompt == "Talk to someone wearing red")
+            .unwrap();
+        assert_eq!(host_talk_task.answer_code, None);
     }
 
     // --- Phase 2 ---

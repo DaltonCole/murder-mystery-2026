@@ -2931,7 +2931,17 @@ fn Host() -> Element {
                 p { "Currently open ({open_tasks.len()}):" }
                 ul {
                     for task in open_tasks.clone() {
-                        li { key: "{task.id.0}", "{task.prompt} ({task.tier:?})" }
+                        li {
+                            key: "{task.id.0}",
+                            "{task.prompt} ({task.tier:?}) -- "
+                            if let Some(code) = &task.answer_code {
+                                "code: {code}"
+                            } else if !task.answer_qualifying_players.is_empty() {
+                                "qualifies: {names(&task.answer_qualifying_players, &roster)}"
+                            } else {
+                                "no one currently qualifies"
+                            }
+                        }
                     }
                 }
             }

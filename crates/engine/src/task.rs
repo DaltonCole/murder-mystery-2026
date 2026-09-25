@@ -33,9 +33,13 @@ pub enum TaskTier {
 
 /// A single pushed task. `qualifying_players` is the *ground truth* set of
 /// players who actually satisfy the task's prompt (e.g. "wearing a red
-/// mask") -- it is never serialized into any [`crate::view::PlayerView`].
-/// Content authoring (turning a bio field into this set) is a Phase 4
-/// concern; the engine only owns the submit/credit mechanic itself.
+/// mask") -- it is never serialized into a Player or Display
+/// [`crate::view::PlayerView`], only the Host's (see
+/// `crate::view::TaskView::answer_qualifying_players`; Dalton's own
+/// explicit instruction reversed the original "never serialize this at
+/// all" guarantee for the Host specifically). Content authoring (turning a
+/// bio field into this set) is a Phase 4 concern; the engine only owns the
+/// submit/credit mechanic itself.
 ///
 /// `expected_code` is the ground truth for a different mechanic entirely
 /// (rules.md §4's medium/hard *location* tasks: "talk to someone at
@@ -45,9 +49,12 @@ pub enum TaskTier {
 /// of `qualifying_players`/`expected_code` is meaningful for a given task;
 /// which command applies (`AttemptTask` vs `AttemptLocationTask`) is
 /// decided by which one is set, not a separate tag, since a `TaskDef` is
-/// never constructed with both in play. Same never-serialized treatment as
-/// `qualifying_players` -- see `AttemptLocationTask`'s doc comment for why
-/// this can't even reach the *client bundle*, not just the wire.
+/// never constructed with both in play. Same Host-only exception as
+/// `qualifying_players` (`crate::view::TaskView::answer_code`) -- see
+/// `AttemptLocationTask`'s doc comment for the separate, still-true
+/// guarantee that the raw `LOCATION_TASKS` content never reaches the
+/// client *bundle* at compile time, which this per-viewer wire scoping
+/// doesn't change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDef {
     pub id: TaskId,

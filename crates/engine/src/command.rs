@@ -289,13 +289,19 @@ pub enum Command {
     ///
     /// The correct code is never derived from anything the engine can see
     /// -- it's supplied whole by the caller when the task is pushed
-    /// (`PushTask`'s `expected_code`), and that caller (`app`) keeps it
-    /// out of reach of the client bundle entirely, not merely off the
-    /// wire: unlike `qualifying_players` (safe to compute engine-side from
-    /// bios already in `GameState`), a location's code is authored,
-    /// physical content that must never be compiled into the WASM served
-    /// to every player's browser -- see `game_server`'s location-task
-    /// handling in the `app` crate.
+    /// (`PushTask`'s `expected_code`), and that caller (`app`) keeps the
+    /// raw content (`game_server::LOCATION_TASKS`) out of reach of the
+    /// client bundle entirely, not merely off the wire: unlike
+    /// `qualifying_players` (safe to compute engine-side from bios already
+    /// in `GameState`), a location's code is authored, physical content
+    /// that must never be *compiled into* the WASM served to every
+    /// player's browser -- see `game_server`'s location-task handling in
+    /// the `app` crate. That's a separate guarantee from the wire-level
+    /// one `view_for` enforces per viewer: the Host's own view is now the
+    /// deliberate exception to the latter (see
+    /// `crate::view::TaskView::answer_code`), but the former still holds
+    /// regardless of viewer -- nothing ever ships the raw
+    /// `LOCATION_TASKS` table itself into the WASM binary.
     AttemptLocationTask {
         player: PlayerId,
         task: TaskId,
