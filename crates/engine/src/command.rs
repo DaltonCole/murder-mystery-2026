@@ -52,6 +52,27 @@ pub enum Command {
     /// `FinalizeSetup` that fills in everyone's catch-all character.
     CloseRaffle,
 
+    /// Sets the real, app-supplied random tie-breaking order every
+    /// "pick a random remaining eligible player" mechanic in this engine
+    /// now draws from (`GameState::first_eligible`/`trigger_leader_confidant`)
+    /// instead of the engine's own deterministic "lowest `PlayerId`" stand-in
+    /// -- rules.md itself says "random" for each of these (the King/Queen's
+    /// Round-3 Cast-Out and conversion replacement, the Revolutionary
+    /// Leader's succession fallback, the Leader's Confidant pick), so a
+    /// security/reliability review's earlier note that this stayed
+    /// deterministic "so tests are reproducible without needing to inject a
+    /// fake RNG" was a real, since-resolved gap, not the final word.
+    /// `order` should be a shuffled copy of the full roster (the caller's
+    /// job -- see the plan's "randomness at the boundary" principle: this
+    /// engine still never generates its own randomness, it only consumes
+    /// an already-random order). Rejected if called more than once, the
+    /// same "set exactly once, right after setup" shape as `CloseRaffle`
+    /// -- a mid-game re-shuffle would be either pointless (nothing left
+    /// undecided) or exploitable (letting a later call retroactively
+    /// change who a past "random" pick would have been, for anything not
+    /// yet resolved).
+    SetPlayerPriorityOrder { order: Vec<PlayerId> },
+
     /// Assigns a player's faction directly. Once the setup raffle has run,
     /// this is only for the leftover players who didn't win a named role in
     /// it (splitting them across Ton/Uprising per rules.md §1's ~60/40

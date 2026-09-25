@@ -179,6 +179,13 @@ enum ClientMsg {
     /// for the client to supply at all. See
     /// `game_server::transfer_king_queen_randomly`'s doc comment.
     TransferKingQueen { player: PlayerId },
+    /// `/play` only, the Bartender's ability: not `Command::BartenderTarget`
+    /// directly -- rules.md's Bartender flips a coin to see whether the
+    /// drink "lands," and per Dalton's own explicit instruction, the engine
+    /// must decide that flip, never the player (see
+    /// `game_server::bartender_target_randomly`'s doc comment). This
+    /// carries no `lands` field at all; the server rolls it.
+    BartenderTarget { player: PlayerId, target: PlayerId },
     /// `/host` only: watch a specific player's own `PlayerView` alongside
     /// the Host's normal `Viewer::Host` view, for the Host console's
     /// read-only "view a player's page" panel -- lets Dalton help a
@@ -270,6 +277,7 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
     match cmd {
         Command::AddPlayer { .. }
         | Command::CloseRaffle
+        | Command::SetPlayerPriorityOrder { .. }
         | Command::AssignFaction { .. }
         | Command::AssignCharacter { .. }
         | Command::FinalizeSetup
@@ -566,6 +574,13 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                 reject!("not authorized to transfer this crown")
                             }
                         }
+                        ClientMsg::BartenderTarget { player, target } => {
+                            if is_host_authed || own_player_id == Some(player) {
+                                respond!(game_server::bartender_target_randomly(player, target))
+                            } else {
+                                reject!("not authorized to act as this player")
+                            }
+                        }
                         ClientMsg::ViewPlayer(target) => {
                             if !is_host_authed {
                                 reject!("host login required")
@@ -720,6 +735,19 @@ fn Play() -> Element {
         error.set(None);
         spawn(async move {
             let _ = socket.send(ClientMsg::TransferKingQueen { player }).await;
+        });
+    };
+
+    // Not a plain `Command` -- the Bartender's coin flip is decided
+    // server-side (Dalton's own explicit instruction: randomness is the
+    // engine's job, never the player's), so this carries no `lands` field.
+    let mut bartender_target = move |player: PlayerId, target: PlayerId| {
+        let socket = socket;
+        error.set(None);
+        spawn(async move {
+            let _ = socket
+                .send(ClientMsg::BartenderTarget { player, target })
+                .await;
         });
     };
 
@@ -896,6 +924,7 @@ fn Play() -> Element {
                         roster: v.roster.clone(),
                         on_command: send_cmd,
                         on_transfer_king_queen: move |()| transfer_king_queen(id),
+                        on_bartender_target: move |target| bartender_target(id, target),
                     }
                 }
             }
@@ -1413,10 +1442,10 @@ fn BioForm(
 
 /// Phase 2 scope: one raw-controls panel covering every ability-bearing
 /// character, matching the rest of this Phase 1-era "basic shell" UI --
-/// see the module doc comment. Bartender's "did it land" is a checkbox the
-/// player sets from an actual coin flip at the table rather than the app
-/// rolling it itself, the same "keep randomness at the boundary, let a
-/// human adjudicate it" choice `CastOut`'s `fallback_replacement` makes.
+/// see the module doc comment. Bartender's coin flip is decided
+/// server-side (see `ClientMsg::BartenderTarget`'s doc comment) -- this
+/// panel only ever lets the player pick a target, never a "did it land"
+/// outcome.
 #[component]
 fn AbilityPanel(
     my_id: PlayerId,
@@ -1431,19 +1460,16 @@ fn AbilityPanel(
     /// to a random eligible Ton player -- see `ClientMsg::TransferKingQueen`'s
     /// doc comment for why this bypasses the generic `on_command` path.
     on_transfer_king_queen: EventHandler<()>,
+    /// Bartender only: fires the target, which the server resolves with its
+    /// own real coin flip -- see `ClientMsg::BartenderTarget`'s doc comment
+    /// for why this bypasses the generic `on_command` path.
+    on_bartender_target: EventHandler<PlayerId>,
 ) -> Element {
     let Some(character) = own_character else {
         return rsx! {};
     };
 
     let mut target = use_signal(|| None::<u32>);
-    // No default -- a review found this silently defaulted to `true`
-    // ("it lands"), so a player who didn't consciously flip the coin at
-    // the table before submitting would submit an outcome that was never
-    // actually decided. Forcing an explicit choice doesn't change what the
-    // ability does, just makes it harder to report the wrong coin flip by
-    // accident.
-    let mut lands = use_signal(|| None::<bool>);
     let mut kind = use_signal(|| InfoQueryKind::IsTheLeader);
     // Cult Leader only, kept separate from `target` above (that one's for
     // the query) -- irreversible and secret, so it gets the same
@@ -1638,39 +1664,11 @@ fn AbilityPanel(
                         }
                     }
                     {target_picker}
-                    p { "Flip a coin at the table, then record what actually happened:" }
-                    label {
-                        input {
-                            r#type: "radio",
-                            name: "bartender-lands",
-                            checked: lands() == Some(true),
-                            onchange: move |_| lands.set(Some(true)),
-                        }
-                        " It landed"
-                    }
-                    label {
-                        input {
-                            r#type: "radio",
-                            name: "bartender-lands",
-                            checked: lands() == Some(false),
-                            onchange: move |_| lands.set(Some(false)),
-                        }
-                        " It didn't land"
-                    }
                     button {
-                        disabled: !abilities.bartender_available.unwrap_or(false)
-                            || target().is_none()
-                            || lands().is_none(),
+                        disabled: !abilities.bartender_available.unwrap_or(false) || target().is_none(),
                         onclick: move |_| {
                             let Some(t) = target() else { return };
-                            let Some(l) = lands() else { return };
-                            on_command
-                                .call(Command::BartenderTarget {
-                                    player: my_id,
-                                    target: PlayerId(t),
-                                    lands: l,
-                                });
-                            lands.set(None);
+                            on_bartender_target.call(PlayerId(t));
                         },
                         "Target",
                     }

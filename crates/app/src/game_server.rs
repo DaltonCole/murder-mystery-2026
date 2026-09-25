@@ -18,6 +18,7 @@ use engine::{
     PlayerStatus, PlayerView, Round, TaskTier, Viewer,
 };
 use rand::seq::SliceRandom;
+use rand::RngExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -379,6 +380,35 @@ pub fn transfer_king_queen_randomly(player: PlayerId) -> Result<Vec<DomainEvent>
     Ok(events)
 }
 
+/// Flips the Bartender's coin server-side (Dalton's own explicit
+/// instruction: for any character involving randomness, the engine decides
+/// it, never the player) and applies the real result -- the same
+/// "randomness at the boundary" shape as `transfer_king_queen_randomly`
+/// above. `Command::BartenderTarget`'s own `lands` field is unchanged; this
+/// is just the one caller that supplies a real coin flip instead of a
+/// player-reported one.
+pub fn bartender_target_randomly(
+    player: PlayerId,
+    target: PlayerId,
+) -> Result<Vec<DomainEvent>, String> {
+    let events;
+    {
+        let mut state = lock_state();
+        let lands = rand::rng().random_bool(0.5);
+        events = apply_command(
+            &mut state,
+            Command::BartenderTarget {
+                player,
+                target,
+                lands,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let _ = server().changed.send(());
+    Ok(events)
+}
+
 /// Every currently-active player who could still nominate/vote this round
 /// -- excludes anyone drunk this round (rules.md: a drunk player "can't
 /// nominate or vote" at all, so waiting on one would mean the phase could
@@ -570,6 +600,23 @@ pub fn run_raffle() -> Result<Vec<DomainEvent>, String> {
         events.extend(apply_command(&mut state, Command::CloseRaffle).map_err(|e| e.to_string())?);
         events
             .extend(apply_command(&mut state, Command::FinalizeSetup).map_err(|e| e.to_string())?);
+        // See `Command::SetPlayerPriorityOrder`'s doc comment: a real,
+        // app-shuffled permutation of the whole roster, set exactly once
+        // right here, that the engine consults for every "pick a random
+        // remaining player" need for the rest of the game (King/Queen
+        // replacement on Convert/Cast-Out, Revolutionary Leader succession,
+        // the Leader's Confidants) instead of a deterministic stand-in.
+        let mut priority_order = roster.clone();
+        priority_order.shuffle(&mut rng);
+        events.extend(
+            apply_command(
+                &mut state,
+                Command::SetPlayerPriorityOrder {
+                    order: priority_order,
+                },
+            )
+            .map_err(|e| e.to_string())?,
+        );
         // Round 1's tasks push automatically right here, the instant setup
         // finalizes -- Dalton's own explicit instruction: no admin action
         // should be needed to get any round's tasks moving, Round 1

@@ -50,6 +50,12 @@ pub enum DomainEvent {
     },
     /// See `Command::CloseRaffle`'s doc comment.
     RaffleClosed,
+    /// See `Command::SetPlayerPriorityOrder`'s doc comment. Deliberately
+    /// doesn't carry `order` itself -- nothing downstream (Whistledown,
+    /// the finale reveal) narrates this, it exists purely so
+    /// `apply_command` has a real event to return, matching every other
+    /// command's contract.
+    PlayerPriorityOrderSet,
     Converted {
         converter: PlayerId,
         target: PlayerId,

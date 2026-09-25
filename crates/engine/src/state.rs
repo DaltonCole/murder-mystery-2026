@@ -43,6 +43,16 @@ pub struct GameState {
     /// `Unassigned`. See `AddPlayer`'s doc comment.
     raffle_closed: bool,
 
+    /// A real, app-supplied random permutation of the roster (see
+    /// `Command::SetPlayerPriorityOrder`), consulted by `first_eligible`
+    /// and `trigger_leader_confidant` instead of plain `PlayerId` order --
+    /// see `first_eligible`'s own doc comment for why this replaced the
+    /// engine's earlier "lowest ID wins" fallback. Empty until set (every
+    /// existing test that never sets it keeps the old, still-deterministic
+    /// behavior via `first_eligible`'s fallback, so this is purely
+    /// additive).
+    player_priority_order: Vec<PlayerId>,
+
     current_round: Round,
 
     king_queen: Option<PlayerId>,
@@ -273,6 +283,7 @@ impl Default for GameState {
             bios: BTreeMap::new(),
             interest_levels: BTreeMap::new(),
             raffle_closed: false,
+            player_priority_order: Vec::new(),
             current_round: Round::One,
             king_queen: None,
             king_queen_transfer_used: false,
@@ -862,20 +873,34 @@ impl GameState {
     /// resolving several Cast-Outs from the same Denouncement batch can
     /// exclude everyone in that batch, not just the one player currently
     /// being processed -- see the doc comment on `resolve_cast_out`'s
-    /// `also_departing` parameter for why that matters. Lowest ID (rather
-    /// than e.g. highest, or first-inserted) is an arbitrary but fixed
-    /// choice, picked so tests are reproducible without needing to inject a
-    /// fake RNG.
+    /// `also_departing` parameter for why that matters.
+    ///
+    /// The *first* eligible candidate in `player_priority_order` (see
+    /// `Command::SetPlayerPriorityOrder`'s doc comment) -- a real,
+    /// app-supplied random permutation of the roster, consulted in order
+    /// and skipping anyone ineligible, which is exactly "uniformly random
+    /// pick from a shrinking eligible pool" (the standard
+    /// shuffle-once-then-draw-in-order technique), matching rules.md's own
+    /// "random remaining player" wording. Falls back to plain `PlayerId`
+    /// order (this engine's original, still-deterministic behavior, kept
+    /// for any caller -- overwhelmingly tests -- that never sets a
+    /// priority order at all) for anyone the priority order doesn't cover,
+    /// so this is purely additive, never a behavior change for existing
+    /// callers that don't opt in.
     fn first_eligible(&self, faction: Faction, exclude: &[PlayerId]) -> Option<PlayerId> {
-        self.players
-            .values()
-            .find(|p| {
+        let eligible = |id: &PlayerId| {
+            self.players.get(id).is_some_and(|p| {
                 p.true_faction() == faction
                     && p.status == PlayerStatus::Active
                     && !exclude.contains(&p.id)
                     && self.is_untitled(p.id)
             })
-            .map(|p| p.id)
+        };
+        self.player_priority_order
+            .iter()
+            .chain(self.players.keys())
+            .find(|id| eligible(id))
+            .copied()
     }
 
     fn is_active(&self, id: PlayerId) -> bool {
@@ -949,6 +974,14 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
         Command::CloseRaffle => {
             state.raffle_closed = true;
             vec![DomainEvent::RaffleClosed]
+        }
+
+        Command::SetPlayerPriorityOrder { order } => {
+            if !state.player_priority_order.is_empty() {
+                return Err(GameError::PlayerPriorityOrderAlreadySet);
+            }
+            state.player_priority_order = order;
+            vec![DomainEvent::PlayerPriorityOrderSet]
         }
 
         Command::AssignFaction { player, faction } => assign_faction(state, player, faction)?,
@@ -2153,16 +2186,24 @@ fn trigger_leader_confidant(state: &mut GameState, events: &mut Vec<DomainEvent>
     let Some(leader) = state.revolutionary_leader else {
         return;
     };
-    let confidant = state
-        .players
-        .values()
-        .find(|p| {
+    let eligible = |id: &PlayerId| {
+        state.players.get(id).is_some_and(|p| {
             p.status == PlayerStatus::Active
                 && p.true_faction() == Faction::Uprising
                 && p.id != leader
                 && !state.leader_known_by.contains(&p.id)
         })
-        .map(|p| p.id);
+    };
+    // See `first_eligible`'s doc comment: consult the app-supplied random
+    // priority order first (rules.md's confidant pick is explicitly
+    // "randomly selects"), falling back to plain `PlayerId` order for
+    // callers -- overwhelmingly tests -- that never set one.
+    let confidant = state
+        .player_priority_order
+        .iter()
+        .chain(state.players.keys())
+        .find(|id| eligible(id))
+        .copied();
     if let Some(confidant) = confidant {
         state.leader_known_by.insert(confidant);
         events.push(DomainEvent::LeaderConfidantRevealed { leader, confidant });
@@ -3551,6 +3592,36 @@ mod tests {
         assert_eq!(state.player(late).unwrap().character, None);
     }
 
+    #[test]
+    fn set_player_priority_order_records_it() {
+        let mut state = GameState::new();
+        let a = add_player(&mut state, "A", Faction::Ton);
+        let b = add_player(&mut state, "B", Faction::Uprising);
+        let events = apply_command(
+            &mut state,
+            Command::SetPlayerPriorityOrder { order: vec![b, a] },
+        )
+        .unwrap();
+        assert_eq!(events, vec![DomainEvent::PlayerPriorityOrderSet]);
+        assert_eq!(state.player_priority_order, vec![b, a]);
+    }
+
+    #[test]
+    fn set_player_priority_order_rejects_a_second_call() {
+        let mut state = GameState::new();
+        let a = add_player(&mut state, "A", Faction::Ton);
+        apply_command(
+            &mut state,
+            Command::SetPlayerPriorityOrder { order: vec![a] },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::SetPlayerPriorityOrder { order: vec![a] },
+        );
+        assert_eq!(result, Err(GameError::PlayerPriorityOrderAlreadySet));
+    }
+
     fn setup_full_game() -> (GameState, PlayerId, PlayerId, PlayerId, PlayerId) {
         let mut state = GameState::new();
         let king_queen = add_player(&mut state, "King", Faction::Ton);
@@ -4018,6 +4089,38 @@ mod tests {
             state.player(extra_ton).unwrap().character,
             Some(Character::KingQueen)
         );
+    }
+
+    #[test]
+    fn converting_king_queen_installs_the_priority_order_replacement_over_lowest_id() {
+        let (mut state, king_queen, _prince, _leader, cult_leader) = setup_full_game();
+        let extra_ton_a = add_player(&mut state, "ExtraTonA", Faction::Ton);
+        let extra_ton_b = add_player(&mut state, "ExtraTonB", Faction::Ton);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        grant_recruitment_slots(&mut state, 1);
+
+        // `extra_ton_b` has the higher `PlayerId` (added second), so plain
+        // `PlayerId` order would pick `extra_ton_a` -- explicitly reversing
+        // priority order here proves `first_eligible` really is consulting
+        // it rather than happening to agree with insertion order.
+        apply_command(
+            &mut state,
+            Command::SetPlayerPriorityOrder {
+                order: vec![extra_ton_b, extra_ton_a],
+            },
+        )
+        .unwrap();
+
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: king_queen,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.king_queen(), Some(extra_ton_b));
     }
 
     #[test]
@@ -10468,6 +10571,50 @@ mod tests {
         assert!(!events3
             .iter()
             .any(|e| matches!(e, DomainEvent::LeaderConfidantRevealed { .. })));
+    }
+
+    #[test]
+    fn leader_confidant_selection_consults_the_priority_order_over_lowest_id() {
+        let mut state = GameState::new();
+        assign_new(
+            &mut state,
+            "Leader",
+            Faction::Uprising,
+            Character::RevolutionaryLeader,
+        );
+        let member_a = add_player(&mut state, "A", Faction::Uprising);
+        let member_b = add_player(&mut state, "B", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+
+        // Plain `PlayerId` order would pick `member_a` first (as the
+        // fallback-order test above confirms) -- reversing priority order
+        // here proves the confidant pick really is consulting it.
+        apply_command(
+            &mut state,
+            Command::SetPlayerPriorityOrder {
+                order: vec![member_b, member_a],
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        let confidant = events
+            .iter()
+            .find_map(|e| match e {
+                DomainEvent::LeaderConfidantRevealed { confidant, .. } => Some(*confidant),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(confidant, member_b);
     }
 
     #[test]

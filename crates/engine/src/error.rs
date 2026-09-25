@@ -226,4 +226,7 @@ pub enum GameError {
         have: usize,
         min: usize,
     },
+
+    #[error("the player priority order has already been set")]
+    PlayerPriorityOrderAlreadySet,
 }
