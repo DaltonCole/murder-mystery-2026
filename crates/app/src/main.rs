@@ -2424,6 +2424,28 @@ fn LocationTaskAttemptForm(
 
 // --- /host -----------------------------------------------------------------
 
+/// Which section of the Host console is currently showing. Dalton's own
+/// explicit instruction: not separate pages/URLs (the console stays one
+/// route, one websocket connection, one login) -- just one page whose
+/// content swaps based on a nav bar, the same tab-switching shape `/play`
+/// already uses for `PlayTab`. Grouped by when-you'd-reach-for-it during a
+/// live event rather than by exactly matching every old section 1:1:
+/// Setup (pre-game), Round (the per-round operational loop -- advancing,
+/// the Denouncement, tasks), Contests (Round 2/4 + the Intermission
+/// lottery), Servants (the Servant/Gallery/Finale end-game track), and
+/// Player (the read-only player-page viewer). The round timer, the
+/// "what's happening now" banner, and Whistledown stay visible on every
+/// page regardless of this -- they're ambient status, not
+/// section-specific content.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HostPage {
+    Setup,
+    Round,
+    Contests,
+    Servants,
+    Player,
+}
+
 #[component]
 fn Host() -> Element {
     let mut view = use_signal(|| None::<PlayerView>);
@@ -2629,6 +2651,10 @@ fn Host() -> Element {
     // Denouncement-phase budgets, plus a plain custom option for Round 1
     // or a contest, where there's no single rules.md number to default to.
     let mut timer_seconds = use_signal(|| 120u32);
+    // Which section of the console is showing -- see `HostPage`'s own doc
+    // comment. Setup by default since that's genuinely the first thing a
+    // fresh login needs.
+    let mut host_page = use_signal(|| HostPage::Setup);
 
     let roster = view().map(|v| v.roster).unwrap_or_default();
     let interest_levels = view().map(|v| v.interest_levels).unwrap_or_default();
@@ -2747,10 +2773,39 @@ fn Host() -> Element {
         if finale_reveal.is_some() {
             div {
                 style: "background:#4a1620;color:#f3e9d2;padding:0.75em 1em;",
-                "The Finale reveal is ready \u{2014} see \"Finale reveal\" near the bottom of this page."
+                "The Finale reveal is ready \u{2014} see \"Finale reveal\" on the Servants page."
             }
         }
         WhistledownPosts { posts: whistledown.clone(), heading_level: 3u8 }
+        div {
+            class: "tab-nav",
+            button {
+                class: if host_page() == HostPage::Setup { "tab-active" },
+                onclick: move |_| host_page.set(HostPage::Setup),
+                "Setup",
+            }
+            button {
+                class: if host_page() == HostPage::Round { "tab-active" },
+                onclick: move |_| host_page.set(HostPage::Round),
+                "Round",
+            }
+            button {
+                class: if host_page() == HostPage::Contests { "tab-active" },
+                onclick: move |_| host_page.set(HostPage::Contests),
+                "Contests",
+            }
+            button {
+                class: if host_page() == HostPage::Servants { "tab-active" },
+                onclick: move |_| host_page.set(HostPage::Servants),
+                "Servants",
+            }
+            button {
+                class: if host_page() == HostPage::Player { "tab-active" },
+                onclick: move |_| host_page.set(HostPage::Player),
+                "Player",
+            }
+        }
+        if host_page() == HostPage::Setup {
         div {
             h3 { "Setup" }
             p {
@@ -2793,6 +2848,8 @@ fn Host() -> Element {
                 RoleReference { assigned: assigned_characters.clone() }
             }
         }
+        }
+        if host_page() == HostPage::Round {
         div {
             h3 { "Round" }
             if let Some(v) = view() {
@@ -2921,6 +2978,8 @@ fn Host() -> Element {
                 "Push task"
             }
         }
+        }
+        if host_page() == HostPage::Contests {
         div {
             h3 { "Contest rounds (Round 2 & 4)" }
             p { "The actual mini-games are designed later -- this just records each category's result. Players never see the running standings or the breakdown (only the engine tracks it, for the Leader's Confidants)." }
@@ -3022,6 +3081,8 @@ fn Host() -> Element {
                 if draw_armed() { "Confirm draw -- click again" } else { "Draw entrants" }
             }
         }
+        }
+        if host_page() == HostPage::Servants {
         div {
             h3 { "Servant leaderboard" }
             p { "Any Servant, or any already-Cast-Out player, is eligible. What earns points (zone scorekeeping, trivia, a minigame) is up to you -- the app just tracks the running total." }
@@ -3143,6 +3204,8 @@ fn Host() -> Element {
                 }
             }
         }
+        }
+        if host_page() == HostPage::Player {
         div {
             h3 { "View a player's page" }
             p { "Read-only -- shows exactly what that player currently sees on their own phone right now. There are no buttons or forms here, so nothing in this panel can act on their behalf." }
@@ -3174,6 +3237,7 @@ fn Host() -> Element {
                     "Close",
                 }
             }
+        }
         }
         RosterList { roster }
     }
