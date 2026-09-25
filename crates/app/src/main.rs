@@ -305,13 +305,13 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
 }
 
 /// Whether this connection may submit `cmd`: either it's logged in as
-/// Host (trusted for everything -- including driving some player
-/// abilities on a player's behalf, e.g. `Convert`, which has no
-/// self-service `/play` UI at all and is always Host-relayed by design),
-/// or `cmd` names exactly the player this connection itself joined as.
-/// Every purely administrative command (`command_actor` returns `None`)
-/// requires the Host login regardless, since there's no player identity
-/// for it to ever match.
+/// Host (trusted for everything), or `cmd` names exactly the player this
+/// connection itself joined as -- including `Convert`, whose only UI is
+/// now the Cult Leader's own `/play` ability panel (Dalton's own explicit
+/// instruction: the Host shouldn't have this power, only the Cult Leader
+/// does). Every purely administrative command (`command_actor` returns
+/// `None`) requires the Host login regardless, since there's no player
+/// identity for it to ever match.
 #[cfg(feature = "server")]
 fn command_authorized(
     cmd: &Command,
@@ -1042,12 +1042,11 @@ fn RosterList(roster: Vec<RosterEntry>) -> Element {
 }
 
 /// A `<select>` listing every roster entry by name, `value` set to the raw
-/// player id -- the Host console's recurring "pick a player" control (6
-/// call sites: faction/character assignment, a task's qualifying player,
-/// Convert's converter/target, a Servant point award). `on_change` gets the
-/// raw `FormEvent` rather than an already-parsed `PlayerId` so each call
-/// site keeps full control of what else its change should do (a couple
-/// also reset an unrelated "armed" confirmation state).
+/// player id -- the Host console's recurring "pick a player" control (3
+/// call sites: a task's qualifying player, a Servant point award, and the
+/// read-only player-page viewer). `on_change` gets the raw `FormEvent`
+/// rather than an already-parsed `PlayerId` so each call site keeps full
+/// control of what else its change should do.
 #[component]
 fn PlayerSelect(
     roster: Vec<RosterEntry>,
@@ -1319,8 +1318,7 @@ fn BioForm(
 /// see the module doc comment. Bartender's "did it land" is a checkbox the
 /// player sets from an actual coin flip at the table rather than the app
 /// rolling it itself, the same "keep randomness at the boundary, let a
-/// human adjudicate it" choice the Host's Convert panel already makes for
-/// `CastOut`'s `fallback_replacement`.
+/// human adjudicate it" choice `CastOut`'s `fallback_replacement` makes.
 #[component]
 fn AbilityPanel(
     my_id: PlayerId,
@@ -1349,6 +1347,12 @@ fn AbilityPanel(
     // accident.
     let mut lands = use_signal(|| None::<bool>);
     let mut kind = use_signal(|| InfoQueryKind::IsTheLeader);
+    // Cult Leader only, kept separate from `target` above (that one's for
+    // the query) -- irreversible and secret, so it gets the same
+    // arm-then-confirm pattern the Host's now-removed Convert panel used,
+    // resetting the moment the target changes.
+    let mut convert_target = use_signal(|| None::<u32>);
+    let mut convert_armed = use_signal(|| false);
 
     let others: Vec<RosterEntry> = roster
         .iter()
@@ -1358,6 +1362,18 @@ fn AbilityPanel(
     let target_picker = rsx! {
         select {
             onchange: move |e| target.set(e.value().parse().ok()),
+            option { value: "", "-- choose --" }
+            for r in others.clone() {
+                option { value: "{r.id.0}", "{r.name}" }
+            }
+        }
+    };
+    let convert_target_picker = rsx! {
+        select {
+            onchange: move |e| {
+                convert_target.set(e.value().parse().ok());
+                convert_armed.set(false);
+            },
             option { value: "", "-- choose --" }
             for r in others.clone() {
                 option { value: "{r.id.0}", "{r.name}" }
@@ -1418,9 +1434,9 @@ fn AbilityPanel(
                     p { "Queries available: {abilities.cult_leader_queries_available.unwrap_or(0)}" }
                     p {
                         if abilities.recruitment_slots_available.unwrap_or(0) == 0 {
-                            "No recruitment slot available right now -- tell the Host once a new one opens up."
+                            "No recruitment slot available right now -- wait for the next one to open."
                         } else {
-                            "Recruitment slots available: {abilities.recruitment_slots_available.unwrap_or(0)} -- tell the Host who to convert."
+                            "Recruitment slots available: {abilities.recruitment_slots_available.unwrap_or(0)}."
                         }
                     }
                     {target_picker}
@@ -1445,6 +1461,24 @@ fn AbilityPanel(
                                 });
                         },
                         "Query",
+                    }
+                    h4 { "Convert" }
+                    p { "Irreversible and secret -- double check before confirming." }
+                    {convert_target_picker}
+                    button {
+                        disabled: abilities.recruitment_slots_available.unwrap_or(0) == 0 || convert_target().is_none(),
+                        onclick: move |_| {
+                            let Some(t) = convert_target() else { return };
+                            if !convert_armed() {
+                                convert_armed.set(true);
+                                return;
+                            }
+                            on_command
+                                .call(Command::Convert { converter: my_id, target: PlayerId(t) });
+                            convert_armed.set(false);
+                            convert_target.set(None);
+                        },
+                        if convert_armed() { "Confirm convert -- click again" } else { "Convert" }
                     }
                 },
                 Character::Deceiver => rsx! {
@@ -2499,22 +2533,11 @@ fn Host() -> Element {
     let mut task_prompt = use_signal(String::new);
     let mut task_tier = use_signal(|| TaskTier::Easy);
     let mut task_qualifier = use_signal(|| None::<u32>);
-    let mut convert_converter = use_signal(|| None::<u32>);
-    let mut convert_target = use_signal(|| None::<u32>);
-    // A review flagged this panel as unguarded, catastrophic-if-misclicked
-    // dev tooling -- but it's actually the *only* way `Command::Convert`
-    // is reachable at all (the Cult Leader has no self-service UI for it
-    // via `/play`; they tell the Host who to convert, and the Host acts on
-    // it here), so hiding it would break the Cult's core recruitment
-    // mechanic. The real fix is a confirm step, not removal: `convert_armed`
-    // requires a second, distinct click before the command actually fires,
-    // and resets the moment either dropdown changes.
-    let mut convert_armed = use_signal(|| false);
     // The Intermission draw is once-per-game and irreversible (a misclick
     // during Round 1 permanently locks in a near-empty entrant pool for
-    // the whole night) -- a review found it was a single unguarded button,
-    // unlike Convert's arm/confirm pattern above. Reusing that same shape
-    // here.
+    // the whole night) -- a review found it was a single unguarded button.
+    // Same arm-then-confirm shape `AbilityPanel`'s Cult Leader Convert
+    // control uses.
     let mut draw_armed = use_signal(|| false);
     let mut contest_round = use_signal(|| Round::Two);
     // Neither defaults, and both reset to `None` after every submit -- a
@@ -2545,8 +2568,6 @@ fn Host() -> Element {
     let interest_levels = view().map(|v| v.interest_levels).unwrap_or_default();
     let raffle_closed = view().map(|v| v.raffle_closed).unwrap_or(false);
     let assigned_characters = view().map(|v| v.assigned_characters).unwrap_or_default();
-    let recruitment_slots_available_for_host =
-        view().and_then(|v| v.recruitment_slots_available_for_host);
     let denouncement_phase = view().and_then(|v| v.denouncement);
     let open_tasks = view().map(|v| v.open_tasks).unwrap_or_default();
     let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
@@ -2832,56 +2853,6 @@ fn Host() -> Element {
                     task_prompt.set(String::new());
                 },
                 "Push task"
-            }
-        }
-        div {
-            h3 { "Cult Leader: Convert" }
-            p { "The Cult Leader has no self-service way to do this from their own phone -- they tell you who to convert, and you act on it here. This is irreversible and secret -- double check before confirming." }
-            if let Some(slots) = recruitment_slots_available_for_host {
-                p {
-                    if slots == 0 {
-                        "No recruitment slot is currently available -- wait for the next round to open one."
-                    } else {
-                        "{slots} recruitment slot(s) currently available."
-                    }
-                }
-            }
-            PlayerSelect {
-                roster: roster.clone(),
-                placeholder: "-- converter (Cult Leader) --",
-                on_change: move |e: FormEvent| {
-                    convert_converter.set(e.value().parse().ok());
-                    convert_armed.set(false);
-                },
-            }
-            PlayerSelect {
-                roster: roster.clone(),
-                placeholder: "-- target --",
-                on_change: move |e: FormEvent| {
-                    convert_target.set(e.value().parse().ok());
-                    convert_armed.set(false);
-                },
-            }
-            button {
-                disabled: convert_converter().is_none() || convert_target().is_none(),
-                onclick: move |_| {
-                    let (Some(converter), Some(target)) = (convert_converter(), convert_target())
-                    else {
-                        return;
-                    };
-                    if !convert_armed() {
-                        convert_armed.set(true);
-                        return;
-                    }
-                    do_cmd(Command::Convert {
-                        converter: PlayerId(converter),
-                        target: PlayerId(target),
-                    });
-                    convert_armed.set(false);
-                    convert_converter.set(None);
-                    convert_target.set(None);
-                },
-                if convert_armed() { "Confirm convert -- click again" } else { "Convert" }
             }
         }
         div {
