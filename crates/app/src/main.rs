@@ -596,13 +596,17 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
 
 // --- /play -----------------------------------------------------------------
 
-/// The three screens a player sees once the game has actually started
-/// (`raffle_closed`) -- before that, `Play` is a single "Character
-/// Creation" screen instead, since there's no round/game state yet worth
-/// splitting into tabs. Grouped by subject rather than by game phase so
-/// the tab a player wants is always the same one, round after round:
-/// "who am I" (Character), "what do I need to do right now" (Round), and
-/// "what's happening across the whole game" (Game).
+/// The three screens a player sees once they've finished Character
+/// Creation (submitted a bio) -- a simplified pre-game version once a bio
+/// exists but `raffle_closed` is still false (Character shows the
+/// submitted bio read-only, Round just says "waiting for the game to
+/// start," Game is the same as always), then the real thing once
+/// `raffle_closed` flips true. Before a bio's even submitted, `Play` is a
+/// single Character Creation form instead, with no tabs at all. Grouped by
+/// subject rather than by game phase so the tab a player wants is always
+/// the same one, round after round: "who am I" (Character), "what do I
+/// need to do right now" (Round), and "what's happening across the whole
+/// game" (Game).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PlayTab {
     Character,
@@ -677,11 +681,10 @@ fn Play() -> Element {
     // with nothing to actually press or hold. Once tripped, stays revealed
     // for the rest of the game -- there's no reason to re-hide it.
     let mut revealed = use_signal(|| false);
-    // Which of the three post-game-start screens is showing. Only
-    // meaningful once the game's actually started (see `PlayTab`'s own
-    // doc comment) -- pre-game there's nothing yet worth splitting into
-    // Round/Game tabs, so that phase stays a single "Character Creation"
-    // screen instead.
+    // Which of the three tabs is showing -- meaningful once a bio's been
+    // submitted (see `PlayTab`'s own doc comment for the pre-game vs.
+    // post-game version of each); before that, `Play` shows a single
+    // Character Creation form instead, with no tabs at all.
     let mut active_tab = use_signal(|| PlayTab::Character);
 
     let mut do_join = move || {
@@ -734,77 +737,65 @@ fn Play() -> Element {
         .iter()
         .any(|r| r.id == id && r.status == PlayerStatus::CastOut);
 
+    // Shared by both the pre-game tabbed screen and the real post-game one
+    // -- neither the tab buttons themselves nor which one's active depend
+    // on whether the game's actually started, only `active_tab` (a plain
+    // `Copy` `Signal`), so this is safe to build once and splice into
+    // whichever of the two mutually-exclusive branches below actually
+    // renders, the same "build once, used in exactly one branch" shape
+    // `AbilityPanel`'s own `target_picker` already uses.
+    let tab_nav = rsx! {
+        div {
+            class: "tab-nav",
+            button {
+                class: if active_tab() == PlayTab::Character { "tab-active" },
+                onclick: move |_| active_tab.set(PlayTab::Character),
+                "Character",
+            }
+            button {
+                class: if active_tab() == PlayTab::Round { "tab-active" },
+                onclick: move |_| active_tab.set(PlayTab::Round),
+                "Round",
+            }
+            button {
+                class: if active_tab() == PlayTab::Game { "tab-active" },
+                onclick: move |_| active_tab.set(PlayTab::Game),
+                "Game",
+            }
+        }
+    };
+
     rsx! {
         h1 { "Murder Mystery 2026" }
         if let Some(e) = error() {
             p { class: "error-text", "{e}" }
         }
-        p { "Round: {v.current_round:?}" }
-        TimerDisplay { remaining_secs: timer() }
-        if let Some(faction) = v.own_faction {
-            if faction == Faction::Unassigned {
-                p { "Waiting for setup to finish..." }
-            } else if revealed() {
-                p {
-                    "Your faction: {faction:?}"
-                    if let Some(c) = v.own_character {
-                        " -- {character_label(c)}"
+        if v.raffle_closed {
+            p { "Round: {v.current_round:?}" }
+            TimerDisplay { remaining_secs: timer() }
+            if let Some(faction) = v.own_faction {
+                if faction == Faction::Unassigned {
+                    p { "Waiting for setup to finish..." }
+                } else if revealed() {
+                    p {
+                        "Your faction: {faction:?}"
+                        if let Some(c) = v.own_character {
+                            " -- {character_label(c)}"
+                        }
+                    }
+                } else {
+                    div {
+                        class: "reveal-gate",
+                        p { "Your character is ready. Press and hold below to reveal it -- just to you." }
+                        button {
+                            onclick: move |_| revealed.set(true),
+                            "Press and hold to reveal"
+                        }
                     }
                 }
-            } else {
-                div {
-                    class: "reveal-gate",
-                    p { "Your character is ready. Press and hold below to reveal it -- just to you." }
-                    button {
-                        onclick: move |_| revealed.set(true),
-                        "Press and hold to reveal"
-                    }
-                }
             }
-        }
-        FinaleCastOutReveal { reveal: v.finale_cast_out_reveal.clone(), heading_level: 4u8 }
-        if !v.raffle_closed {
-            // rules.md §1's "Character creation" -- a new player's very
-            // first task, before there's any round/game state worth
-            // showing. Servants never reach this branch (they only ever
-            // join once `raffle_closed` is already true), so there's no
-            // "how involved do you want to be" or "create your character"
-            // prompt for them at all -- both are meaningless once the
-            // raffle they'd feed into has already run.
-            div {
-                h2 { "Character Creation" }
-                p { "Welcome! The game hasn't started yet -- rate how involved you'd like to be, then create your character below." }
-                InterestLevelForm {
-                    my_id: id,
-                    own_interest_level: v.own_interest_level,
-                    on_command: send_cmd,
-                }
-                BioForm {
-                    my_id: id,
-                    own_bio: v.own_bio.clone(),
-                    locked: false,
-                    on_command: send_cmd,
-                }
-            }
-        } else {
-            div {
-                class: "tab-nav",
-                button {
-                    class: if active_tab() == PlayTab::Character { "tab-active" },
-                    onclick: move |_| active_tab.set(PlayTab::Character),
-                    "Character",
-                }
-                button {
-                    class: if active_tab() == PlayTab::Round { "tab-active" },
-                    onclick: move |_| active_tab.set(PlayTab::Round),
-                    "Round",
-                }
-                button {
-                    class: if active_tab() == PlayTab::Game { "tab-active" },
-                    onclick: move |_| active_tab.set(PlayTab::Game),
-                    "Game",
-                }
-            }
+            FinaleCastOutReveal { reveal: v.finale_cast_out_reveal.clone(), heading_level: 4u8 }
+            {tab_nav}
             if active_tab() == PlayTab::Character {
                 if is_servant {
                     div {
@@ -970,6 +961,80 @@ fn Play() -> Element {
                 }
                 WhistledownPosts { posts: v.whistledown.clone(), heading_level: 4u8 }
                 RosterList { roster: v.roster.clone() }
+            }
+        } else if v.own_bio.is_some() {
+            // Character Creation is done (a bio's been submitted) but the
+            // game hasn't started yet -- Dalton's own explicit instruction:
+            // no "Round: One"/"waiting for setup" noise here, just a
+            // simplified version of the same three-tab shape the real
+            // post-game screen uses, so the transition into the game once
+            // setup finalizes doesn't relocate anything a player's already
+            // gotten used to finding.
+            {tab_nav}
+            if active_tab() == PlayTab::Character {
+                if let Some(level) = v.own_interest_level {
+                    p { "Your interest level: {level}" }
+                }
+                BioForm {
+                    my_id: id,
+                    own_bio: v.own_bio.clone(),
+                    locked: true,
+                    on_command: send_cmd,
+                }
+            }
+            if active_tab() == PlayTab::Round {
+                p { "Waiting for the game to start." }
+            }
+            if active_tab() == PlayTab::Game {
+                div {
+                    h4 { "Intermission" }
+                    if let Some(entrants) = &v.intermission_entrants {
+                        p { "Entrants: {names(entrants, &v.roster)}" }
+                    } else if v.i_opted_into_intermission {
+                        p { "You're in the pool. Entrants haven't been drawn yet." }
+                    } else {
+                        button {
+                            onclick: move |_| send_cmd(Command::OptIntoIntermission { player: id }),
+                            "Opt into the Intermission lottery",
+                        }
+                    }
+                }
+                if !v.servant_leaderboard.is_empty() {
+                    div {
+                        h4 { "Servant leaderboard" }
+                        ul {
+                            for (pid , points) in v.servant_leaderboard.clone() {
+                                li { key: "{pid.0}", "{names(&[pid], &v.roster)}: {points}" }
+                            }
+                        }
+                    }
+                }
+                WhistledownPosts { posts: v.whistledown.clone(), heading_level: 4u8 }
+                RosterList { roster: v.roster.clone() }
+            }
+        } else {
+            // rules.md §1's "Character creation" -- a new player's very
+            // first task, before there's any round/game state worth
+            // showing. Servants never reach this branch (they only ever
+            // join once `raffle_closed` is already true, which routes them
+            // into the first branch above instead), so there's no "how
+            // involved do you want to be" or "create your character"
+            // prompt for them at all -- both are meaningless once the
+            // raffle they'd feed into has already run.
+            div {
+                h2 { "Character Creation" }
+                p { "Welcome! The game hasn't started yet -- rate how involved you'd like to be, then create your character below." }
+                InterestLevelForm {
+                    my_id: id,
+                    own_interest_level: v.own_interest_level,
+                    on_command: send_cmd,
+                }
+                BioForm {
+                    my_id: id,
+                    own_bio: v.own_bio.clone(),
+                    locked: false,
+                    on_command: send_cmd,
+                }
             }
         }
     }
