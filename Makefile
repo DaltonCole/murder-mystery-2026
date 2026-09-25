@@ -1,9 +1,9 @@
-# -include (not include) so a missing `.env` is silently fine. Nothing reads
-# it yet -- there's no deployment secret in this app today -- but it's ready
-# for when the host console needs a password (see the implementation plan's
-# "Networking, Realtime, and Authorization" section) without every command
-# needing it retyped on the command line, matching the game-changer project's
-# convention.
+# -include (not include) so a missing `.env` is silently fine. Set
+# HOST_PASSWORD here before a real event -- `game_server::check_host_password`
+# reads it to gate /host, and is WIDE OPEN (accepts any passphrase) if it's
+# unset (main() prints a startup warning to this same terminal when that's
+# the case). Loading it via `.env` avoids retyping it on the command line
+# every time, matching the game-changer project's convention.
 -include .env
 
 PORT ?= 8080

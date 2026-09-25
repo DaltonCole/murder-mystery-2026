@@ -2223,8 +2223,15 @@ fn award_servant_points(
     if !is_servant(p) {
         return Err(GameError::NotAServant(player));
     }
+    // `saturating_add`, not `+=` -- `points` is a plain client-suppliable
+    // `u32` with no range check the way `SubmitInterestLevel`'s sibling
+    // field has (there's no natural upper bound on a Servant point award
+    // the way there is for a 1-10 interest rating), so an adversarial or
+    // simply mistaken huge value must degrade to "capped," never overflow
+    // and panic this connection's task (`overflow-checks` is on in the
+    // `dev` profile this app actually ships as -- see the Makefile).
     let total = state.servant_points.entry(player).or_insert(0);
-    *total += points;
+    *total = total.saturating_add(points);
     let total = *total;
     Ok(vec![DomainEvent::ServantPointsAwarded {
         player,
@@ -10764,6 +10771,38 @@ mod tests {
             DomainEvent::ServantPointsAwarded { total: 5, .. }
         ));
         assert_eq!(state.servant_leaderboard(), vec![(player, 5)]);
+    }
+
+    #[test]
+    fn award_servant_points_saturates_instead_of_overflow_panicking() {
+        // Reliability regression: `points` has no range check the way
+        // `SubmitInterestLevel`'s sibling `u8` field does, and this app
+        // ships as a `dev`-profile build (overflow-checks on) -- a plain
+        // `+=` near `u32::MAX` would panic this connection's task instead
+        // of just capping the total.
+        let mut state = GameState::new();
+        let player = add_player(&mut state, "Servant", Faction::Servant);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(
+            &mut state,
+            Command::AwardServantPoints {
+                player,
+                points: u32::MAX - 1,
+            },
+        )
+        .unwrap();
+        let events = apply_command(
+            &mut state,
+            Command::AwardServantPoints { player, points: 5 },
+        )
+        .unwrap();
+        assert!(matches!(
+            &events[0],
+            DomainEvent::ServantPointsAwarded {
+                total: u32::MAX,
+                ..
+            }
+        ));
     }
 
     fn setup_at_finale_with_open_denouncement() -> (GameState, PlayerId) {

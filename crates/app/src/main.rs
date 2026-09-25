@@ -9,28 +9,52 @@
 //!
 //! KNOWN GAP, not an oversight: there is no session/auth layer yet, and
 //! it's broader than just view privacy. `game_ws` accepts any `ClientMsg`
-//! from any connection with no identity check at all:
-//! - `Watch(Viewer::Player(id))` lets a crafted client read any player's
-//!   private view. This UI never sends that itself -- a fresh `/play`
-//!   connection only ever watches the id its own `Join` call just
-//!   received -- but nothing stops a deliberately crafted client from
-//!   doing so.
+//! from any connection with no identity check at all -- `HostLogin`
+//! (`check_host_password`) is the one exception in name only: it gates
+//! nothing else here, it's purely a reply to that one message, so every
+//! other arm below runs identically whether or not a connection ever logs
+//! in. A security review (2026-09-25) confirmed and enumerated the full
+//! reachable surface, worse than this comment's original scope:
+//! - `ViewPlayer(Some(id))` is the single worst item: a silent,
+//!   zero-interaction dump of any player's ENTIRE private `PlayerView`
+//!   (true faction, character, bio, ability status, info-check results) --
+//!   no game participation needed at all, just a raw websocket connection
+//!   and a guessed `PlayerId` (a plain sequential `u32`, trivial to
+//!   enumerate). This UI never sends it itself except from an
+//!   already-logged-in `/host` tab, but nothing enforces that server-side.
+//! - `Watch(Viewer::Player(id))` (and `Viewer::Host`/`Viewer::Display`) lets
+//!   a crafted client read any view directly, the same way. This UI never
+//!   sends `Watch(Viewer::Player(id))` itself -- a fresh `/play` connection
+//!   only ever watches the id its own `Join` call just received -- but
+//!   nothing stops a deliberately crafted client from doing so.
 //! - `Do(Command)` goes further: since commands like `CastBallot`,
-//!   `Nominate`, and `AttemptTask` carry the acting player's id as a plain
-//!   field with nothing tying it to the sending connection, any client can
-//!   impersonate *any* player's writes, not just reads -- vote as someone
-//!   else, submit fake task attempts.
-//! - Every host-only command (`AddPlayer`, `FinalizeSetup`,
-//!   `AdvanceRound`, `OpenDenouncement`, `CloseNomination`, `OpenBallot`,
-//!   `CloseBallot`, `CloseRunoff`, `PushTask`, `CloseTasks`) can be issued
-//!   from a raw connection to `/api/ws` regardless of which route it came
-//!   through -- nothing distinguishes a Host console's socket from a
-//!   Player's. The same is true of the two host-only `ClientMsg` variants
-//!   that aren't plain `Command`s either (`RunRaffle`, `PushLocationTask`).
+//!   `Nominate`, `AttemptTask`, and `TransferKingQueen` carry the acting
+//!   player's id as a plain field with nothing tying it to the sending
+//!   connection, any client can impersonate *any* player's writes, not
+//!   just reads -- vote as someone else, submit fake task attempts, or (in
+//!   combination with the `ViewPlayer` leak above to first find out who
+//!   holds the crown) force the King/Queen's once-per-game transfer
+//!   without them.
+//! - Every host-only command reachable through `Do(Command)` (`AddPlayer`,
+//!   `FinalizeSetup`, `AdvanceRound`, `OpenDenouncement`,
+//!   `CloseNomination`, `OpenBallot`, `CloseBallot`, `CloseRunoff`,
+//!   `PushTask`, `CloseTasks`, `AssignFaction`, `AssignCharacter`,
+//!   `CastOut`, `RecordContestResult`, `ResolveGalleryPredictions`,
+//!   `AwardServantPoints`, `DrawIntermissionEntrants` (also a plain
+//!   `Command`, letting a caller hand-pick the "random" Intermission
+//!   entrants directly), ...) can be issued from a raw connection to
+//!   `/api/ws` regardless of which route it came through -- nothing
+//!   distinguishes a Host console's socket from a Player's. The same is
+//!   true of every host-only `ClientMsg` variant that isn't a plain
+//!   `Command` either (`RunRaffle`, `PushLocationTask`,
+//!   `DrawIntermissionEntrants`, `StartRoundOne`, `StartTimer`,
+//!   `AddTimerSeconds`, `ClearTimer`, `ViewPlayer`).
 //!
-//! Real per-player join tokens and a real Host credential (see the plan's
+//! Real per-player join tokens and a real Host credential enforced on every
+//! message server-side (not just the `HostLogin` reply and the Host UI's
+//! own choice not to render controls before it succeeds -- see the plan's
 //! "Session" section) must land before this runs at a real event over
-//! shared WiFi.
+//! shared WiFi with guests who aren't fully trusted.
 //!
 //! SECOND KNOWN GAP: no reconnect story. Every route's `use_websocket` call
 //! uses a plain `WebSocketOptions::new()`, not
@@ -70,6 +94,20 @@ enum Route {
 }
 
 fn main() {
+    // A reliability review found `check_host_password` is silently wide
+    // open (accepts any password, including "") whenever `HOST_PASSWORD`
+    // isn't set -- a reasonable default for local dev (see that function's
+    // own doc comment), but there was previously nothing to stop that from
+    // being the state at a real event too, if it's just forgotten. This is
+    // the one moment guaranteed to reach a terminal the host is actually
+    // looking at, right before `make run`'s own "give players this URL"
+    // line -- printed only on the server binary, never the WASM client.
+    #[cfg(feature = "server")]
+    if std::env::var("HOST_PASSWORD").is_err() {
+        eprintln!(
+            "WARNING: HOST_PASSWORD is not set -- the Host console at /host will accept ANY passphrase, including a blank one. Set HOST_PASSWORD before a real event."
+        );
+    }
     dioxus::launch(App);
 }
 
