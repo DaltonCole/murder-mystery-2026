@@ -519,6 +519,35 @@ fn auto_close_denouncement_phase(state: &mut GameState) -> Vec<DomainEvent> {
     }
 }
 
+/// Closes every currently-open task (via `Command::CloseTasks`) the
+/// instant a Denouncement opens -- Dalton's own explicit instruction:
+/// "once denouncement has started, remove the tasks from the player
+/// screen and close the tasks. Any incomplete tasks are considered failed
+/// tasks." `CloseTasks` already makes closed tasks disappear from every
+/// player's `open_tasks` (see `engine::view`'s own tests), and a
+/// never-attempted task was already treated identically to an
+/// explicitly-failed one everywhere that matters (e.g.
+/// `ton_met_task_threshold`'s Leader's Confidants trigger) -- so this is
+/// purely the missing automation, not a new engine rule. `CloseTasks` is
+/// already a safe no-op when nothing is open (see its own doc comment), so
+/// this never needs to check first.
+///
+/// Triggered by scanning `events` (whatever command was just applied) for
+/// `DomainEvent::DenouncementOpened` -- same shape as
+/// `auto_push_on_round_advance`.
+fn auto_close_tasks_on_denouncement_open(
+    state: &mut GameState,
+    events: &[DomainEvent],
+) -> Vec<DomainEvent> {
+    if !events
+        .iter()
+        .any(|e| matches!(e, DomainEvent::DenouncementOpened))
+    {
+        return Vec::new();
+    }
+    apply_command(state, Command::CloseTasks).unwrap_or_default()
+}
+
 /// Applies one command against the single canonical `GameState`, holding
 /// the lock only for the mutation itself. The only place in the whole app
 /// allowed to call `engine::apply_command` -- every route-driven mutation
@@ -534,6 +563,7 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let auto_events = auto_push_on_round_advance(&mut state, &events, &mut pushed);
         events.extend(auto_events);
+        events.extend(auto_close_tasks_on_denouncement_open(&mut state, &events));
         events.extend(auto_close_denouncement_phase(&mut state));
     }
     // Errors here just mean nobody's subscribed right now -- fine to
