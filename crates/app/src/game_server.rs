@@ -326,6 +326,37 @@ pub fn start_round_one() -> Result<Vec<DomainEvent>, String> {
     Ok(events)
 }
 
+/// Transfers the crown from `player` (the current King/Queen) to a
+/// randomly-chosen eligible Ton player -- rules.md §3.1: "the title
+/// passes to a random remaining Ton player." Not a plain `Command` --
+/// unlike the rest of `AbilityPanel`, this ability has no target picker at
+/// all on `/play`: rules.md gives the King/Queen no say in who receives
+/// it, so there's nothing for the player to choose, and this is where the
+/// one genuinely random step actually happens (the engine's own
+/// `Command::TransferKingQueen` still takes a concrete `new_holder` and
+/// validates it -- `GameState::eligible_king_queen_successors` is the
+/// public pool this picks from, so the choice can't drift from what the
+/// engine would actually accept).
+pub fn transfer_king_queen_randomly(player: PlayerId) -> Result<Vec<DomainEvent>, String> {
+    let events;
+    {
+        let mut state = lock_state();
+        let mut candidates = state.eligible_king_queen_successors();
+        if candidates.is_empty() {
+            return Err("no eligible Ton player to receive the crown".to_string());
+        }
+        candidates.shuffle(&mut rand::rng());
+        let new_holder = candidates[0];
+        events = apply_command(
+            &mut state,
+            Command::TransferKingQueen { player, new_holder },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let _ = server().changed.send(());
+    Ok(events)
+}
+
 /// Every currently-active player who could still nominate/vote this round
 /// -- excludes anyone drunk this round (rules.md: a drunk player "can't
 /// nominate or vote" at all, so waiting on one would mean the phase could

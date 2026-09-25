@@ -182,6 +182,12 @@ enum ClientMsg {
     /// `/host` only: attempts to log in with this passphrase. See
     /// `game_server::check_host_password`'s doc comment.
     HostLogin { password: String },
+    /// `/play` only, the King/Queen's crown-transfer ability: not a plain
+    /// `Command` -- rules.md gives the King/Queen no say in who receives
+    /// the crown ("a random remaining Ton player"), so there's no target
+    /// for the client to supply at all. See
+    /// `game_server::transfer_king_queen_randomly`'s doc comment.
+    TransferKingQueen { player: PlayerId },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,6 +359,9 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                 .await
                                 .is_ok()
                         }
+                        ClientMsg::TransferKingQueen { player } => {
+                            respond!(game_server::transfer_king_queen_randomly(player))
+                        }
                     };
                     if !sent_ok {
                         break;
@@ -436,6 +445,17 @@ fn Play() -> Element {
         error.set(None);
         spawn(async move {
             let _ = socket.send(ClientMsg::Do(cmd)).await;
+        });
+    };
+
+    // Not a plain `Command` -- the King/Queen's crown transfer picks its
+    // own random target server-side (rules.md: "a random remaining Ton
+    // player"), so there's no target for this player to supply at all.
+    let mut transfer_king_queen = move |player: PlayerId| {
+        let socket = socket;
+        error.set(None);
+        spawn(async move {
+            let _ = socket.send(ClientMsg::TransferKingQueen { player }).await;
         });
     };
 
@@ -623,6 +643,7 @@ fn Play() -> Element {
                         known_uprising_members: v.known_uprising_members.clone(),
                         roster: v.roster.clone(),
                         on_command: send_cmd,
+                        on_transfer_king_queen: move |()| transfer_king_queen(id),
                     }
                 }
             }
@@ -1079,6 +1100,10 @@ fn AbilityPanel(
     known_uprising_members: Vec<PlayerId>,
     roster: Vec<RosterEntry>,
     on_command: EventHandler<Command>,
+    /// King/Queen only: fires the crown transfer, which the server resolves
+    /// to a random eligible Ton player -- see `ClientMsg::TransferKingQueen`'s
+    /// doc comment for why this bypasses the generic `on_command` path.
+    on_transfer_king_queen: EventHandler<()>,
 ) -> Element {
     let Some(character) = own_character else {
         return rsx! {};
@@ -1346,19 +1371,14 @@ fn AbilityPanel(
                 Character::KingQueen => rsx! {
                     p {
                         if abilities.king_queen_transfer_available.unwrap_or(false) {
-                            "You may transfer the crown once, before Round 5, to another eligible Ton player -- unmasking both of you."
+                            "You may transfer the crown once, before Round 5 -- to a random eligible Ton player, unmasking both of you."
                         } else {
                             "Transfer already used, or it's Round 5 or later."
                         }
                     }
-                    {target_picker}
                     button {
-                        disabled: !abilities.king_queen_transfer_available.unwrap_or(false) || target().is_none(),
-                        onclick: move |_| {
-                            let Some(t) = target() else { return };
-                            on_command
-                                .call(Command::TransferKingQueen { player: my_id, new_holder: PlayerId(t) });
-                        },
+                        disabled: !abilities.king_queen_transfer_available.unwrap_or(false),
+                        onclick: move |_| on_transfer_king_queen.call(()),
                         "Transfer the crown",
                     }
                 },
@@ -1640,7 +1660,7 @@ fn character_flavor(character: Character) -> &'static str {
 /// did.
 fn ability_description(character: Character) -> &'static str {
     match character {
-        Character::KingQueen => "Once per game, before Round 5, you may transfer the crown to another eligible Ton player -- unmasking you both.",
+        Character::KingQueen => "Once per game, before Round 5, you may transfer the crown to a random remaining Ton player -- unmasking you both.",
         Character::PrincePrincess => "You automatically learn the King/Queen's identity once Round 3 begins -- no action needed.",
         Character::RevolutionaryLeader => "At any time, you may secretly pre-designate a successor. If you're Cast Out with nobody chosen, succession defaults to a random remaining Uprising member.",
         Character::CultLeader => "Before each recruitment window, you may query one candidate -- are they Ton-aligned, or are they the Revolutionary Leader? You also designate which recruited Cultist holds the Deceiver title.",

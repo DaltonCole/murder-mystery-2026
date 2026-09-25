@@ -374,6 +374,26 @@ impl GameState {
         self.king_queen
     }
 
+    /// Every currently-active, untitled Ton player eligible to receive the
+    /// crown via `Command::TransferKingQueen` -- the exact same
+    /// eligibility `transfer_king_queen` itself validates against
+    /// (`is_eligible_titleholder`), exposed publicly so a caller can pick
+    /// one (rules.md §3.1: "the title passes to a random remaining Ton
+    /// player" -- see `game_server::transfer_king_queen_randomly`, the
+    /// only real source of randomness this needs) without duplicating, or
+    /// risking drifting from, that validation logic. Empty if there's no
+    /// current King/Queen at all (shouldn't happen once the game's
+    /// started, but this is a plain read, not a place to panic over it).
+    pub fn eligible_king_queen_successors(&self) -> Vec<PlayerId> {
+        let Some(current) = self.king_queen else {
+            return Vec::new();
+        };
+        self.players()
+            .filter(|p| is_eligible_titleholder(self, p.id, Faction::Ton, current))
+            .map(|p| p.id)
+            .collect()
+    }
+
     // Not read anywhere in win_condition.rs (Prince/Princess doesn't gate
     // any win condition) -- exercised by the cascade tests below, and
     // expected to gain a real caller once view_for/the host UI surfaces
@@ -4010,6 +4030,29 @@ mod tests {
         assert_eq!(
             state.player(king_queen).unwrap().character,
             Some(Character::NormalTon)
+        );
+    }
+
+    #[test]
+    fn eligible_king_queen_successors_lists_active_untitled_ton_players_only() {
+        let (mut state, king_queen, prince, _leader, _cult_leader) = setup_full_game();
+        let extra_ton = add_player(&mut state, "ExtraTon", Faction::Ton);
+        let extra_uprising = add_player(&mut state, "ExtraUprising", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+
+        let eligible = state.eligible_king_queen_successors();
+        assert!(eligible.contains(&extra_ton));
+        assert!(
+            !eligible.contains(&king_queen),
+            "the current holder can't be their own successor"
+        );
+        assert!(
+            !eligible.contains(&prince),
+            "an already-titled Ton player (Prince/Princess) isn't eligible"
+        );
+        assert!(
+            !eligible.contains(&extra_uprising),
+            "wrong faction entirely"
         );
     }
 
