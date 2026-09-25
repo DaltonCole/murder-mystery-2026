@@ -227,6 +227,15 @@ strong {
   margin: 0.5rem 0;
 }
 
+/* The Host console's role-reference page (`RoleReference`) -- one boxed
+ * entry per character so a long list of flavor/ability text stays easy to
+ * visually scan while collapsed sections stay closed by default. */
+.role-reference-entry {
+  border-left: 3px solid var(--color-accent);
+  padding: 0.4rem 0.8rem;
+  margin: 0.5rem 0;
+}
+
 /* rules.md §6's private martyrdom message -- a deliberately somber,
  * different color from Whistledown's lighter gossip-column tone. */
 .martyrdom-message {

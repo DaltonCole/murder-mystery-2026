@@ -244,6 +244,13 @@ pub struct PlayerView {
     /// the Convert panel (`AbilityStatus::recruitment_slots_available`'s
     /// own doc comment names exactly this gap).
     pub recruitment_slots_available_for_host: Option<usize>,
+    /// Every distinct `Character` currently held by at least one player --
+    /// `Viewer::Host` ONLY, always empty for `Viewer::Player`/
+    /// `Viewer::Display`. See `GameState::assigned_characters`'s doc
+    /// comment: this is "has this role been given out" only, never "to
+    /// whom" -- the Host's role-reference page and manual assignment flow
+    /// both need the former without the latter.
+    pub assigned_characters: Vec<Character>,
 }
 
 /// The single read path for the whole engine. Every field on the returned
@@ -384,6 +391,11 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     } else {
         None
     };
+    let assigned_characters = if is_host {
+        state.assigned_characters()
+    } else {
+        Vec::new()
+    };
 
     PlayerView {
         roster,
@@ -416,6 +428,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         martyrdom_message,
         raffle_closed: state.raffle_closed(),
         recruitment_slots_available_for_host,
+        assigned_characters,
     }
 }
 
@@ -2038,6 +2051,51 @@ mod tests {
             view_for(&state, Viewer::Display).recruitment_slots_available_for_host,
             None
         );
+    }
+
+    #[test]
+    fn assigned_characters_are_visible_to_the_host_only() {
+        let mut state = GameState::new();
+        let alice = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Alice".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+        apply_command(
+            &mut state,
+            Command::AssignFaction {
+                player: alice,
+                faction: Faction::Ton,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::AssignCharacter {
+                player: alice,
+                character: Character::KingQueen,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            view_for(&state, Viewer::Host).assigned_characters,
+            vec![Character::KingQueen]
+        );
+        assert!(view_for(&state, Viewer::Player(alice))
+            .assigned_characters
+            .is_empty());
+        assert!(view_for(&state, Viewer::Display)
+            .assigned_characters
+            .is_empty());
     }
 
     #[test]

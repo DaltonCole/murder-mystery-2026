@@ -1944,6 +1944,94 @@ fn PlayerPageReadOnly(id: PlayerId, v: PlayerView) -> Element {
     }
 }
 
+/// Every named `Character`, grouped by the faction the engine's own
+/// (private) `required_faction` requires for it -- mirrors that match
+/// exactly, duplicated here since `engine` has no public "every character
+/// in this faction" accessor to reuse instead. `NormalTon`/
+/// `NormalUprising`/`Cultist` close out each of their factions' lists --
+/// unlike the rest, many players can hold these at once.
+const TON_CHARACTERS: &[Character] = &[
+    Character::KingQueen,
+    Character::PrincePrincess,
+    Character::Oracle,
+    Character::Almanac,
+    Character::PriestPriestess,
+    Character::PotionMaker,
+    Character::Magistrate,
+    Character::Duelist,
+    Character::GrandInquisitor,
+    Character::NormalTon,
+];
+const UPRISING_CHARACTERS: &[Character] = &[
+    Character::RevolutionaryLeader,
+    Character::Spymaster,
+    Character::Bartender,
+    Character::DoctorMedic,
+    Character::Firebrand,
+    Character::CellLeader,
+    Character::Agitator,
+    Character::NormalUprising,
+];
+const CULT_CHARACTERS: &[Character] = &[
+    Character::CultLeader,
+    Character::Deceiver,
+    Character::Cultist,
+];
+
+/// `character_label` reads oddly for the 3 generic catch-all roles on this
+/// page specifically ("Ton" right under a "Ton" faction heading) -- everywhere
+/// else that label appears next to a specific player's own reveal, where the
+/// faction is already obvious from context and doesn't need repeating.
+fn role_reference_label(c: Character) -> &'static str {
+    match c {
+        Character::NormalTon => "Normal Ton member",
+        Character::NormalUprising => "Normal Uprising member",
+        Character::Cultist => "Cultist (unnamed recruit)",
+        other => character_label(other),
+    }
+}
+
+/// Host-only role compendium: every character in the game, assigned or not,
+/// with its flavor text and ability description -- a setup-time reference
+/// (what does each role actually do, have I already handed this one out)
+/// and a narration aid during the night. Shows only whether a role has
+/// been given to *someone* (`assigned`, from
+/// `GameState::assigned_characters`), never who -- rules.md's own framing
+/// never gives the Host an ambient view of who's who, and this page isn't
+/// the deliberate, scoped exception the Finale reveal is.
+#[component]
+fn RoleReference(assigned: Vec<Character>) -> Element {
+    let groups: [(Faction, &[Character]); 3] = [
+        (Faction::Ton, TON_CHARACTERS),
+        (Faction::Uprising, UPRISING_CHARACTERS),
+        (Faction::Cult, CULT_CHARACTERS),
+    ];
+    rsx! {
+        div { class: "role-reference",
+            for (faction , characters) in groups {
+                div {
+                    key: "{faction:?}",
+                    h4 { "{faction:?}" }
+                    p { style: "font-style:italic;", "{faction_flavor(faction)}" }
+                    for c in characters.iter().copied() {
+                        div {
+                            key: "{role_reference_label(c)}",
+                            class: "role-reference-entry",
+                            p {
+                                strong { "{role_reference_label(c)}" }
+                                " -- "
+                                if assigned.contains(&c) { "Assigned" } else { "Not yet assigned" }
+                            }
+                            p { "{character_flavor(c)}" }
+                            p { "{ability_description(c)}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn TaskAttemptForm(
     my_id: PlayerId,
@@ -2213,6 +2301,10 @@ fn Host() -> Element {
     // just so the panel knows whose name to show and which `<select>` option
     // to keep highlighted; the id itself never leaves this browser tab.
     let mut viewed_player_id = use_signal(|| None::<u32>);
+    // Collapsed by default -- the role reference is long (21 roles' worth
+    // of flavor + ability text), and most of the Host console's other
+    // panels are things Dalton needs open at a glance during live play.
+    let mut show_role_reference = use_signal(|| false);
     let mut new_name = use_signal(String::new);
     let mut faction_player = use_signal(|| None::<u32>);
     let mut faction_choice = use_signal(|| Faction::Ton);
@@ -2266,6 +2358,7 @@ fn Host() -> Element {
     let roster = view().map(|v| v.roster).unwrap_or_default();
     let interest_levels = view().map(|v| v.interest_levels).unwrap_or_default();
     let raffle_closed = view().map(|v| v.raffle_closed).unwrap_or(false);
+    let assigned_characters = view().map(|v| v.assigned_characters).unwrap_or_default();
     let recruitment_slots_available_for_host =
         view().and_then(|v| v.recruitment_slots_available_for_host);
     let denouncement_phase = view().and_then(|v| v.denouncement);
@@ -2489,6 +2582,17 @@ fn Host() -> Element {
                 }
             }
             button { onclick: move |_| do_cmd(Command::FinalizeSetup), "Finalize setup" }
+        }
+        div {
+            h3 { "Role reference" }
+            p { "Every role in the game, assigned or not, with its flavor text and ability -- doesn't say who holds an assigned role, just that someone does." }
+            button {
+                onclick: move |_| show_role_reference.set(!show_role_reference()),
+                if show_role_reference() { "Hide role reference" } else { "Show role reference" }
+            }
+            if show_role_reference() {
+                RoleReference { assigned: assigned_characters.clone() }
+            }
         }
         div {
             h3 { "Round" }

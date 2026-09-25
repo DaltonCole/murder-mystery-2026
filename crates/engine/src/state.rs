@@ -374,6 +374,27 @@ impl GameState {
         self.king_queen
     }
 
+    /// Every distinct `Character` currently held by at least one player
+    /// (any status -- Cast Out or converted doesn't un-assign a role, see
+    /// `Player::character`'s own doc comment), with no indication of which
+    /// player holds which. `Viewer::Host` only (see `view_for`) -- this is
+    /// deliberately weaker than the finale's full reveal: it answers "has
+    /// this role been given out yet," which the Host's manual
+    /// `AssignCharacter` flow and a role-reference page both need, without
+    /// exposing the same ambient "who is who" the game's own design
+    /// otherwise withholds from the Host until the Finale.
+    pub fn assigned_characters(&self) -> Vec<Character> {
+        let mut assigned = Vec::new();
+        for p in self.players() {
+            if let Some(c) = p.character {
+                if !assigned.contains(&c) {
+                    assigned.push(c);
+                }
+            }
+        }
+        assigned
+    }
+
     /// Every currently-active, untitled Ton player eligible to receive the
     /// crown via `Command::TransferKingQueen` -- the exact same
     /// eligibility `transfer_king_queen` itself validates against
@@ -4031,6 +4052,42 @@ mod tests {
             state.player(king_queen).unwrap().character,
             Some(Character::NormalTon)
         );
+    }
+
+    #[test]
+    fn assigned_characters_lists_every_distinct_character_currently_held_with_no_holder_identity() {
+        assert_eq!(
+            GameState::new().assigned_characters(),
+            Vec::<Character>::new()
+        );
+
+        let (mut state, king_queen, ..) = setup_full_game();
+        let assigned = state.assigned_characters();
+        assert_eq!(assigned.len(), 4);
+        for c in [
+            Character::KingQueen,
+            Character::PrincePrincess,
+            Character::RevolutionaryLeader,
+            Character::CultLeader,
+        ] {
+            assert!(assigned.contains(&c), "{c:?} should show as assigned");
+        }
+        assert!(
+            !assigned.contains(&Character::Oracle),
+            "a role nobody holds yet shouldn't show as assigned"
+        );
+
+        // Casting the King/Queen out doesn't un-assign the role -- the
+        // title was still given out, Cast-Out or not.
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: king_queen,
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        assert!(state.assigned_characters().contains(&Character::KingQueen));
     }
 
     #[test]
