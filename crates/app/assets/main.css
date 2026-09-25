@@ -215,6 +215,18 @@ strong {
   padding: 1rem;
 }
 
+/* The Host console's read-only "view a player's page" panel
+ * (`PlayerPageReadOnly`) -- boxed and slightly muted so it reads as a
+ * distinct, inert snapshot rather than part of the Host's own editable
+ * controls around it. */
+.readonly-player-view {
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-accent);
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 0.5rem 0;
+}
+
 /* rules.md §6's private martyrdom message -- a deliberately somber,
  * different color from Whistledown's lighter gossip-column tone. */
 .martyrdom-message {

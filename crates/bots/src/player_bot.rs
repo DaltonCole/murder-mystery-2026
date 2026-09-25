@@ -169,6 +169,7 @@ impl PlayerBot {
                 Some(ServerMsg::LocationTaskTemplates(_)) => {}
                 Some(ServerMsg::Timer(_)) => {}
                 Some(ServerMsg::HostLoginResult { .. }) => {}
+                Some(ServerMsg::ViewedPlayer(_)) => {}
                 None => return Ok(()),
             }
         }

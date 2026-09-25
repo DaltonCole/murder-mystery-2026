@@ -188,6 +188,19 @@ enum ClientMsg {
     /// for the client to supply at all. See
     /// `game_server::transfer_king_queen_randomly`'s doc comment.
     TransferKingQueen { player: PlayerId },
+    /// `/host` only: watch a specific player's own `PlayerView` alongside
+    /// the Host's normal `Viewer::Host` view, for the Host console's
+    /// read-only "view a player's page" panel -- lets Dalton help a
+    /// confused player without walking over and touching their phone.
+    /// `Some(id)` starts/switches the subscription; `None` clears it. Not
+    /// folded into the existing `Watch` message -- a connection already
+    /// watching as `Viewer::Host` needs both views at once, not a
+    /// replacement for either. Deliberately read-only: the reply
+    /// (`ServerMsg::ViewedPlayer`) carries the same `PlayerView` that
+    /// player would see themselves, and nothing in this protocol lets a
+    /// Host connection issue a `Command` *as* that player -- see
+    /// `PlayerPageReadOnly`'s doc comment.
+    ViewPlayer(Option<PlayerId>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,12 +230,23 @@ enum ServerMsg {
     HostLoginResult {
         ok: bool,
     },
+    /// `/host` only, reply to and kept live after `ClientMsg::ViewPlayer`:
+    /// the named player's own `PlayerView`, or `None` once cleared. Kept
+    /// out of the ordinary `View` variant (which always carries the
+    /// requesting connection's own `Viewer::Host` view) so a Host
+    /// connection can hold both at once.
+    ViewedPlayer(Option<PlayerView>),
 }
 
 #[get("/api/ws")]
 async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, ServerMsg>> {
     Ok(options.on_upgrade(move |mut socket| async move {
         let mut viewer: Option<Viewer> = None;
+        // `/host` only -- see `ClientMsg::ViewPlayer`'s doc comment. Kept
+        // separate from `viewer` above (which for a Host connection stays
+        // `Some(Viewer::Host)`) so watching a player's page never replaces
+        // the Host's own view.
+        let mut viewing_player: Option<PlayerId> = None;
         let mut changed = game_server::subscribe();
 
         // `game_server::apply` broadcasts on every successful mutation, this
@@ -362,6 +386,15 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         ClientMsg::TransferKingQueen { player } => {
                             respond!(game_server::transfer_king_queen_randomly(player))
                         }
+                        ClientMsg::ViewPlayer(target) => {
+                            viewing_player = target;
+                            socket
+                                .send(ServerMsg::ViewedPlayer(
+                                    target.map(|id| game_server::view(Viewer::Player(id))),
+                                ))
+                                .await
+                                .is_ok()
+                        }
                     };
                     if !sent_ok {
                         break;
@@ -370,6 +403,15 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                 _ = changed.recv() => {
                     if let Some(v) = viewer {
                         if socket.send(ServerMsg::View(game_server::view(v))).await.is_err() {
+                            break;
+                        }
+                    }
+                    if let Some(id) = viewing_player {
+                        if socket
+                            .send(ServerMsg::ViewedPlayer(Some(game_server::view(Viewer::Player(id)))))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -431,9 +473,14 @@ fn Play() -> Element {
                 Ok(ServerMsg::View(v)) => view.set(Some(v)),
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
                 // `/play` never watches as `Viewer::Host`, and never sends
-                // `HostLogin` either -- see `ServerMsg::LocationTaskTemplates`'s
-                // doc comment for why these still have to be parseable.
-                Ok(ServerMsg::LocationTaskTemplates(_) | ServerMsg::HostLoginResult { .. }) => {}
+                // `HostLogin`/`ViewPlayer` either -- see
+                // `ServerMsg::LocationTaskTemplates`'s doc comment for why
+                // these still have to be parseable.
+                Ok(
+                    ServerMsg::LocationTaskTemplates(_)
+                    | ServerMsg::HostLoginResult { .. }
+                    | ServerMsg::ViewedPlayer(_),
+                ) => {}
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
                 Err(_) => break,
             }
@@ -1684,6 +1731,219 @@ fn ability_description(character: Character) -> &'static str {
     }
 }
 
+/// Every populated `AbilityStatus` field as a plain, human-readable line --
+/// used only by `PlayerPageReadOnly`. Generic over every character rather
+/// than a per-character match like `AbilityPanel`'s (deliberately, since
+/// this is read-only display text, not action controls -- there's no
+/// target picker or button to build per character here, just "what does
+/// the status struct currently say").
+fn ability_status_lines(status: &AbilityStatus, roster: &[RosterEntry]) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(n) = status.oracle_checks_available {
+        lines.push(format!("Oracle checks available: {n}"));
+    }
+    if let Some(b) = status.almanac_available {
+        lines.push(format!("Almanac available: {b}"));
+    }
+    if let Some(b) = status.spymaster_available {
+        lines.push(format!("Spymaster available: {b}"));
+    }
+    if let Some(n) = status.cult_leader_queries_available {
+        lines.push(format!("Cult Leader queries available: {n}"));
+    }
+    if let Some(n) = status.recruitment_slots_available {
+        lines.push(format!("Recruitment slots available: {n}"));
+    }
+    if let Some(b) = status.deceiver_armed {
+        lines.push(format!("Deceiver armed: {b}"));
+    }
+    if let Some(b) = status.deceiver_falsify_used {
+        lines.push(format!("Deceiver falsify used: {b}"));
+    }
+    if let Some(n) = status.priest_protects_available {
+        lines.push(format!("Priest/Priestess protects available: {n}"));
+    }
+    if let Some(b) = status.medic_available {
+        lines.push(format!("Medic protect available: {b}"));
+    }
+    if let Some(b) = status.bartender_available {
+        lines.push(format!("Bartender available: {b}"));
+    }
+    if let Some(b) = status.potion_maker_available {
+        lines.push(format!("Potion Maker available: {b}"));
+    }
+    if let Some(b) = status.double_vote_available {
+        lines.push(format!("Double vote available: {b}"));
+    }
+    if let Some(b) = status.vote_shield_available {
+        lines.push(format!("Vote shield available: {b}"));
+    }
+    if let Some(b) = status.duelist_available {
+        lines.push(format!("Duelist challenge available: {b}"));
+    }
+    if let Some(b) = status.agitator_available {
+        lines.push(format!("Agitator redirect available: {b}"));
+    }
+    if let Some(b) = status.grand_inquisitor_available {
+        lines.push(format!("Grand Inquisitor invoke available: {b}"));
+    }
+    if let Some(b) = status.king_queen_transfer_available {
+        lines.push(format!("King/Queen transfer available: {b}"));
+    }
+    if let Some(successor) = status.designated_successor {
+        lines.push(format!(
+            "Designated successor: {}",
+            names(&[successor], roster)
+        ));
+    }
+    lines
+}
+
+/// Host-only, read-only mirror of what a specific player currently sees on
+/// `/play` -- see `ClientMsg::ViewPlayer`'s doc comment. Renders from the
+/// exact same `PlayerView` that player's own connection would get (there's
+/// no separate "admin projection"), so this can never show Dalton more
+/// than that player already sees themselves.
+///
+/// Deliberately renders no buttons, forms, `<select>`s, or `on_command`
+/// handlers of any kind -- text and lists only. This is what actually
+/// enforces "no edits from this view": it isn't that controls are present
+/// but disabled, it's that there are no controls here that could ever
+/// issue a `Command` at all. Compare `AbilityPanel`/`DenouncementPanel`/
+/// `TaskAttemptForm`, which this deliberately does NOT reuse, since all
+/// three exist specifically to submit commands.
+#[component]
+fn PlayerPageReadOnly(id: PlayerId, v: PlayerView) -> Element {
+    let is_servant = v.own_faction == Some(Faction::Servant);
+    let is_cast_out = v
+        .roster
+        .iter()
+        .any(|r| r.id == id && r.status == PlayerStatus::CastOut);
+
+    rsx! {
+        div {
+            class: "readonly-player-view",
+            p { style: "font-style:italic;", "Viewing {names(&[id], &v.roster)}'s page -- round: {v.current_round:?}" }
+            if !v.raffle_closed {
+                p { "Still in Character Creation -- hasn't been assigned a role yet." }
+                if let Some(level) = v.own_interest_level {
+                    p { "Interest level: {level}" }
+                }
+            }
+            if let Some(faction) = v.own_faction {
+                p {
+                    "Faction: {faction:?}"
+                    if let Some(c) = v.own_character {
+                        " -- {character_label(c)}"
+                    }
+                }
+            }
+
+            h4 { "Character" }
+            if is_servant {
+                p { "{faction_flavor(Faction::Servant)}" }
+                p { "Joined after the game started, so there's no character sheet or ability panel." }
+            } else {
+                if let Some(faction) = v.own_faction {
+                    if faction != Faction::Unassigned {
+                        p { "{faction_flavor(faction)}" }
+                    }
+                }
+                if let Some(c) = v.own_character {
+                    p { "{character_flavor(c)}" }
+                    h4 { "Ability" }
+                    p { "{ability_description(c)}" }
+                    for line in ability_status_lines(&v.my_abilities, &v.roster) {
+                        p { "{line}" }
+                    }
+                }
+                if !v.fellow_cultists.is_empty() {
+                    p { "Fellow Cultists: {names(&v.fellow_cultists, &v.roster)}" }
+                }
+                if !v.known_uprising_members.is_empty() {
+                    p { "Uprising members known: {names(&v.known_uprising_members, &v.roster)}" }
+                }
+                if !v.my_info_checks.is_empty() {
+                    h4 { "Info-check results" }
+                    ul {
+                        for (i , check) in v.my_info_checks.iter().enumerate() {
+                            li { key: "{i}", "{describe_check(check, &v.roster)}" }
+                        }
+                    }
+                }
+                if let Some(king_queen) = v.known_king_queen {
+                    p { "Knows the King/Queen: {names(&[king_queen], &v.roster)}" }
+                }
+                if let Some(leader) = v.revealed_leader {
+                    p { "Knows the Revolutionary Leader: {names(&[leader], &v.roster)}" }
+                }
+                if !v.my_confidants.is_empty() {
+                    p { "Confidants who know they're the Leader: {names(&v.my_confidants, &v.roster)}" }
+                }
+                if let Some(message) = &v.martyrdom_message {
+                    p { class: "martyrdom-message", "{message}" }
+                }
+            }
+            BioForm { my_id: id, own_bio: v.own_bio.clone(), locked: true, on_command: |_| {} }
+
+            h4 { "Round" }
+            if v.i_am_drunk {
+                p { class: "error-text", "Drunk this round -- can't nominate or vote." }
+            }
+            if v.open_tasks.is_empty() {
+                p { "No open tasks." }
+            } else {
+                ul {
+                    for task in v.open_tasks.iter() {
+                        li {
+                            key: "{task.id.0}",
+                            "{task.prompt} ({task.tier:?})"
+                            if task.is_location_task { " -- location task" }
+                            match task.my_outcome {
+                                Some(true) => " -- completed",
+                                Some(false) => " -- no match this time",
+                                None => " -- not yet attempted",
+                            }
+                        }
+                    }
+                }
+            }
+            if is_cast_out {
+                p { "Cast Out -- spectating this Denouncement." }
+            }
+            match &v.denouncement {
+                None => rsx! { p { "No Denouncement currently open." } },
+                Some(DenouncementView::Nomination { .. }) => rsx! { p { "Nomination is open." } },
+                Some(DenouncementView::Discussion { surfaced }) => rsx! {
+                    p { "Discussion -- surfaced: {names(surfaced, &v.roster)}" }
+                },
+                Some(DenouncementView::Ballot { candidates, .. }) => rsx! {
+                    p { "Ballot open -- candidates: {names(candidates, &v.roster)}" }
+                },
+                Some(DenouncementView::Runoff { candidates, .. }) => rsx! {
+                    p { "Runoff open -- candidates: {names(candidates, &v.roster)}" }
+                },
+            }
+
+            h4 { "Game" }
+            if let Some(entrants) = &v.intermission_entrants {
+                p { "Intermission entrants: {names(entrants, &v.roster)}" }
+            } else if v.i_opted_into_intermission {
+                p { "Opted into the Intermission lottery." }
+            }
+            if !v.servant_leaderboard.is_empty() {
+                h4 { "Servant leaderboard" }
+                ul {
+                    for (pid , points) in v.servant_leaderboard.iter() {
+                        li { key: "{pid.0}", "{names(&[*pid], &v.roster)}: {points}" }
+                    }
+                }
+            }
+            WhistledownPosts { posts: v.whistledown.clone(), heading_level: 5u8 }
+        }
+    }
+}
+
 #[component]
 fn TaskAttemptForm(
     my_id: PlayerId,
@@ -1811,6 +2071,9 @@ fn Host() -> Element {
     let mut authed = use_signal(|| false);
     let mut login_failed = use_signal(|| false);
     let mut password_draft = use_signal(String::new);
+    // The "view a player's page" panel -- see `ClientMsg::ViewPlayer`'s
+    // doc comment. `None` means the panel is closed/not requested.
+    let mut viewed_player: Signal<Option<PlayerView>> = use_signal(|| None);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
@@ -1826,6 +2089,7 @@ fn Host() -> Element {
                     location_task_templates.set(templates);
                 }
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
+                Ok(ServerMsg::ViewedPlayer(v)) => viewed_player.set(v),
                 Ok(ServerMsg::HostLoginResult { ok }) => {
                     authed.set(ok);
                     login_failed.set(!ok);
@@ -1937,7 +2201,18 @@ fn Host() -> Element {
             let _ = socket.send(ClientMsg::StartRoundOne).await;
         });
     };
+    let view_player = move |id: Option<PlayerId>| {
+        let socket = socket;
+        spawn(async move {
+            let _ = socket.send(ClientMsg::ViewPlayer(id)).await;
+        });
+    };
 
+    // Which player's page is currently open in the read-only viewer panel
+    // below -- kept alongside `viewed_player` (the actual `PlayerView` data)
+    // just so the panel knows whose name to show and which `<select>` option
+    // to keep highlighted; the id itself never leaves this browser tab.
+    let mut viewed_player_id = use_signal(|| None::<u32>);
     let mut new_name = use_signal(String::new);
     let mut faction_player = use_signal(|| None::<u32>);
     let mut faction_choice = use_signal(|| Faction::Ton);
@@ -2616,6 +2891,38 @@ fn Host() -> Element {
                 }
             }
         }
+        div {
+            h3 { "View a player's page" }
+            p { "Read-only -- shows exactly what that player currently sees on their own phone right now. There are no buttons or forms here, so nothing in this panel can act on their behalf." }
+            PlayerSelect {
+                roster: roster.clone(),
+                placeholder: "-- pick a player --",
+                on_change: move |e: FormEvent| {
+                    let id: Option<u32> = e.value().parse().ok();
+                    viewed_player_id.set(id);
+                    // Cleared immediately rather than left stale until the
+                    // server replies -- otherwise a fast re-pick could
+                    // briefly show the new player's name over the
+                    // previous player's still-cached data.
+                    viewed_player.set(None);
+                    view_player(id.map(PlayerId));
+                },
+            }
+            if let Some(id) = viewed_player_id() {
+                if let Some(v) = viewed_player() {
+                    PlayerPageReadOnly { id: PlayerId(id), v }
+                } else {
+                    p { "Loading..." }
+                }
+                button {
+                    onclick: move |_| {
+                        viewed_player_id.set(None);
+                        view_player(None);
+                    },
+                    "Close",
+                }
+            }
+        }
         RosterList { roster }
     }
 }
@@ -2705,7 +3012,8 @@ fn Display() -> Element {
                     ServerMsg::Failed { .. }
                     | ServerMsg::Joined { .. }
                     | ServerMsg::LocationTaskTemplates(_)
-                    | ServerMsg::HostLoginResult { .. },
+                    | ServerMsg::HostLoginResult { .. }
+                    | ServerMsg::ViewedPlayer(_),
                 ) => {}
                 // See the identical comment in `Host` -- without this, a
                 // closed connection spins this loop forever with no yield.

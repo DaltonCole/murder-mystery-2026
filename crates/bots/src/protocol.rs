@@ -59,6 +59,12 @@ pub enum ServerMsg {
     HostLoginResult {
         ok: bool,
     },
+    /// Mirrors `app`'s own `ServerMsg::ViewedPlayer` -- like
+    /// `HostLoginResult`, never actually sent to a bots connection in
+    /// practice (it's a per-connection reply to `ClientMsg::ViewPlayer`,
+    /// which this crate's own `ClientMsg` mirror has no variant for).
+    /// Mirrored anyway for the same "protocol drift fails loudly" reason.
+    ViewedPlayer(Option<PlayerView>),
 }
 
 #[derive(Debug)]
@@ -223,6 +229,7 @@ impl Conn {
                 Some(ServerMsg::LocationTaskTemplates(_)) => {}
                 Some(ServerMsg::Timer(_)) => {}
                 Some(ServerMsg::HostLoginResult { .. }) => {}
+                Some(ServerMsg::ViewedPlayer(_)) => {}
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -244,6 +251,7 @@ impl Conn {
                 Some(ServerMsg::LocationTaskTemplates(_)) => continue,
                 Some(ServerMsg::Timer(_)) => continue,
                 Some(ServerMsg::HostLoginResult { .. }) => continue,
+                Some(ServerMsg::ViewedPlayer(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -258,7 +266,8 @@ impl Conn {
                 | Some(ServerMsg::Failed { .. })
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
-                | Some(ServerMsg::HostLoginResult { .. }) => continue,
+                | Some(ServerMsg::HostLoginResult { .. })
+                | Some(ServerMsg::ViewedPlayer(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
@@ -278,7 +287,8 @@ impl Conn {
                 Some(ServerMsg::View(_))
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
-                | Some(ServerMsg::HostLoginResult { .. }) => continue,
+                | Some(ServerMsg::HostLoginResult { .. })
+                | Some(ServerMsg::ViewedPlayer(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
             }
         }
