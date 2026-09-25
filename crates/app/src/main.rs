@@ -146,12 +146,6 @@ enum ClientMsg {
     /// `game_server::run_raffle`'s doc comment on "randomness at the
     /// boundary"), which only exists server-side.
     RunRaffle,
-    /// `/host` only: pushes `game_server::LOCATION_TASKS[index]` as a real
-    /// task. Not a plain `Command` either -- the code that task carries
-    /// only exists server-side (see `game_server::push_location_task`'s
-    /// doc comment), so the Host browser can only ever refer to a template
-    /// by index, never construct the `PushTask` itself.
-    PushLocationTask { index: usize },
     /// `/host` only: draws the Intermission entrants server-side. Not a
     /// plain `Command { selected }` either -- unlike a real player's own
     /// `Command::OptIntoIntermission`, the Host browser has no legitimate
@@ -374,7 +368,7 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
         }
 
         // Shared reply shape for every Host-mutation `ClientMsg` arm below
-        // (`Do`, `RunRaffle`, `PushLocationTask`, `DrawIntermissionEntrants`):
+        // (`Do`, `RunRaffle`, `DrawIntermissionEntrants`):
         // on success, drain this connection's own broadcast echo and send a
         // fresh view if it's watching as someone; on failure, relay the
         // error as `ServerMsg::Failed`. Only the called mutation differs per
@@ -506,13 +500,6 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         ClientMsg::RunRaffle => {
                             if is_host_authed {
                                 respond!(game_server::run_raffle())
-                            } else {
-                                reject!("host login required")
-                            }
-                        }
-                        ClientMsg::PushLocationTask { index } => {
-                            if is_host_authed {
-                                respond!(game_server::push_location_task(index))
                             } else {
                                 reject!("host login required")
                             }
@@ -2609,13 +2596,6 @@ fn Host() -> Element {
             let _ = socket.send(ClientMsg::RunRaffle).await;
         });
     };
-    let mut push_location_task = move |index: usize| {
-        let socket = socket;
-        error.set(None);
-        spawn(async move {
-            let _ = socket.send(ClientMsg::PushLocationTask { index }).await;
-        });
-    };
     let mut draw_intermission_entrants = move || {
         let socket = socket;
         error.set(None);
@@ -2956,40 +2936,29 @@ fn Host() -> Element {
                 }
             }
             button { onclick: move |_| do_cmd(Command::CloseTasks), "Close tasks" }
-            p { "The controls below are for a manual top-up or fix-up only." }
+            p { "You can't push a task by hand here anymore -- every round's bio-derived and location tasks are drawn automatically. Use \"Manual entry\" below only for a live-event top-up or fix-up." }
             h4 { "From player bios (rules.md §4, Rounds 3/5)" }
-            p { "Every candidate here is available to the automatic Round 1/3/5 draw by default -- \"Ban\" excludes just that exact prompt from ever being auto-selected (it doesn't stop you from pushing it by hand right here)." }
+            p { "Every candidate here is eligible for the automatic Round 1/3/5 draw by default -- \"Ban\" excludes just that exact prompt from ever being auto-selected." }
             for (tier , candidates) in task_candidates.clone() {
                 div {
                     key: "{tier:?}",
                     p { "{tier:?} ({candidates.len()} candidates):" }
-                    for candidate in candidates
-                        .into_iter()
-                        .filter(|c| !banned_task_prompts().contains(&c.prompt))
-                        .take(8)
-                    {
-                        span {
-                            key: "{candidate.prompt}",
-                            button {
-                                onclick: {
-                                    let candidate = candidate.clone();
-                                    move |_| {
-                                        do_cmd(Command::PushTask {
-                                            prompt: candidate.prompt.clone(),
-                                            tier,
-                                            qualifying_players: candidate.qualifying_players.iter().copied().collect(),
-                                            expected_code: None,
-                                        });
-                                    }
-                                },
-                                "{candidate.prompt}"
-                            }
-                            button {
-                                onclick: {
-                                    let prompt = candidate.prompt.clone();
-                                    move |_| ban_task(prompt.clone())
-                                },
-                                "Ban"
+                    ul {
+                        for candidate in candidates
+                            .into_iter()
+                            .filter(|c| !banned_task_prompts().contains(&c.prompt))
+                            .take(8)
+                        {
+                            li {
+                                key: "{candidate.prompt}",
+                                "{candidate.prompt} "
+                                button {
+                                    onclick: {
+                                        let prompt = candidate.prompt.clone();
+                                        move |_| ban_task(prompt.clone())
+                                    },
+                                    "Ban"
+                                }
                             }
                         }
                     }
@@ -3016,12 +2985,10 @@ fn Host() -> Element {
                 }
             }
             h4 { "Location tasks (rules.md §4: talk to someone at a place)" }
-            p { "Medium states the location plainly; hard is a riddle -- both are credited once the player enters the code you've physically placed there." }
-            for (index , tier , prompt) in location_task_templates() {
-                button {
-                    key: "{index}",
-                    onclick: move |_| push_location_task(index),
-                    "[{tier:?}] {prompt}"
+            p { "Medium states the location plainly; hard is a riddle -- both are credited once the player enters the code you've physically placed there. These are now also drawn automatically alongside the bio-derived pool for their tier; listed here for reference only." }
+            ul {
+                for (index , tier , prompt) in location_task_templates() {
+                    li { key: "{index}", "[{tier:?}] {prompt}" }
                 }
             }
             h4 { "Manual entry (Round 1's fixed tasks, or a fallback)" }

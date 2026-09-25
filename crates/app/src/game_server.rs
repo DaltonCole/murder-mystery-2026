@@ -72,11 +72,11 @@ fn server() -> &'static GameServer {
 
 /// Bans `prompt` from ever being auto-selected for Round 1/3/5's task push
 /// (see `push_tasks_for_round`) -- the Host console's "Ban" button next to
-/// a bio-derived candidate. Doesn't affect pushing the same prompt
-/// manually (the "Manual entry"/location-task pickers) -- banning only
-/// scopes the automatic pool, matching the actual feature request ("tasks
-/// should be assigned automatically... allow the admin to ban a certain
-/// task"), not a blanket block on that exact text ever being used at all.
+/// a bio-derived candidate. Doesn't affect pushing the same prompt by hand
+/// through the free-text "Manual entry" fallback -- banning only scopes the
+/// automatic pool, matching the actual feature request ("tasks should be
+/// assigned automatically... allow the admin to ban a certain task"), not
+/// a blanket block on that exact text ever being used at all.
 pub fn ban_task_prompt(prompt: String) {
     server()
         .banned_task_prompts
@@ -255,6 +255,19 @@ fn auto_task_counts(round: Round) -> (usize, usize, usize) {
     }
 }
 
+/// One candidate task the automatic per-round draw (`push_tasks_for_round`)
+/// can pick from -- either a bio-derived "talk to 3, credit on 1 match"
+/// prompt (`expected_code: None`) or a pre-authored `LOCATION_TASKS` entry
+/// (`qualifying_players` empty, `expected_code: Some`). Unifying the two
+/// into one pool is what lets the draw shuffle them together per tier --
+/// see `push_tasks_for_round`'s doc comment on why location tasks were
+/// folded in here rather than kept as their own separate Host-picked pool.
+struct AutoTaskCandidate {
+    prompt: String,
+    qualifying_players: BTreeSet<PlayerId>,
+    expected_code: Option<String>,
+}
+
 /// Pushes `round`'s configured tasks (see `auto_task_counts`), unless
 /// they've already been pushed (`pushed`, this process's own idempotency
 /// guard -- see `GameServer::auto_tasks_pushed`'s doc comment). Shared by
@@ -262,16 +275,19 @@ fn auto_task_counts(round: Round) -> (usize, usize, usize) {
 /// `auto_push_on_round_advance` below) and automatically for Round 1, the
 /// moment setup finalizes (see `run_raffle`).
 ///
-/// For each tier, excludes any banned prompt (`banned_task_prompts` --
-/// "all tasks should be available by default," so this is normally a
-/// no-op filter), then shuffles the remaining `bio::task_candidates` pool
-/// with real, OS-backed entropy (the same "randomness at the boundary"
-/// shape as `run_raffle`/`draw_intermission_entrants`) and pushes
-/// `auto_task_counts`'s configured count from the front -- capped at
-/// however many distinct candidates actually exist, so a too-small bio
-/// pool (a tiny playtest game, or a tier nobody's bio happens to fill, or
-/// every candidate in a tier happening to be banned) just pushes fewer
-/// tasks rather than erroring.
+/// For each tier, pools together every bio-derived `task_candidates`
+/// prompt with every `LOCATION_TASKS` entry of that same tier (Dalton's
+/// own explicit instruction: the Host shouldn't hand-pick location tasks
+/// either -- see the Host console's removed "push" picker), excludes any
+/// banned prompt (`banned_task_prompts` -- "all tasks should be available
+/// by default," so this is normally a no-op filter), then shuffles the
+/// combined pool with real, OS-backed entropy (the same "randomness at the
+/// boundary" shape as `run_raffle`/`draw_intermission_entrants`) and
+/// pushes `auto_task_counts`'s configured count from the front -- capped
+/// at however many distinct candidates actually exist, so a too-small pool
+/// (a tiny playtest game, or a tier nobody's bio happens to fill, or every
+/// candidate in a tier happening to be banned) just pushes fewer tasks
+/// rather than erroring.
 fn push_tasks_for_round(
     state: &mut GameState,
     round: Round,
@@ -294,8 +310,23 @@ fn push_tasks_for_round(
         (TaskTier::Medium, medium),
         (TaskTier::Hard, hard),
     ] {
-        let mut candidates: Vec<_> = task_candidates(state, tier)
+        let mut candidates: Vec<AutoTaskCandidate> = task_candidates(state, tier)
             .into_iter()
+            .map(|c| AutoTaskCandidate {
+                prompt: c.prompt,
+                qualifying_players: c.qualifying_players.into_iter().collect(),
+                expected_code: None,
+            })
+            .chain(
+                LOCATION_TASKS
+                    .iter()
+                    .filter(|&&(location_tier, ..)| location_tier == tier)
+                    .map(|&(_, prompt, code)| AutoTaskCandidate {
+                        prompt: prompt.to_string(),
+                        qualifying_players: BTreeSet::new(),
+                        expected_code: Some(code.to_string()),
+                    }),
+            )
             .filter(|c| !banned.contains(&c.prompt))
             .collect();
         candidates.shuffle(&mut rng);
@@ -305,8 +336,8 @@ fn push_tasks_for_round(
                 Command::PushTask {
                     prompt: candidate.prompt,
                     tier,
-                    qualifying_players: candidate.qualifying_players.into_iter().collect(),
-                    expected_code: None,
+                    qualifying_players: candidate.qualifying_players,
+                    expected_code: candidate.expected_code,
                 },
             ) {
                 new_events.extend(events);
@@ -318,11 +349,12 @@ fn push_tasks_for_round(
 
 /// Automatically pushes Round 3 or Round 5's task phase (rules.md §4) the
 /// moment `AdvanceRound` reaches it, so the Host never has to hand-pick
-/// which bio-derived candidate to push from the "From player bios" panel
-/// -- a reliability/automation review found this was one of the last
-/// remaining points of necessary Host involvement in an otherwise-
-/// automated round flow. The manual per-candidate buttons and the
-/// free-text "Manual entry" fallback stay in the Host console regardless,
+/// which bio-derived or location candidate to push -- a
+/// reliability/automation review found this was one of the last remaining
+/// points of necessary Host involvement in an otherwise-automated round
+/// flow, and Dalton's own later instruction removed the Host's push
+/// pickers entirely (see `push_tasks_for_round`'s doc comment). The
+/// free-text "Manual entry" fallback stays in the Host console regardless,
 /// for a live-event fix-up.
 ///
 /// Round 1 is deliberately NOT triggered from here -- it's pushed at the
@@ -449,9 +481,10 @@ fn must_still_act(state: &GameState) -> BTreeSet<PlayerId> {
 /// player has attempted every open task) was tried and deliberately
 /// reverted: unlike Nomination/Ballot/Runoff, which each open as one
 /// atomic action, tasks can be added incrementally over several separate
-/// `PushTask` calls (the Host console's "From player bios"/"Manual entry"
-/// panels are built specifically for pushing one at a time) -- a fast
-/// group finishing the *first* pushed task auto-closed the whole phase
+/// `PushTask` calls (the Host console's free-text "Manual entry" fallback
+/// is built specifically for pushing one at a time, for a live-event
+/// fix-up after the automatic per-round draw) -- a fast group finishing
+/// the *first* pushed task auto-closed the whole phase
 /// before the Host had pushed the rest they intended, confirmed by a real
 /// bot-test regression. Nomination/Ballot/Runoff don't have that failure
 /// mode: nothing adds *more* candidates/ballots to an already-open phase
@@ -529,8 +562,9 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
 /// `run_round_one_tasks`, deliberately independent of this function's
 /// real bio-derived random selection.
 ///
-/// `String` error (not `GameError`, matching `push_location_task`'s
-/// precedent) since the one way this can fail -- a double-click re-running
+/// `String` error (not `GameError`, matching every other app-layer
+/// randomness-at-the-boundary function's precedent) since the one way this
+/// can fail -- a double-click re-running
 /// an already-closed raffle -- is an app-level UI mistake, not a domain
 /// rejection: a reliability review found this had no guard at all, so a
 /// double-click under live-event network latency (the button doesn't
@@ -691,9 +725,10 @@ pub fn draw_intermission_entrants() -> Result<Vec<DomainEvent>, String> {
 /// every player's browser, so any code stored there would ship straight
 /// into that bundle, trivially extractable via devtools -- defeating the
 /// entire point of a *physical* location task. The Host browser only ever
-/// learns the safe subset (tier + prompt, via `location_task_templates`)
-/// and pushes by index (`push_location_task`); the code itself never
-/// leaves this server process.
+/// learns the safe subset (tier + prompt, via `location_task_templates`,
+/// for reference only -- see its own doc comment); the code itself never
+/// leaves this server process. `push_tasks_for_round` is the only thing
+/// that ever actually turns one of these into a real open task.
 const LOCATION_TASKS: &[(TaskTier, &str, &str)] = &[
     (
         TaskTier::Medium,
@@ -707,31 +742,19 @@ const LOCATION_TASKS: &[(TaskTier, &str, &str)] = &[
     ),
 ];
 
-/// The safe subset of `LOCATION_TASKS` for the Host browser to render a
-/// picker from -- index (to push by) plus tier and prompt, never the code.
+/// The safe subset of `LOCATION_TASKS` for the Host console's read-only
+/// reference list -- tier and prompt, never the code (see
+/// `location_task_templates`'s doc comment on why the code itself never
+/// reaches this list). Dalton's own explicit instruction removed the
+/// Host's old per-template "push" button entirely -- location tasks now
+/// only ever enter play through the automatic per-round draw (see
+/// `push_tasks_for_round`), same as bio-derived ones.
 pub fn location_task_templates() -> Vec<(usize, TaskTier, String)> {
     LOCATION_TASKS
         .iter()
         .enumerate()
         .map(|(i, &(tier, prompt, _code))| (i, tier, prompt.to_string()))
         .collect()
-}
-
-/// Pushes `LOCATION_TASKS[index]` as a real, open `TaskDef` (via the
-/// ordinary `Command::PushTask`, same as every other task) -- the Host
-/// console's per-template "push" button. `String` error (not `GameError`)
-/// since an out-of-range index is an app-level mistake, not a domain one.
-pub fn push_location_task(index: usize) -> Result<Vec<DomainEvent>, String> {
-    let &(tier, prompt, code) = LOCATION_TASKS
-        .get(index)
-        .ok_or_else(|| format!("no location task at index {index}"))?;
-    apply(Command::PushTask {
-        prompt: prompt.to_string(),
-        tier,
-        qualifying_players: BTreeSet::new(),
-        expected_code: Some(code.to_string()),
-    })
-    .map_err(|e| e.to_string())
 }
 
 /// The single read path every route uses -- never hands out a raw
