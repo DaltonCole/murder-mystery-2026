@@ -1873,15 +1873,27 @@ mod tests {
             character_name: "Lord Ashworth".into(),
             real_name: "Alex".into(),
             occupation: "Duke".into(),
-            hobbies: ["chess".into(), "".into(), "".into(), "".into(), "".into()],
-            clothing_features: [
-                "a silver mask".into(),
-                "".into(),
-                "".into(),
+            hobbies: [
+                "chess".into(),
+                "fencing".into(),
+                "poetry".into(),
                 "".into(),
                 "".into(),
             ],
-            skills: ["".into(), "".into(), "".into(), "".into(), "".into()],
+            clothing_features: [
+                "a silver mask".into(),
+                "a velvet cape".into(),
+                "opera gloves".into(),
+                "".into(),
+                "".into(),
+            ],
+            skills: [
+                "sword fighting".into(),
+                "dancing".into(),
+                "wine tasting".into(),
+                "".into(),
+                "".into(),
+            ],
         }
     }
 

@@ -30,7 +30,9 @@ mod whistledown;
 mod win_condition;
 
 pub use ability::{AbilityStatus, Dossier, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind};
-pub use bio::{pascal_case, task_candidates, Bio, TaskCandidate, MAX_FIELD_LEN};
+pub use bio::{
+    pascal_case, task_candidates, Bio, TaskCandidate, MAX_FIELD_LEN, MIN_CATEGORY_ENTRIES,
+};
 pub use character::{Character, PlayerStatus};
 pub use command::Command;
 pub use contest::ContestCategory;

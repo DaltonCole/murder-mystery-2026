@@ -1288,6 +1288,16 @@ fn submit_bio(
             max: crate::bio::MAX_FIELD_LEN,
         });
     }
+    if let Some(field) = bio.first_missing_required_field() {
+        return Err(GameError::RequiredBioFieldMissing { field });
+    }
+    if let Some((category, have)) = bio.first_underfilled_category() {
+        return Err(GameError::NotEnoughBioEntries {
+            category,
+            have,
+            min: crate::bio::MIN_CATEGORY_ENTRIES,
+        });
+    }
     state.bios.insert(player, bio.clone());
     Ok(vec![DomainEvent::BioSubmitted { player, bio }])
 }
@@ -3548,21 +3558,21 @@ mod tests {
             hobbies: [
                 "chess".into(),
                 "fencing".into(),
-                "".into(),
+                "poetry".into(),
                 "".into(),
                 "".into(),
             ],
             clothing_features: [
                 "a silver mask".into(),
-                "".into(),
-                "".into(),
+                "a velvet cape".into(),
+                "opera gloves".into(),
                 "".into(),
                 "".into(),
             ],
             skills: [
                 "sword fighting".into(),
-                "".into(),
-                "".into(),
+                "dancing".into(),
+                "wine tasting".into(),
                 "".into(),
                 "".into(),
             ],
@@ -3620,6 +3630,75 @@ mod tests {
             })
         );
         assert!(state.bio(king_queen).is_none());
+    }
+
+    #[test]
+    fn submit_bio_rejects_a_blank_required_field() {
+        let (mut state, king_queen, ..) = setup_full_game();
+        let mut bio = sample_bio("Lord Ashworth");
+        bio.real_name = "   ".to_string();
+        let result = apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: king_queen,
+                bio,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::RequiredBioFieldMissing { field: "Real Name" })
+        );
+        assert!(state.bio(king_queen).is_none());
+    }
+
+    #[test]
+    fn submit_bio_rejects_a_category_with_fewer_than_3_entries() {
+        let (mut state, king_queen, ..) = setup_full_game();
+        let mut bio = sample_bio("Lord Ashworth");
+        bio.skills = [
+            "sword fighting".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+        ];
+        let result = apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: king_queen,
+                bio,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::NotEnoughBioEntries {
+                category: "Skills",
+                have: 1,
+                min: crate::bio::MIN_CATEGORY_ENTRIES,
+            })
+        );
+        assert!(state.bio(king_queen).is_none());
+    }
+
+    #[test]
+    fn submit_bio_accepts_exactly_3_entries_in_every_category() {
+        let (mut state, king_queen, ..) = setup_full_game();
+        let mut bio = sample_bio("Lord Ashworth");
+        // `sample_bio` already fills exactly 3 of each -- this is a plain
+        // boundary check that 3 (not just the sample's specific values)
+        // is genuinely accepted, not accidentally rejected as "still too
+        // few" by an off-by-one in `first_underfilled_category`.
+        bio.hobbies[3] = "".into();
+        bio.hobbies[4] = "".into();
+        apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: king_queen,
+                bio,
+            },
+        )
+        .unwrap();
+        assert!(state.bio(king_queen).is_some());
     }
 
     #[test]

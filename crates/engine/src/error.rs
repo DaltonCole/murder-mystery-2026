@@ -205,4 +205,25 @@ pub enum GameError {
 
     #[error("the roster is already at its {max}-player cap")]
     TooManyPlayers { max: usize },
+
+    /// A bio's "Character Name"/"Real Name"/"Occupation" left blank --
+    /// rules.md §1 lists these alongside Hobbies/Clothing/Skills, but
+    /// doesn't itself say they're mandatory; Dalton's own explicit
+    /// instruction made them required fields.
+    #[error("{field} is required")]
+    RequiredBioFieldMissing { field: &'static str },
+
+    /// A bio's Hobbies/Clothing/Skills category has fewer than `min`
+    /// non-empty entries -- Dalton's own explicit instruction (3-5 each),
+    /// tightening rules.md §1's own "5 Hobbies, 5 Notable Clothing
+    /// Features, and 5 Skills" (which reads as a fixed count, not a
+    /// ceiling) into a 3-5 range instead. The 5-max side of that range
+    /// doesn't need its own check: `Bio`'s `[String; 5]` fields are fixed
+    /// arrays, so more than 5 is unrepresentable in the first place.
+    #[error("{category} needs at least {min} entries, only {have} are filled in")]
+    NotEnoughBioEntries {
+        category: &'static str,
+        have: usize,
+        min: usize,
+    },
 }

@@ -8,6 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// rules.md §1: "each capped at 32 characters."
 pub const MAX_FIELD_LEN: usize = 32;
 
+/// Dalton's own explicit instruction: Hobbies/Clothing/Skills each need at
+/// least this many filled-in entries (the max, 5, needs no separate
+/// constant or check -- see `Bio::first_underfilled_category`'s doc
+/// comment).
+pub const MIN_CATEGORY_ENTRIES: usize = 3;
+
 /// A player's character sheet (rules.md §1's "Character creation"),
 /// submitted during setup. Free text throughout -- the engine validates
 /// only the length cap rules.md states, nothing about content. Servants
@@ -48,6 +54,43 @@ impl Bio {
         self.fields()
             .find(|(_, value)| value.chars().count() > MAX_FIELD_LEN)
             .map(|(label, value)| (label, value.chars().count()))
+    }
+
+    /// The first of "Character Name"/"Real Name"/"Occupation" left blank
+    /// (whitespace-only counts as blank, matching how a filled-in category
+    /// entry is already judged elsewhere -- see `task_candidates`'s own
+    /// `raw.trim().is_empty()` check), if any. Dalton's own explicit
+    /// instruction: these three, unlike Hobbies/Clothing/Skills, are
+    /// simply required, not "at least N of five."
+    pub(crate) fn first_missing_required_field(&self) -> Option<&'static str> {
+        [
+            ("Character Name", &self.character_name),
+            ("Real Name", &self.real_name),
+            ("Occupation", &self.occupation),
+        ]
+        .into_iter()
+        .find(|(_, value)| value.trim().is_empty())
+        .map(|(label, _)| label)
+    }
+
+    /// The first of Hobbies/Clothing/Skills with fewer than
+    /// `MIN_CATEGORY_ENTRIES` filled-in entries, if any -- `(label,
+    /// actual_count)`. Only a *minimum* check: the *maximum* (5) needs no
+    /// code at all, since `hobbies`/`clothing_features`/`skills` are fixed
+    /// `[String; 5]` arrays -- a 6th entry is unrepresentable, not merely
+    /// unvalidated.
+    pub(crate) fn first_underfilled_category(&self) -> Option<(&'static str, usize)> {
+        [
+            ("Hobbies", &self.hobbies),
+            ("Clothing", &self.clothing_features),
+            ("Skills", &self.skills),
+        ]
+        .into_iter()
+        .map(|(label, values)| {
+            let filled = values.iter().filter(|v| !v.trim().is_empty()).count();
+            (label, filled)
+        })
+        .find(|&(_, filled)| filled < MIN_CATEGORY_ENTRIES)
     }
 }
 
@@ -194,15 +237,15 @@ mod tests {
             ],
             clothing_features: [
                 "a silver mask".into(),
-                "".into(),
-                "".into(),
+                "a velvet cape".into(),
+                "opera gloves".into(),
                 "".into(),
                 "".into(),
             ],
             skills: [
                 "sword fighting".into(),
-                "".into(),
-                "".into(),
+                "dancing".into(),
+                "wine tasting".into(),
                 "".into(),
                 "".into(),
             ],
@@ -233,6 +276,40 @@ mod tests {
         let mut bio = sample_bio();
         bio.hobbies[2] = "a".repeat(40);
         assert_eq!(bio.first_oversized_field(), Some(("hobby", 40)));
+    }
+
+    #[test]
+    fn a_fully_filled_bio_has_no_missing_required_field_or_underfilled_category() {
+        assert_eq!(sample_bio().first_missing_required_field(), None);
+        assert_eq!(sample_bio().first_underfilled_category(), None);
+    }
+
+    #[test]
+    fn a_blank_required_field_is_caught_even_if_only_whitespace() {
+        let mut bio = sample_bio();
+        bio.character_name = "   ".to_string();
+        assert_eq!(bio.first_missing_required_field(), Some("Character Name"));
+    }
+
+    #[test]
+    fn an_underfilled_category_reports_its_label_and_actual_count() {
+        let mut bio = sample_bio();
+        bio.clothing_features = [
+            "a silver mask".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+        ];
+        assert_eq!(bio.first_underfilled_category(), Some(("Clothing", 1)));
+    }
+
+    #[test]
+    fn a_whitespace_only_entry_does_not_count_as_filled() {
+        let mut bio = sample_bio();
+        bio.skills[1] = "   ".to_string();
+        // Only skills[0] and skills[2] are genuinely filled now.
+        assert_eq!(bio.first_underfilled_category(), Some(("Skills", 2)));
     }
 
     #[test]

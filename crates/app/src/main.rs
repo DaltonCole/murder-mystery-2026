@@ -52,7 +52,7 @@ use engine::{
     pascal_case, AbilityStatus, Ballot, Bio, Character, Command, ContestCategory, DenouncementView,
     DomainEvent, Faction, GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind,
     PlayerId, PlayerReveal, PlayerStatus, PlayerView, RosterEntry, Round, TaskTier, TaskView,
-    Viewer, WhistledownPost,
+    Viewer, WhistledownPost, MIN_CATEGORY_ENTRIES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1163,6 +1163,13 @@ fn TimerDisplay(remaining_secs: Option<i64>) -> Element {
 /// (see `Command::SubmitBio`'s doc comment), so editing just means
 /// retyping, matching this Phase 1-era "basic shell" UI's overall level of
 /// polish elsewhere.
+///
+/// Character Name/Real Name/Occupation are required, and Hobbies/Clothing/
+/// Skills each need 3-5 filled-in entries (Dalton's own explicit
+/// instruction -- see `Bio::first_missing_required_field`/
+/// `first_underfilled_category`, the actual source of truth this mirrors
+/// client-side purely so a player finds out *before* submitting, not from
+/// a rejected round-trip).
 #[component]
 fn BioForm(
     my_id: PlayerId,
@@ -1177,6 +1184,15 @@ fn BioForm(
     let mut clothing_features =
         use_signal(|| std::array::from_fn::<String, 5, _>(|_| String::new()));
     let mut skills = use_signal(|| std::array::from_fn::<String, 5, _>(|_| String::new()));
+
+    let filled_count =
+        |values: &[String; 5]| values.iter().filter(|s| !s.trim().is_empty()).count();
+    let is_valid = !character_name().trim().is_empty()
+        && !real_name().trim().is_empty()
+        && !occupation().trim().is_empty()
+        && filled_count(&hobbies()) >= MIN_CATEGORY_ENTRIES
+        && filled_count(&clothing_features()) >= MIN_CATEGORY_ENTRIES
+        && filled_count(&skills()) >= MIN_CATEGORY_ENTRIES;
 
     rsx! {
         div {
@@ -1211,24 +1227,24 @@ fn BioForm(
                 }
             } else {
             input {
-                placeholder: "Character name",
+                placeholder: "Character name (required)",
                 maxlength: "32",
                 value: "{character_name}",
                 oninput: move |e| character_name.set(e.value()),
             }
             input {
-                placeholder: "Real name",
+                placeholder: "Real name (required)",
                 maxlength: "32",
                 value: "{real_name}",
                 oninput: move |e| real_name.set(e.value()),
             }
             input {
-                placeholder: "Occupation",
+                placeholder: "Occupation (required)",
                 maxlength: "32",
                 value: "{occupation}",
                 oninput: move |e| occupation.set(e.value()),
             }
-            p { "Hobbies (up to 5):" }
+            p { "Hobbies (3-5 required):" }
             for i in 0..5 {
                 input {
                     key: "hobby-{i}",
@@ -1242,7 +1258,7 @@ fn BioForm(
                     },
                 }
             }
-            p { "Notable clothing features (up to 5):" }
+            p { "Notable clothing features (3-5 required):" }
             for i in 0..5 {
                 input {
                     key: "clothing-{i}",
@@ -1256,7 +1272,7 @@ fn BioForm(
                     },
                 }
             }
-            p { "Skills (up to 5):" }
+            p { "Skills (3-5 required):" }
             for i in 0..5 {
                 input {
                     key: "skill-{i}",
@@ -1270,7 +1286,13 @@ fn BioForm(
                     },
                 }
             }
+            if !is_valid {
+                p { class: "error-text",
+                    "Fill in Character Name, Real Name, Occupation, and at least {MIN_CATEGORY_ENTRIES} of each of Hobbies, Clothing, and Skills."
+                }
+            }
             button {
+                disabled: !is_valid,
                 onclick: move |_| {
                     on_command
                         .call(Command::SubmitBio {
