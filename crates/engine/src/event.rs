@@ -263,6 +263,47 @@ pub enum DomainEvent {
         category: ContestCategory,
         ton_won: bool,
     },
+
+    // --- Contest mini-games (see `contest_minigame`'s module doc comment)
+    // ---
+    ContestMinigameOpened {
+        round: Round,
+        category: ContestCategory,
+        prompt: String,
+    },
+    /// Deliberately never carries `text` -- the entry itself lives in
+    /// `GameState` (visible to other players for rating purposes through
+    /// `view_for`), not duplicated into the append-only log.
+    CreativeEntrySubmitted {
+        player: PlayerId,
+        round: Round,
+    },
+    CreativeEntryRated {
+        rater: PlayerId,
+        target: PlayerId,
+        round: Round,
+        stars: u8,
+    },
+    /// Never carries the guessed answer, right or wrong -- same
+    /// no-spoiler reasoning as `TaskAttempted` never carrying `named`.
+    IntelligenceAnswerAttempted {
+        player: PlayerId,
+        round: Round,
+        correct: bool,
+    },
+    PhysicalPlacementSubmitted {
+        player: PlayerId,
+        round: Round,
+        placement: u32,
+    },
+    /// Emitted alongside `ContestResultRecorded` when a mini-game session
+    /// closes -- see `KingQueenConversionCascade`'s doc comment for why a
+    /// closely-related-but-distinct fact gets its own event instead of
+    /// being folded into the other one.
+    ContestMinigameClosed {
+        round: Round,
+        category: ContestCategory,
+    },
     /// A bidirectional identity reveal (rules.md §3.2): `confidant` learns
     /// who `leader` is, and `leader` learns `confidant`'s identity in
     /// return (though `leader` already knew who every active Uprising

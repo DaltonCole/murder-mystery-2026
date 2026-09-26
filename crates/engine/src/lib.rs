@@ -14,6 +14,7 @@ mod bio;
 mod character;
 mod command;
 mod contest;
+mod contest_minigame;
 mod denouncement;
 mod error;
 mod event;
@@ -37,6 +38,7 @@ pub use bio::{
 pub use character::{Character, PlayerStatus};
 pub use command::Command;
 pub use contest::ContestCategory;
+pub use contest_minigame::{DEFAULT_TOP_N_SCORERS, MAX_CONTEST_ENTRY_LEN};
 pub use denouncement::{Ballot, DenouncementPhase};
 pub use error::GameError;
 pub use event::DomainEvent;
@@ -54,6 +56,8 @@ pub use round::Round;
 pub use servant::GalleryPrediction;
 pub use state::{apply_command, GameState};
 pub use task::{TaskDef, TaskId, TaskTier, MAX_LOCATION_CODE_LEN, MAX_TASK_PROMPT_LEN};
-pub use view::{view_for, DenouncementView, PlayerView, RosterEntry, TaskView, Viewer};
+pub use view::{
+    view_for, ContestMinigameView, DenouncementView, PlayerView, RosterEntry, TaskView, Viewer,
+};
 pub use whistledown::{posts as whistledown_posts, WhistledownPost};
 pub use win_condition::{evaluate as evaluate_win_conditions, CultPath, GameOutcome};

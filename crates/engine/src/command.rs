@@ -452,6 +452,72 @@ pub enum Command {
         ton_won: bool,
     },
 
+    // --- Contest mini-games (rules.md §4's Strength/Creativity/
+    // Intelligence, actually implemented rather than host-asserted -- see
+    // `contest_minigame`'s module doc comment). `RecordContestResult`
+    // above stays as the manual fallback for a live-event fix-up, the same
+    // "always keep a manual override" shape as `PushTask`'s Manual entry
+    // or `CastOut`'s `fallback_replacement`. ---
+    /// Opens `category`'s mini-game session for `round` -- the Host's
+    /// prompt/question/challenge-description, typed in live (see
+    /// `contest_minigame`'s placeholder-content warning). Rejected if
+    /// `round` isn't a contest round, if that `(round, category)` already
+    /// has a session open, or if it's already been resolved.
+    /// `correct_answer` is Intelligence-only (the answer players' guesses
+    /// are checked against) -- `None` for Creativity/Strength.
+    OpenContestMinigame {
+        round: Round,
+        category: ContestCategory,
+        prompt: String,
+        correct_answer: Option<String>,
+    },
+    /// Creativity: `player`'s one free-text entry to the round's shared
+    /// prompt. One-shot, like `AttemptTask`.
+    SubmitCreativeEntry {
+        player: PlayerId,
+        round: Round,
+        text: String,
+    },
+    /// Creativity: `player` rates `target`'s entry 1-5 stars. Rejects
+    /// self-rating and a `target` with no submitted entry. A repeat rating
+    /// of the same `target` replaces the earlier one, the same standing-
+    /// choice shape `Nominate`/`CastBallot` already use.
+    RateCreativeEntry {
+        player: PlayerId,
+        round: Round,
+        target: PlayerId,
+        stars: u8,
+    },
+    /// Intelligence: `player`'s one attempt at the round's shared
+    /// question, checked case-insensitively and trimmed against the
+    /// session's `correct_answer` -- the same check `AttemptLocationTask`
+    /// already does for a location's code. One-shot, right or wrong.
+    SubmitIntelligenceAnswer {
+        player: PlayerId,
+        round: Round,
+        answer: String,
+    },
+    /// Strength: `player`'s own self-reported finishing placement (1 =
+    /// won outright) for a live, physically-judged event -- Dalton's own
+    /// explicit instruction: never a "Ton vs the room" vote, since players
+    /// aren't supposed to know who's on which side. One-shot.
+    SubmitPhysicalPlacement {
+        player: PlayerId,
+        round: Round,
+        placement: u32,
+    },
+    /// Closes `category`'s mini-game session for `round`, computes each
+    /// participant's score (see `contest_minigame`'s doc comment for how
+    /// each category scores), and resolves `ton_won` via
+    /// `contest_minigame::resolve_ton_won` -- internally just
+    /// `record_contest_result` with a computed `ton_won` instead of a
+    /// host-asserted one, so it inherits that function's own round/
+    /// duplicate checks and its Leader's-Confidant trigger on a Ton loss.
+    CloseContestMinigame {
+        round: Round,
+        category: ContestCategory,
+    },
+
     // --- Phase 3: the Intermission lottery (rules.md §4) ---
     /// A player opts into "Who is Lorel's number one love?" -- rejected if
     /// they're already Cast Out ("anyone Cast Out earlier is ineligible to

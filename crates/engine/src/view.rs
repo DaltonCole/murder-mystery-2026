@@ -107,6 +107,45 @@ pub struct TaskView {
     pub answer_code: Option<String>,
 }
 
+/// A viewer-safe projection of one currently-open contest mini-game
+/// session (see `contest_minigame`'s module doc comment). Every active
+/// player sees every currently-open session regardless of round -- there's
+/// only ever one or three of these open at a time (Round 4 runs all three
+/// categories simultaneously), and knowing a session is running plus its
+/// prompt is exactly what a player needs to go participate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContestMinigameView {
+    pub round: Round,
+    pub category: ContestCategory,
+    pub prompt: String,
+    /// How many participants have submitted something so far (an entry, an
+    /// attempt, or a placement, whichever this category uses) -- visible
+    /// to every viewer, mainly so the Host has a live signal for "is it
+    /// time to close this yet" without needing the standings themselves.
+    pub submission_count: usize,
+    /// Creativity only: every submitted entry so far, including the
+    /// viewer's own -- safe to show every active player since rating
+    /// requires seeing what you're rating (unlike a task's qualifying set,
+    /// this was never meant to stay hidden). Empty for every other
+    /// category.
+    pub creative_entries: Vec<(PlayerId, String)>,
+    /// Creativity only: which targets the viewer has already rated this
+    /// session, so the UI can grey out an already-rated entry (a repeat
+    /// rating still succeeds -- see `Command::RateCreativeEntry`'s doc
+    /// comment -- this is just a UI convenience, not an enforced lock).
+    pub my_creative_ratings_given: Vec<PlayerId>,
+    /// Intelligence only: whether the viewer has already attempted (right
+    /// or wrong) -- one-shot, so the UI can hide the input once used.
+    pub my_intelligence_attempted: bool,
+    /// Strength only: the viewer's own submitted placement, if any.
+    pub my_physical_placement: Option<u32>,
+    /// Host-only, Intelligence only: the correct answer -- the same
+    /// deliberate "Host sees the answer" reversal as
+    /// `TaskView::answer_code`. `None` for every non-Host viewer and for
+    /// every non-Intelligence category.
+    pub answer: Option<String>,
+}
+
 /// What a single connection is allowed to see, fully pre-filtered
 /// server-side. This is the only type that ever gets serialized and sent
 /// to a client.
@@ -125,6 +164,11 @@ pub struct PlayerView {
     /// `None` when no Denouncement is currently running.
     pub denouncement: Option<DenouncementView>,
     pub open_tasks: Vec<TaskView>,
+    /// Every currently-open contest mini-game session -- visible to every
+    /// viewer kind, the same "the list itself is public, only the
+    /// viewer-specific fields inside differ" shape `open_tasks` above
+    /// already uses. See `ContestMinigameView`'s doc comment.
+    pub open_contest_minigames: Vec<ContestMinigameView>,
 
     /// What the viewer's own current character can do right now -- every
     /// field empty/default for Host/Display and for a player with no
@@ -354,6 +398,49 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         })
         .collect();
 
+    let open_contest_minigames = state
+        .contest_minigames()
+        .map(|(&(round, category), session)| ContestMinigameView {
+            round,
+            category,
+            prompt: session.prompt.clone(),
+            submission_count: match category {
+                ContestCategory::Creativity => session.creative_entries.len(),
+                ContestCategory::Intelligence => session.intelligence_attempts.len(),
+                ContestCategory::Strength => session.placements.len(),
+            },
+            creative_entries: if category == ContestCategory::Creativity {
+                session
+                    .creative_entries
+                    .iter()
+                    .map(|(&id, text)| (id, text.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            my_creative_ratings_given: viewer_id
+                .filter(|_| category == ContestCategory::Creativity)
+                .map(|id| {
+                    session
+                        .creative_ratings
+                        .get(&id)
+                        .map(|by_target| by_target.keys().copied().collect())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default(),
+            my_intelligence_attempted: category == ContestCategory::Intelligence
+                && viewer_id.is_some_and(|id| session.intelligence_attempts.contains(&id)),
+            my_physical_placement: viewer_id
+                .filter(|_| category == ContestCategory::Strength)
+                .and_then(|id| session.placements.get(&id).copied()),
+            answer: if is_host {
+                session.correct_answer.clone()
+            } else {
+                None
+            },
+        })
+        .collect();
+
     let my_abilities = viewer_id
         .map(|id| state.ability_status_for(id))
         .unwrap_or_default();
@@ -445,6 +532,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         current_round: state.current_round(),
         denouncement,
         open_tasks,
+        open_contest_minigames,
         my_abilities,
         my_info_checks,
         fellow_cultists,
@@ -2117,6 +2205,81 @@ mod tests {
                 view.round_history,
                 Vec::new(),
                 "Host/Display should never get a per-player round history"
+            );
+        }
+    }
+
+    #[test]
+    fn contest_minigame_view_scopes_the_answer_to_host_only_but_entries_to_everyone() {
+        let mut state = three_player_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Intelligence,
+                prompt: "2+2?".into(),
+                correct_answer: Some("Four".into()),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitIntelligenceAnswer {
+                player: PlayerId(0),
+                round: Round::Two,
+                answer: "Four".into(),
+            },
+        )
+        .unwrap();
+
+        let alice_view = view_for(&state, Viewer::Player(PlayerId(0)));
+        assert_eq!(alice_view.open_contest_minigames.len(), 1);
+        let session = &alice_view.open_contest_minigames[0];
+        assert_eq!(session.prompt, "2+2?");
+        assert!(session.my_intelligence_attempted);
+        assert_eq!(session.answer, None, "a player must never see the answer");
+
+        let bob_view = view_for(&state, Viewer::Player(PlayerId(1)));
+        assert!(!bob_view.open_contest_minigames[0].my_intelligence_attempted);
+
+        let host_view = view_for(&state, Viewer::Host);
+        assert_eq!(
+            host_view.open_contest_minigames[0].answer.as_deref(),
+            Some("Four"),
+            "the Host is the one deliberate exception"
+        );
+    }
+
+    #[test]
+    fn creativity_entries_are_visible_to_every_viewer_for_rating() {
+        let mut state = three_player_state();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                prompt: "Draw a cat".into(),
+                correct_answer: None,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitCreativeEntry {
+                player: PlayerId(0),
+                round: Round::Two,
+                text: "a cat".into(),
+            },
+        )
+        .unwrap();
+
+        for viewer in [Viewer::Player(PlayerId(1)), Viewer::Host, Viewer::Display] {
+            let view = view_for(&state, viewer);
+            assert_eq!(
+                view.open_contest_minigames[0].creative_entries,
+                vec![(PlayerId(0), "a cat".to_string())]
             );
         }
     }

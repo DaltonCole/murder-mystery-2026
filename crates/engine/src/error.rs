@@ -229,4 +229,31 @@ pub enum GameError {
 
     #[error("the player priority order has already been set")]
     PlayerPriorityOrderAlreadySet,
+
+    #[error("a mini-game session for {category:?} in {round:?} is already open")]
+    ContestMinigameAlreadyOpen {
+        round: Round,
+        category: ContestCategory,
+    },
+
+    #[error("no mini-game session for {category:?} is currently open in {round:?}")]
+    ContestMinigameNotOpen {
+        round: Round,
+        category: ContestCategory,
+    },
+
+    #[error("player {0:?} already submitted to this mini-game session")]
+    AlreadySubmittedToContestMinigame(PlayerId),
+
+    #[error("a contest mini-game rating cannot name the rating player themself")]
+    CannotRateSelfInContestMinigame,
+
+    #[error("player {0:?} has no submitted entry to rate")]
+    NoContestEntryToRate(PlayerId),
+
+    #[error("star rating {0} is outside the 1-5 range")]
+    StarRatingOutOfRange(u8),
+
+    #[error("placement {0} is out of range -- must be at least 1")]
+    PlacementOutOfRange(u32),
 }

@@ -5,6 +5,7 @@ use crate::bio::Bio;
 use crate::character::{Character, PlayerStatus};
 use crate::command::Command;
 use crate::contest::ContestCategory;
+use crate::contest_minigame::{self, ContestMinigameSession};
 use crate::denouncement::{
     execution_count, resolve_ballot, surfaced_nominees, Ballot, Denouncement, DenouncementPhase,
 };
@@ -217,6 +218,14 @@ pub struct GameState {
     /// surfaced through `view_for` to any viewer -- see
     /// `Command::RecordContestResult`'s doc comment.
     contest_results: BTreeMap<(Round, ContestCategory), bool>,
+    /// Every currently-open contest mini-game session, keyed by (round,
+    /// category) -- Round 4 runs all three categories simultaneously in
+    /// separate zones, so this needs to hold more than one at once. See
+    /// `contest_minigame`'s module doc comment. A closed session is
+    /// removed from this map entirely (its result lives in
+    /// `contest_results` instead) rather than kept around -- there's
+    /// nothing left that needs its submissions once resolved.
+    contest_minigames: BTreeMap<(Round, ContestCategory), ContestMinigameSession>,
     /// Every active Uprising member who currently knows the Revolutionary
     /// Leader's identity, grown one at a time by `trigger_leader_confidant`
     /// -- never shrinks, and self-limits once it covers every active
@@ -328,6 +337,7 @@ impl Default for GameState {
             grand_inquisitor_armed: false,
             grand_inquisitor_used: false,
             contest_results: BTreeMap::new(),
+            contest_minigames: BTreeMap::new(),
             leader_known_by: BTreeSet::new(),
             intermission_opt_ins: BTreeSet::new(),
             intermission_entrants: None,
@@ -492,6 +502,14 @@ impl GameState {
     /// prompt).
     pub(crate) fn tasks(&self) -> impl Iterator<Item = &TaskDef> {
         self.tasks.values()
+    }
+
+    /// Every currently-open contest mini-game session -- see
+    /// `GameState::contest_minigames`'s own doc comment.
+    pub(crate) fn contest_minigames(
+        &self,
+    ) -> impl Iterator<Item = (&(Round, ContestCategory), &ContestMinigameSession)> {
+        self.contest_minigames.iter()
     }
 
     pub fn is_task_open(&self, id: TaskId) -> bool {
@@ -1133,6 +1151,37 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
             category,
             ton_won,
         } => record_contest_result(state, round, category, ton_won)?,
+
+        Command::OpenContestMinigame {
+            round,
+            category,
+            prompt,
+            correct_answer,
+        } => open_contest_minigame(state, round, category, prompt, correct_answer)?,
+        Command::SubmitCreativeEntry {
+            player,
+            round,
+            text,
+        } => submit_creative_entry(state, player, round, text)?,
+        Command::RateCreativeEntry {
+            player,
+            round,
+            target,
+            stars,
+        } => rate_creative_entry(state, player, round, target, stars)?,
+        Command::SubmitIntelligenceAnswer {
+            player,
+            round,
+            answer,
+        } => submit_intelligence_answer(state, player, round, answer)?,
+        Command::SubmitPhysicalPlacement {
+            player,
+            round,
+            placement,
+        } => submit_physical_placement(state, player, round, placement)?,
+        Command::CloseContestMinigame { round, category } => {
+            close_contest_minigame(state, round, category)?
+        }
 
         Command::OptIntoIntermission { player } => opt_into_intermission(state, player)?,
         Command::DrawIntermissionEntrants { selected } => {
@@ -2247,6 +2296,194 @@ fn record_contest_result(
         trigger_leader_confidant(state, &mut events);
     }
 
+    Ok(events)
+}
+
+/// Opens `category`'s mini-game session for `round` -- see
+/// `Command::OpenContestMinigame`'s doc comment.
+fn open_contest_minigame(
+    state: &mut GameState,
+    round: Round,
+    category: ContestCategory,
+    prompt: String,
+    correct_answer: Option<String>,
+) -> Result<Vec<DomainEvent>, GameError> {
+    contest_minigame::check_is_contest_round(round)?;
+    contest_minigame::check_entry_len("contest mini-game prompt", &prompt)?;
+    if let Some(answer) = &correct_answer {
+        contest_minigame::check_entry_len("contest mini-game answer", answer)?;
+    }
+    if state.contest_results.contains_key(&(round, category)) {
+        return Err(GameError::ContestResultAlreadyRecorded { round, category });
+    }
+    if state.contest_minigames.contains_key(&(round, category)) {
+        return Err(GameError::ContestMinigameAlreadyOpen { round, category });
+    }
+
+    state.contest_minigames.insert(
+        (round, category),
+        contest_minigame::new_session(prompt.clone(), correct_answer),
+    );
+    Ok(vec![DomainEvent::ContestMinigameOpened {
+        round,
+        category,
+        prompt,
+    }])
+}
+
+fn submit_creative_entry(
+    state: &mut GameState,
+    player: PlayerId,
+    round: Round,
+    text: String,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    contest_minigame::check_entry_len("creative entry", &text)?;
+    let session = state
+        .contest_minigames
+        .get_mut(&(round, ContestCategory::Creativity))
+        .ok_or(GameError::ContestMinigameNotOpen {
+            round,
+            category: ContestCategory::Creativity,
+        })?;
+    if session.creative_entries.contains_key(&player) {
+        return Err(GameError::AlreadySubmittedToContestMinigame(player));
+    }
+    session.creative_entries.insert(player, text);
+    Ok(vec![DomainEvent::CreativeEntrySubmitted { player, round }])
+}
+
+fn rate_creative_entry(
+    state: &mut GameState,
+    player: PlayerId,
+    round: Round,
+    target: PlayerId,
+    stars: u8,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    if player == target {
+        return Err(GameError::CannotRateSelfInContestMinigame);
+    }
+    if !(1..=5).contains(&stars) {
+        return Err(GameError::StarRatingOutOfRange(stars));
+    }
+    let session = state
+        .contest_minigames
+        .get_mut(&(round, ContestCategory::Creativity))
+        .ok_or(GameError::ContestMinigameNotOpen {
+            round,
+            category: ContestCategory::Creativity,
+        })?;
+    if !session.creative_entries.contains_key(&target) {
+        return Err(GameError::NoContestEntryToRate(target));
+    }
+    session
+        .creative_ratings
+        .entry(player)
+        .or_default()
+        .insert(target, stars);
+    Ok(vec![DomainEvent::CreativeEntryRated {
+        rater: player,
+        target,
+        round,
+        stars,
+    }])
+}
+
+fn submit_intelligence_answer(
+    state: &mut GameState,
+    player: PlayerId,
+    round: Round,
+    answer: String,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    contest_minigame::check_entry_len("intelligence answer", &answer)?;
+    let session = state
+        .contest_minigames
+        .get_mut(&(round, ContestCategory::Intelligence))
+        .ok_or(GameError::ContestMinigameNotOpen {
+            round,
+            category: ContestCategory::Intelligence,
+        })?;
+    if !session.intelligence_attempts.insert(player) {
+        return Err(GameError::AlreadySubmittedToContestMinigame(player));
+    }
+    let correct = session
+        .correct_answer
+        .as_deref()
+        .is_some_and(|expected| expected.trim().eq_ignore_ascii_case(answer.trim()));
+    if correct {
+        session.correct_order.push(player);
+    }
+    Ok(vec![DomainEvent::IntelligenceAnswerAttempted {
+        player,
+        round,
+        correct,
+    }])
+}
+
+fn submit_physical_placement(
+    state: &mut GameState,
+    player: PlayerId,
+    round: Round,
+    placement: u32,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    if placement == 0 {
+        return Err(GameError::PlacementOutOfRange(placement));
+    }
+    let session = state
+        .contest_minigames
+        .get_mut(&(round, ContestCategory::Strength))
+        .ok_or(GameError::ContestMinigameNotOpen {
+            round,
+            category: ContestCategory::Strength,
+        })?;
+    if session.placements.contains_key(&player) {
+        return Err(GameError::AlreadySubmittedToContestMinigame(player));
+    }
+    session.placements.insert(player, placement);
+    Ok(vec![DomainEvent::PhysicalPlacementSubmitted {
+        player,
+        round,
+        placement,
+    }])
+}
+
+/// Closes `category`'s mini-game session for `round` and resolves it into
+/// a real contest result -- see `Command::CloseContestMinigame`'s doc
+/// comment.
+fn close_contest_minigame(
+    state: &mut GameState,
+    round: Round,
+    category: ContestCategory,
+) -> Result<Vec<DomainEvent>, GameError> {
+    let session = state
+        .contest_minigames
+        .get(&(round, category))
+        .ok_or(GameError::ContestMinigameNotOpen { round, category })?;
+    let scores = match category {
+        ContestCategory::Creativity => session.creative_scores(),
+        ContestCategory::Intelligence => session.intelligence_scores(),
+        ContestCategory::Strength => session.physical_scores(),
+    };
+    let ton_won =
+        contest_minigame::resolve_ton_won(state, &scores, contest_minigame::DEFAULT_TOP_N_SCORERS);
+
+    // `record_contest_result` re-validates the round and rejects a
+    // duplicate on its own -- if it fails, the session stays open rather
+    // than being silently discarded, so the Host can retry.
+    let mut events = record_contest_result(state, round, category, ton_won)?;
+    state.contest_minigames.remove(&(round, category));
+    events.push(DomainEvent::ContestMinigameClosed { round, category });
     Ok(events)
 }
 
@@ -10445,6 +10682,463 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    fn setup_for_contest(n_ton: usize, n_room: usize) -> (GameState, Vec<PlayerId>, Vec<PlayerId>) {
+        let mut state = GameState::new();
+        let mut ton = Vec::new();
+        let mut room = Vec::new();
+        for i in 0..n_ton {
+            ton.push(add_player(&mut state, &format!("Ton{i}"), Faction::Ton));
+        }
+        for i in 0..n_room {
+            room.push(add_player(
+                &mut state,
+                &format!("Room{i}"),
+                Faction::Uprising,
+            ));
+        }
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        (state, ton, room)
+    }
+
+    #[test]
+    fn open_contest_minigame_rejects_a_non_contest_round() {
+        let (mut state, ..) = setup_for_contest(1, 1);
+        let result = apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::One,
+                category: ContestCategory::Creativity,
+                prompt: "Draw a cat".into(),
+                correct_answer: None,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotAContestRound(Round::One)));
+    }
+
+    #[test]
+    fn open_contest_minigame_rejects_a_second_open() {
+        let (mut state, ..) = setup_for_contest(1, 1);
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                prompt: "Draw a cat".into(),
+                correct_answer: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                prompt: "Draw a dog".into(),
+                correct_answer: None,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::ContestMinigameAlreadyOpen {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+            })
+        );
+    }
+
+    #[test]
+    fn creativity_minigame_resolves_ton_won_from_top_scorers_and_removes_the_session() {
+        let (mut state, ton, room) = setup_for_contest(2, 2);
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                prompt: "Draw a cat".into(),
+                correct_answer: None,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitCreativeEntry {
+                player: ton[0],
+                round: Round::Two,
+                text: "a cat".into(),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitCreativeEntry {
+                player: room[0],
+                round: Round::Two,
+                text: "a dog".into(),
+            },
+        )
+        .unwrap();
+        // Ton's entry gets 5 stars from both other players; Room's gets 1.
+        for rater in [room[1], ton[1]] {
+            apply_command(
+                &mut state,
+                Command::RateCreativeEntry {
+                    player: rater,
+                    round: Round::Two,
+                    target: ton[0],
+                    stars: 5,
+                },
+            )
+            .unwrap();
+            apply_command(
+                &mut state,
+                Command::RateCreativeEntry {
+                    player: rater,
+                    round: Round::Two,
+                    target: room[0],
+                    stars: 1,
+                },
+            )
+            .unwrap();
+        }
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+            },
+        )
+        .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestResultRecorded { ton_won: true, .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestMinigameClosed { .. })));
+        // The session is gone -- a second close is rejected as "not open,"
+        // not "already recorded."
+        let result = apply_command(
+            &mut state,
+            Command::CloseContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::ContestMinigameNotOpen {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+            })
+        );
+    }
+
+    #[test]
+    fn rate_creative_entry_rejects_self_rating_out_of_range_and_a_missing_target() {
+        let (mut state, ton, _room) = setup_for_contest(1, 1);
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                prompt: "Draw a cat".into(),
+                correct_answer: None,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitCreativeEntry {
+                player: ton[0],
+                round: Round::Two,
+                text: "a cat".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_command(
+                &mut state,
+                Command::RateCreativeEntry {
+                    player: ton[0],
+                    round: Round::Two,
+                    target: ton[0],
+                    stars: 3,
+                },
+            ),
+            Err(GameError::CannotRateSelfInContestMinigame)
+        );
+        assert_eq!(
+            apply_command(
+                &mut state,
+                Command::RateCreativeEntry {
+                    player: _room[0],
+                    round: Round::Two,
+                    target: ton[0],
+                    stars: 6,
+                },
+            ),
+            Err(GameError::StarRatingOutOfRange(6))
+        );
+        // `_room[0]` never submitted an entry -- ton[0] rating them (not
+        // themselves) must hit the "no entry" rejection, not self-rating.
+        assert_eq!(
+            apply_command(
+                &mut state,
+                Command::RateCreativeEntry {
+                    player: ton[0],
+                    round: Round::Two,
+                    target: _room[0],
+                    stars: 3,
+                },
+            ),
+            Err(GameError::NoContestEntryToRate(_room[0]))
+        );
+    }
+
+    #[test]
+    fn submit_creative_entry_rejects_a_duplicate() {
+        let (mut state, ton, _room) = setup_for_contest(1, 1);
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                prompt: "Draw a cat".into(),
+                correct_answer: None,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitCreativeEntry {
+                player: ton[0],
+                round: Round::Two,
+                text: "a cat".into(),
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::SubmitCreativeEntry {
+                player: ton[0],
+                round: Round::Two,
+                text: "a better cat".into(),
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::AlreadySubmittedToContestMinigame(ton[0]))
+        );
+    }
+
+    #[test]
+    fn intelligence_answer_is_checked_trimmed_and_case_insensitively_then_ranked_by_speed() {
+        let (mut state, ton, room) = setup_for_contest(1, 3);
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Intelligence,
+                prompt: "What's 2+2?".into(),
+                correct_answer: Some("Four".into()),
+            },
+        )
+        .unwrap();
+
+        // Wrong first, from a Room player.
+        let wrong = apply_command(
+            &mut state,
+            Command::SubmitIntelligenceAnswer {
+                player: room[0],
+                round: Round::Two,
+                answer: "Five".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            wrong[0],
+            DomainEvent::IntelligenceAnswerAttempted { correct: false, .. }
+        ));
+        // A second attempt is rejected outright, even with the right answer.
+        assert_eq!(
+            apply_command(
+                &mut state,
+                Command::SubmitIntelligenceAnswer {
+                    player: room[0],
+                    round: Round::Two,
+                    answer: "four".into(),
+                },
+            ),
+            Err(GameError::AlreadySubmittedToContestMinigame(room[0]))
+        );
+
+        // Ton solves it first (fastest), trimmed/case-insensitive match.
+        apply_command(
+            &mut state,
+            Command::SubmitIntelligenceAnswer {
+                player: ton[0],
+                round: Round::Two,
+                answer: "  four  ".into(),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitIntelligenceAnswer {
+                player: room[1],
+                round: Round::Two,
+                answer: "FOUR".into(),
+            },
+        )
+        .unwrap();
+
+        // Ton solved first (score 2) and gets the only other correct
+        // solver's rival share (room[1], score 1) -- Ton wins the category.
+        let events = apply_command(
+            &mut state,
+            Command::CloseContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Intelligence,
+            },
+        )
+        .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestResultRecorded { ton_won: true, .. })));
+    }
+
+    #[test]
+    fn physical_placement_rejects_zero_and_a_duplicate_then_resolves_by_placement() {
+        let (mut state, ton, room) = setup_for_contest(1, 1);
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                prompt: "Tug of war".into(),
+                correct_answer: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_command(
+                &mut state,
+                Command::SubmitPhysicalPlacement {
+                    player: ton[0],
+                    round: Round::Two,
+                    placement: 0,
+                },
+            ),
+            Err(GameError::PlacementOutOfRange(0))
+        );
+
+        apply_command(
+            &mut state,
+            Command::SubmitPhysicalPlacement {
+                player: ton[0],
+                round: Round::Two,
+                placement: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            apply_command(
+                &mut state,
+                Command::SubmitPhysicalPlacement {
+                    player: ton[0],
+                    round: Round::Two,
+                    placement: 2,
+                },
+            ),
+            Err(GameError::AlreadySubmittedToContestMinigame(ton[0]))
+        );
+        apply_command(
+            &mut state,
+            Command::SubmitPhysicalPlacement {
+                player: room[0],
+                round: Round::Two,
+                placement: 2,
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+            },
+        )
+        .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestResultRecorded { ton_won: true, .. })));
+    }
+
+    #[test]
+    fn resolve_ton_won_treats_a_converted_player_as_room_not_ton() {
+        let (mut state, king_queen, _prince, _leader, cult_leader) = setup_full_game();
+        let room_player = add_player(&mut state, "RoomPlayer", Faction::Uprising);
+        apply_command(&mut state, Command::FinalizeSetup).unwrap();
+        grant_recruitment_slots(&mut state, 1);
+        apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: king_queen,
+            },
+        )
+        .unwrap();
+        assert!(state.player(king_queen).unwrap().converted);
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                prompt: "Tug of war".into(),
+                correct_answer: None,
+            },
+        )
+        .unwrap();
+        // The converted (ex-)King/Queen "wins" outright, but their true
+        // faction is now Cult, not Ton -- must count against Ton.
+        apply_command(
+            &mut state,
+            Command::SubmitPhysicalPlacement {
+                player: king_queen,
+                round: Round::Two,
+                placement: 1,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitPhysicalPlacement {
+                player: room_player,
+                round: Round::Two,
+                placement: 2,
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+            },
+        )
+        .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestResultRecorded { ton_won: false, .. })));
     }
 
     #[test]

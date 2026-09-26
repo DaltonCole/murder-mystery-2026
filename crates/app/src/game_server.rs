@@ -520,29 +520,40 @@ fn auto_close_denouncement_phase(state: &mut GameState) -> Vec<DomainEvent> {
 }
 
 /// Closes every currently-open task (via `Command::CloseTasks`) the
-/// instant a Denouncement opens -- Dalton's own explicit instruction:
-/// "once denouncement has started, remove the tasks from the player
-/// screen and close the tasks. Any incomplete tasks are considered failed
-/// tasks." `CloseTasks` already makes closed tasks disappear from every
-/// player's `open_tasks` (see `engine::view`'s own tests), and a
-/// never-attempted task was already treated identically to an
-/// explicitly-failed one everywhere that matters (e.g.
-/// `ton_met_task_threshold`'s Leader's Confidants trigger) -- so this is
-/// purely the missing automation, not a new engine rule. `CloseTasks` is
-/// already a safe no-op when nothing is open (see its own doc comment), so
-/// this never needs to check first.
+/// instant a Denouncement opens, or the instant the round advances into
+/// Round 2 or Round 4 -- Dalton's own explicit instructions: "once
+/// denouncement has started, remove the tasks from the player screen and
+/// close the tasks. Any incomplete tasks are considered failed tasks," and
+/// later, "for even rounds, players should not have the option to
+/// complete odd round tasks." The Denouncement-open trigger alone left a
+/// gap: Round 1 has no Denouncement at all, so a task still open when the
+/// game advances straight from Round 1 into Round 2 would otherwise linger
+/// on every player's screen throughout the whole contest round.
+/// `CloseTasks` already makes closed tasks disappear from every player's
+/// `open_tasks` (see `engine::view`'s own tests), and a never-attempted
+/// task was already treated identically to an explicitly-failed one
+/// everywhere that matters (e.g. `ton_met_task_threshold`'s Leader's
+/// Confidants trigger) -- so this is purely automation, not a new engine
+/// rule. `CloseTasks` is already a safe no-op when nothing is open (see
+/// its own doc comment), so this never needs to check first.
 ///
 /// Triggered by scanning `events` (whatever command was just applied) for
-/// `DomainEvent::DenouncementOpened` -- same shape as
-/// `auto_push_on_round_advance`.
-fn auto_close_tasks_on_denouncement_open(
+/// `DomainEvent::DenouncementOpened` or a `RoundAdvanced` into Round 2/4 --
+/// same shape as `auto_push_on_round_advance`.
+fn auto_close_tasks_on_denouncement_open_or_even_round(
     state: &mut GameState,
     events: &[DomainEvent],
 ) -> Vec<DomainEvent> {
-    if !events
-        .iter()
-        .any(|e| matches!(e, DomainEvent::DenouncementOpened))
-    {
+    let should_close = events.iter().any(|e| {
+        matches!(e, DomainEvent::DenouncementOpened)
+            || matches!(
+                e,
+                DomainEvent::RoundAdvanced {
+                    round: Round::Two | Round::Four
+                }
+            )
+    });
+    if !should_close {
         return Vec::new();
     }
     apply_command(state, Command::CloseTasks).unwrap_or_default()
@@ -563,7 +574,9 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let auto_events = auto_push_on_round_advance(&mut state, &events, &mut pushed);
         events.extend(auto_events);
-        events.extend(auto_close_tasks_on_denouncement_open(&mut state, &events));
+        events.extend(auto_close_tasks_on_denouncement_open_or_even_round(
+            &mut state, &events,
+        ));
         events.extend(auto_close_denouncement_phase(&mut state));
     }
     // Errors here just mean nobody's subscribed right now -- fine to

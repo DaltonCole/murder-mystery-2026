@@ -49,11 +49,11 @@ mod game_server;
 use dioxus::fullstack::{use_websocket, WebSocketOptions, Websocket};
 use dioxus::prelude::*;
 use engine::{
-    pascal_case, AbilityStatus, Ballot, Bio, Character, Command, ContestCategory, DenouncementView,
-    DomainEvent, Faction, GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind,
-    PlayerId, PlayerReveal, PlayerStatus, PlayerView, RosterEntry, Round, RoundHistoryEntry,
-    TaskHistoryEntry, TaskOutcome, TaskTier, TaskView, Viewer, WhistledownPost,
-    MIN_CATEGORY_ENTRIES,
+    pascal_case, AbilityStatus, Ballot, Bio, Character, Command, ContestCategory,
+    ContestMinigameView, DenouncementView, DomainEvent, Faction, GalleryPrediction,
+    InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind, PlayerId, PlayerReveal, PlayerStatus,
+    PlayerView, RosterEntry, Round, RoundHistoryEntry, TaskHistoryEntry, TaskOutcome, TaskTier,
+    TaskView, Viewer, WhistledownPost, MIN_CATEGORY_ENTRIES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -286,6 +286,8 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
         | Command::PushTask { .. }
         | Command::CloseTasks
         | Command::RecordContestResult { .. }
+        | Command::OpenContestMinigame { .. }
+        | Command::CloseContestMinigame { .. }
         | Command::DrawIntermissionEntrants { .. }
         | Command::AwardServantPoints { .. }
         | Command::ResolveGalleryPredictions { .. } => None,
@@ -310,6 +312,10 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
         | Command::ActivateGrandInquisitor { player }
         | Command::ArmVoteShield { player }
         | Command::OptIntoIntermission { player }
+        | Command::SubmitCreativeEntry { player, .. }
+        | Command::RateCreativeEntry { player, .. }
+        | Command::SubmitIntelligenceAnswer { player, .. }
+        | Command::SubmitPhysicalPlacement { player, .. }
         | Command::SubmitGalleryPrediction { player, .. } => Some(*player),
 
         Command::Convert { converter, .. } => Some(*converter),
@@ -931,21 +937,37 @@ fn Play() -> Element {
                 if v.i_am_drunk {
                     p { class: "error-text", "You're drunk this round -- you can't nominate or vote." }
                 }
-                for task in v.open_tasks.clone() {
-                    if task.is_location_task {
-                        LocationTaskAttemptForm {
-                            key: "{task.id.0}",
-                            my_id: id,
-                            task,
-                            on_command: send_cmd,
-                        }
-                    } else {
-                        TaskAttemptForm {
-                            key: "{task.id.0}",
-                            my_id: id,
-                            task,
-                            roster: v.roster.clone(),
-                            on_command: send_cmd,
+                // Dalton's own explicit instruction: even rounds (2 and 4)
+                // are contest rounds -- players are directed to the
+                // Creativity/Intelligence/Strength mini-games instead of
+                // the odd-round bio-derived/location tasks (which
+                // `game_server::auto_close_tasks_on_denouncement_open_or_even_round`
+                // already makes sure are closed and gone from
+                // `open_tasks` by the time a round actually reaches here).
+                if matches!(v.current_round, Round::Two | Round::Four) {
+                    ContestMinigamePanel {
+                        my_id: id,
+                        sessions: v.open_contest_minigames.clone(),
+                        roster: v.roster.clone(),
+                        on_command: send_cmd,
+                    }
+                } else {
+                    for task in v.open_tasks.clone() {
+                        if task.is_location_task {
+                            LocationTaskAttemptForm {
+                                key: "{task.id.0}",
+                                my_id: id,
+                                task,
+                                on_command: send_cmd,
+                            }
+                        } else {
+                            TaskAttemptForm {
+                                key: "{task.id.0}",
+                                my_id: id,
+                                task,
+                                roster: v.roster.clone(),
+                                on_command: send_cmd,
+                            }
                         }
                     }
                 }
@@ -2554,6 +2576,184 @@ fn LocationTaskAttemptForm(
     }
 }
 
+/// Renders every currently-open contest mini-game session on `/play`'s
+/// Round tab during Round 2/4 -- see `contest_minigame`'s (engine-side)
+/// module doc comment for the mechanics themselves. One sub-form per
+/// category, shown only for sessions that actually exist right now (the
+/// Host opens them one at a time for Round 2, all three at once for
+/// Round 4).
+#[component]
+fn ContestMinigamePanel(
+    my_id: PlayerId,
+    sessions: Vec<ContestMinigameView>,
+    roster: Vec<RosterEntry>,
+    on_command: EventHandler<Command>,
+) -> Element {
+    if sessions.is_empty() {
+        return rsx! {
+            p { "No contest is open right now -- wait for the Host to start one." }
+        };
+    }
+    rsx! {
+        for session in sessions {
+            div {
+                key: "{session.round:?}-{session.category:?}",
+                h4 { "{session.category:?}" }
+                p { "{session.prompt}" }
+                match session.category {
+                    ContestCategory::Creativity => rsx! {
+                        CreativityMinigameForm { my_id, session, roster: roster.clone(), on_command }
+                    },
+                    ContestCategory::Intelligence => rsx! {
+                        IntelligenceMinigameForm { my_id, session, on_command }
+                    },
+                    ContestCategory::Strength => rsx! {
+                        PhysicalMinigameForm { my_id, session, on_command }
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn CreativityMinigameForm(
+    my_id: PlayerId,
+    session: ContestMinigameView,
+    roster: Vec<RosterEntry>,
+    on_command: EventHandler<Command>,
+) -> Element {
+    let mut entry_text = use_signal(String::new);
+    let mut rating_picks = use_signal(|| None::<u8>);
+    let round = session.round;
+    let already_submitted = session.creative_entries.iter().any(|(id, _)| *id == my_id);
+    let others: Vec<(PlayerId, String)> = session
+        .creative_entries
+        .iter()
+        .filter(|(id, _)| *id != my_id)
+        .cloned()
+        .collect();
+
+    rsx! {
+        if already_submitted {
+            p { "Your entry is in." }
+        } else {
+            input {
+                placeholder: "Your entry",
+                value: "{entry_text}",
+                oninput: move |e| entry_text.set(e.value()),
+            }
+            button {
+                disabled: entry_text().trim().is_empty(),
+                onclick: move |_| {
+                    on_command.call(Command::SubmitCreativeEntry {
+                        player: my_id,
+                        round,
+                        text: entry_text.peek().trim().to_string(),
+                    });
+                    entry_text.set(String::new());
+                },
+                "Submit entry",
+            }
+        }
+        if !others.is_empty() {
+            h5 { "Rate everyone else's entry" }
+            for (target , text) in others {
+                div {
+                    key: "{target.0}",
+                    p { "{names(&[target], &roster)}: {text}" }
+                    if session.my_creative_ratings_given.contains(&target) {
+                        " (already rated)"
+                    } else {
+                        select {
+                            onchange: move |e| rating_picks.set(e.value().parse().ok()),
+                            option { value: "", "-- stars --" }
+                            for stars in 1..=5u8 {
+                                option { value: "{stars}", "{stars}" }
+                            }
+                        }
+                        button {
+                            disabled: rating_picks().is_none(),
+                            onclick: move |_| {
+                                let Some(stars) = rating_picks() else { return };
+                                on_command.call(Command::RateCreativeEntry { player: my_id, round, target, stars });
+                                rating_picks.set(None);
+                            },
+                            "Rate",
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn IntelligenceMinigameForm(
+    my_id: PlayerId,
+    session: ContestMinigameView,
+    on_command: EventHandler<Command>,
+) -> Element {
+    let mut answer = use_signal(String::new);
+    let round = session.round;
+
+    if session.my_intelligence_attempted {
+        return rsx! {
+            p { "You've already answered." }
+        };
+    }
+    rsx! {
+        input {
+            placeholder: "Your answer",
+            value: "{answer}",
+            oninput: move |e| answer.set(e.value()),
+        }
+        button {
+            disabled: answer().trim().is_empty(),
+            onclick: move |_| {
+                on_command.call(Command::SubmitIntelligenceAnswer {
+                    player: my_id,
+                    round,
+                    answer: answer.peek().trim().to_string(),
+                });
+            },
+            "Submit answer",
+        }
+    }
+}
+
+#[component]
+fn PhysicalMinigameForm(
+    my_id: PlayerId,
+    session: ContestMinigameView,
+    on_command: EventHandler<Command>,
+) -> Element {
+    let mut placement = use_signal(|| None::<u32>);
+    let round = session.round;
+
+    if let Some(placement) = session.my_physical_placement {
+        return rsx! {
+            p { "You reported finishing in place {placement}." }
+        };
+    }
+    rsx! {
+        p { "Once the challenge is judged live, enter where you finished (1 = won outright)." }
+        input {
+            r#type: "number",
+            min: "1",
+            oninput: move |e| placement.set(e.value().parse().ok()),
+        }
+        button {
+            disabled: placement().is_none(),
+            onclick: move |_| {
+                let Some(p) = placement() else { return };
+                on_command.call(Command::SubmitPhysicalPlacement { player: my_id, round, placement: p });
+            },
+            "Submit placement",
+        }
+    }
+}
+
 // --- /host -----------------------------------------------------------------
 
 /// Which section of the Host console is currently showing. Dalton's own
@@ -2775,6 +2975,8 @@ fn Host() -> Element {
     // clobber an already-correct result for a different category.
     let mut contest_category = use_signal(|| None::<ContestCategory>);
     let mut contest_ton_won = use_signal(|| None::<bool>);
+    let mut minigame_prompt = use_signal(String::new);
+    let mut minigame_answer = use_signal(String::new);
     let mut servant_award_player = use_signal(|| None::<u32>);
     let mut servant_award_points = use_signal(|| 1u32);
     let mut gallery_winner = use_signal(|| Faction::Ton);
@@ -2802,6 +3004,7 @@ fn Host() -> Element {
     let denouncement_phase = view().and_then(|v| v.denouncement);
     let open_tasks = view().map(|v| v.open_tasks).unwrap_or_default();
     let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
+    let open_contest_minigames = view().map(|v| v.open_contest_minigames).unwrap_or_default();
     let winner = view().and_then(|v| v.winner);
     let task_candidates = view().map(|v| v.task_candidates).unwrap_or_default();
     let finale_reveal = view().and_then(|v| v.finale_reveal);
@@ -3152,12 +3355,12 @@ fn Host() -> Element {
         if host_page() == HostPage::Contests {
         div {
             h3 { "Contest rounds (Round 2 & 4)" }
-            p { "The actual mini-games are designed later -- this just records each category's result. Players never see the running standings or the breakdown (only the engine tracks it, for the Leader's Confidants)." }
+            p { "Creativity and Intelligence run as real in-app mini-games; Strength is judged live in person, with each participant self-reporting their own placement in-app (never a \"Ton vs the room\" vote -- players aren't supposed to know who's on which side). \"Record result\" below stays as a manual fallback." }
             p {
                 if contest_round() == Round::Two {
                     "Round 2: the whole room competes together, one category at a time."
                 } else {
-                    "Round 4: 3 simultaneous zones, one per category -- a Cast-Out scorekeeper reports each zone's result in as it finishes."
+                    "Round 4: 3 simultaneous zones, one per category -- open all three sessions at once and let players self-select which zone they're in by which one they submit to."
                 }
             }
             select {
@@ -3187,6 +3390,67 @@ fn Host() -> Element {
                 option { value: "Creativity", "Creativity" }
                 option { value: "Intelligence", "Intelligence" }
             }
+            h4 { "Open a mini-game session" }
+            input {
+                placeholder: if contest_category() == Some(ContestCategory::Strength) { "Challenge description (informational only)" } else { "Prompt / question" },
+                value: "{minigame_prompt}",
+                oninput: move |e| minigame_prompt.set(e.value()),
+            }
+            if contest_category() == Some(ContestCategory::Intelligence) {
+                input {
+                    placeholder: "Correct answer",
+                    value: "{minigame_answer}",
+                    oninput: move |e| minigame_answer.set(e.value()),
+                }
+            }
+            button {
+                disabled: contest_category().is_none() || minigame_prompt().trim().is_empty(),
+                onclick: move |_| {
+                    let Some(category) = contest_category() else { return };
+                    let correct_answer = (category == ContestCategory::Intelligence)
+                        .then(|| minigame_answer())
+                        .filter(|a| !a.trim().is_empty());
+                    do_cmd(Command::OpenContestMinigame {
+                        round: contest_round(),
+                        category,
+                        prompt: minigame_prompt(),
+                        correct_answer,
+                    });
+                    minigame_prompt.set(String::new());
+                    minigame_answer.set(String::new());
+                },
+                "Open mini-game",
+            }
+            h4 { "Currently open sessions" }
+            if open_contest_minigames.is_empty() {
+                p { "None open." }
+            } else {
+                ul {
+                    for session in open_contest_minigames.clone() {
+                        li {
+                            key: "{session.round:?}-{session.category:?}",
+                            "{session.round:?} / {session.category:?}: \"{session.prompt}\" -- {session.submission_count} submitted"
+                            if session.category == ContestCategory::Intelligence {
+                                if let Some(answer) = &session.answer {
+                                    " (answer: {answer})"
+                                }
+                            }
+                            " "
+                            button {
+                                onclick: move |_| {
+                                    do_cmd(Command::CloseContestMinigame {
+                                        round: session.round,
+                                        category: session.category,
+                                    });
+                                },
+                                "Close & resolve",
+                            }
+                        }
+                    }
+                }
+            }
+            h4 { "Manual fallback" }
+            p { "Only for a live-event fix-up -- overrides/records a result directly without an open session." }
             select {
                 value: match contest_ton_won() {
                     Some(true) => "Ton",
