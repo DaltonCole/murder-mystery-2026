@@ -4,6 +4,7 @@ use crate::character::{Character, PlayerStatus};
 use crate::contest::ContestCategory;
 use crate::denouncement::DenouncementPhase;
 use crate::finale_reveal::{self, FinaleReveal, PlayerReveal};
+use crate::history::{self, RoundHistoryEntry, TaskHistoryEntry};
 use crate::player::{Faction, PlayerId};
 use crate::round::Round;
 use crate::state::GameState;
@@ -208,6 +209,17 @@ pub struct PlayerView {
     /// Host/Display. Lets `/play` show a player what they rated themselves
     /// before the raffle runs.
     pub own_interest_level: Option<u8>,
+    /// The viewer's own outcome (Completed/NoMatch/Failed) on every task
+    /// that has ever *closed* -- never another player's, and never
+    /// populated for Host/Display. The player's own History tab's task
+    /// section -- see `history::task_history`'s doc comment. A currently
+    /// *open* task isn't here yet; it's still in `open_tasks` above.
+    pub task_history: Vec<TaskHistoryEntry>,
+    /// The viewer's own nomination and ballot for every round that had a
+    /// Denouncement -- never another player's, and never populated for
+    /// Host/Display. The player's own History tab's nominations/votes
+    /// section -- see `history::round_history`'s doc comment.
+    pub round_history: Vec<RoundHistoryEntry>,
     /// Every player's signup interest rating submitted so far, as
     /// `(PlayerId, level)` pairs -- `Viewer::Host` ONLY, always empty for
     /// `Viewer::Player`/`Viewer::Display`. This is the raw input the Host
@@ -380,6 +392,12 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     let gallery_resolved = is_host && state.gallery_resolved();
     let own_bio = viewer_id.and_then(|id| state.bio(id)).cloned();
     let own_interest_level = viewer_id.and_then(|id| state.interest_level(id));
+    let task_history = viewer_id
+        .map(|id| history::task_history(state, id))
+        .unwrap_or_default();
+    let round_history = viewer_id
+        .map(|id| history::round_history(state, id))
+        .unwrap_or_default();
     let interest_levels = if is_host {
         state.interest_levels().collect()
     } else {
@@ -444,6 +462,8 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         whistledown: crate::whistledown::posts(state),
         own_bio,
         own_interest_level,
+        task_history,
+        round_history,
         interest_levels,
         task_candidates,
         finale_reveal: finale_reveal_for_host,
@@ -460,6 +480,7 @@ mod tests {
     use super::*;
     use crate::command::Command;
     use crate::event::DomainEvent;
+    use crate::history::TaskOutcome;
     use crate::state::apply_command;
 
     fn two_player_state() -> GameState {
@@ -2021,6 +2042,83 @@ mod tests {
         );
         assert_eq!(view_for(&state, Viewer::Host).own_interest_level, None);
         assert_eq!(view_for(&state, Viewer::Display).own_interest_level, None);
+    }
+
+    #[test]
+    fn task_and_round_history_are_visible_only_to_their_own_player() {
+        let mut state = three_player_state();
+        apply_command(
+            &mut state,
+            Command::AddPlayer {
+                name: "Dave".into(),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "Talk to someone wearing red".into(),
+                tier: crate::task::TaskTier::Easy,
+                qualifying_players: [PlayerId(1)].into_iter().collect(),
+                expected_code: None,
+            },
+        )
+        .unwrap();
+        let task_id = match state.event_log().last() {
+            Some(DomainEvent::TaskPushed { id, .. }) => *id,
+            other => panic!("expected TaskPushed, got {other:?}"),
+        };
+        apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: PlayerId(0),
+                task: task_id,
+                named: [PlayerId(1), PlayerId(2), PlayerId(3)],
+            },
+        )
+        .unwrap();
+        apply_command(&mut state, Command::CloseTasks).unwrap();
+
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+        apply_command(&mut state, Command::AdvanceRound).unwrap();
+        apply_command(&mut state, Command::OpenDenouncement).unwrap();
+        apply_command(
+            &mut state,
+            Command::Nominate {
+                voter: PlayerId(0),
+                nominee: PlayerId(1),
+            },
+        )
+        .unwrap();
+
+        let alice_view = view_for(&state, Viewer::Player(PlayerId(0)));
+        assert_eq!(alice_view.task_history.len(), 1);
+        assert_eq!(alice_view.task_history[0].outcome, TaskOutcome::Completed);
+        assert_eq!(alice_view.round_history.len(), 1);
+        assert_eq!(alice_view.round_history[0].nominated, Some(PlayerId(1)));
+
+        // Bob gets his own history (he never attempted the task, and never
+        // nominated) -- correctly non-empty, but never Alice's outcome or
+        // her nomination.
+        let bob_view = view_for(&state, Viewer::Player(PlayerId(1)));
+        assert_eq!(bob_view.task_history.len(), 1);
+        assert_eq!(bob_view.task_history[0].outcome, TaskOutcome::Failed);
+        assert_eq!(bob_view.round_history.len(), 1);
+        assert_eq!(bob_view.round_history[0].nominated, None);
+
+        for viewer in [Viewer::Host, Viewer::Display] {
+            let view = view_for(&state, viewer);
+            assert_eq!(
+                view.task_history,
+                Vec::new(),
+                "Host/Display should never get a per-player task history"
+            );
+            assert_eq!(
+                view.round_history,
+                Vec::new(),
+                "Host/Display should never get a per-player round history"
+            );
+        }
     }
 
     #[test]

@@ -51,8 +51,9 @@ use dioxus::prelude::*;
 use engine::{
     pascal_case, AbilityStatus, Ballot, Bio, Character, Command, ContestCategory, DenouncementView,
     DomainEvent, Faction, GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind,
-    PlayerId, PlayerReveal, PlayerStatus, PlayerView, RosterEntry, Round, TaskTier, TaskView,
-    Viewer, WhistledownPost, MIN_CATEGORY_ENTRIES,
+    PlayerId, PlayerReveal, PlayerStatus, PlayerView, RosterEntry, Round, RoundHistoryEntry,
+    TaskHistoryEntry, TaskOutcome, TaskTier, TaskView, Viewer, WhistledownPost,
+    MIN_CATEGORY_ENTRIES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -664,6 +665,12 @@ enum PlayTab {
     Character,
     Round,
     Game,
+    /// Dalton's own explicit instruction: "add a tab that allows a player
+    /// to view their entire history" -- past task outcomes (including a
+    /// never-attempted one, scored as failed once closed), their own
+    /// ability/info-check results, and their own nominations and votes
+    /// cast each round. See `HistoryTab`.
+    History,
 }
 
 #[component]
@@ -827,6 +834,11 @@ fn Play() -> Element {
                 class: if active_tab() == PlayTab::Game { "tab-active" },
                 onclick: move |_| active_tab.set(PlayTab::Game),
                 "Game",
+            }
+            button {
+                class: if active_tab() == PlayTab::History { "tab-active" },
+                onclick: move |_| active_tab.set(PlayTab::History),
+                "History",
             }
         }
     };
@@ -1030,6 +1042,14 @@ fn Play() -> Element {
                 WhistledownPosts { posts: v.whistledown.clone(), heading_level: 4u8 }
                 RosterList { roster: v.roster.clone() }
             }
+            if active_tab() == PlayTab::History {
+                HistoryTab {
+                    task_history: v.task_history.clone(),
+                    round_history: v.round_history.clone(),
+                    info_checks: v.my_info_checks.clone(),
+                    roster: v.roster.clone(),
+                }
+            }
         } else if v.own_bio.is_some() {
             // Character Creation is done (a bio's been submitted) but the
             // game hasn't started yet -- Dalton's own explicit instruction:
@@ -1053,6 +1073,9 @@ fn Play() -> Element {
             }
             if active_tab() == PlayTab::Round {
                 p { "Waiting for the game to start." }
+            }
+            if active_tab() == PlayTab::History {
+                p { "No history yet -- the game hasn't started." }
             }
             if active_tab() == PlayTab::Game {
                 div {
@@ -1112,6 +1135,75 @@ fn RosterList(roster: Vec<RosterEntry>) -> Element {
         ul {
             for entry in roster {
                 li { key: "{entry.id.0}", "{entry.name} ({entry.status:?})" }
+            }
+        }
+    }
+}
+
+/// A player's own history tab (Dalton's own explicit instruction) -- every
+/// closed task's outcome, every info-check result they've ever received,
+/// and their own nomination/ballot for every round that had a
+/// Denouncement. Every field here is already scoped to the viewer by
+/// `view_for` itself (see `PlayerView::task_history`/`round_history`'s doc
+/// comments) -- this component only ever renders what it's handed, no
+/// further filtering needed.
+#[component]
+fn HistoryTab(
+    task_history: Vec<TaskHistoryEntry>,
+    round_history: Vec<RoundHistoryEntry>,
+    info_checks: Vec<InfoCheckDelivery>,
+    roster: Vec<RosterEntry>,
+) -> Element {
+    rsx! {
+        div {
+            h3 { "Your history" }
+            h4 { "Tasks" }
+            if task_history.is_empty() {
+                p { "No tasks have closed yet." }
+            } else {
+                ul {
+                    for (i , entry) in task_history.iter().enumerate() {
+                        li {
+                            key: "{i}",
+                            "{entry.prompt} ({entry.tier:?}): "
+                            match entry.outcome {
+                                TaskOutcome::Completed => "Completed",
+                                TaskOutcome::NoMatch => "No match",
+                                TaskOutcome::Failed => "Failed (never attempted)",
+                            }
+                        }
+                    }
+                }
+            }
+            h4 { "Ability / info-check results" }
+            if info_checks.is_empty() {
+                p { "No info-check results yet." }
+            } else {
+                ul {
+                    for (i , check) in info_checks.iter().enumerate() {
+                        li { key: "{i}", "Round {check.round:?}: {describe_check(check, &roster)}" }
+                    }
+                }
+            }
+            h4 { "Nominations & votes" }
+            if round_history.is_empty() {
+                p { "No Denouncement has happened yet." }
+            } else {
+                ul {
+                    for entry in round_history.clone() {
+                        li {
+                            key: "{entry.round:?}",
+                            "Round {entry.round:?} -- nominated: "
+                            if let Some(nominee) = entry.nominated {
+                                "{names(&[nominee], &roster)}"
+                            } else {
+                                "no one"
+                            }
+                            ", voted: "
+                            "{describe_ballot(entry.ballot, &roster)}"
+                        }
+                    }
+                }
             }
         }
     }
@@ -1752,6 +1844,22 @@ fn AbilityPanel(
                 _ => rsx! {},
             }
         }
+    }
+}
+
+/// Renders one round's ballot for `HistoryTab` -- a plain function (not a
+/// bare `match` used inline as rsx content) specifically so the
+/// interpolated `{names(...)}` call actually happens: this codebase's rsx
+/// usage interpolates `"{expr}"` string literals reliably when they're an
+/// `if`/`else` arm or a whole function's return value, but a bare `match`
+/// arm holding a `"{...}"` literal was found to render the literal braces
+/// verbatim instead of the player's name -- a real reliability bug caught
+/// during this tab's own development, not a hypothetical one.
+fn describe_ballot(ballot: Option<Ballot>, roster: &[RosterEntry]) -> String {
+    match ballot {
+        Some(Ballot::For(target)) => names(&[target], roster),
+        Some(Ballot::Abstain) => "abstained".to_string(),
+        None => "didn't vote".to_string(),
     }
 }
 
