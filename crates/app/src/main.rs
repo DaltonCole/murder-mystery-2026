@@ -917,7 +917,11 @@ fn Play() -> Element {
             p { class: "error-text", "{e}" }
         }
         if v.raffle_closed {
-            p { "Round: {v.current_round:?}" }
+            if v.round_one_started {
+                p { "Round: {v.current_round:?}" }
+            } else {
+                p { "Waiting for the game to start..." }
+            }
             TimerDisplay { remaining_secs: timer() }
             if let Some(faction) = v.own_faction {
                 if faction == Faction::Unassigned {
@@ -2161,7 +2165,7 @@ fn faction_flavor(faction: Faction) -> &'static str {
 /// exists in the story, not *what button it presses*.
 fn character_flavor(character: Character) -> &'static str {
     match character {
-        Character::KingQueen => "Your goal: avoid conversion to the Cult.",
+        Character::KingQueen => "Your goal: avoid conversion.",
         Character::PrincePrincess => {
             "Known as \"the Heir.\" Your goal: protect the King/Queen."
         }
@@ -2214,7 +2218,7 @@ fn ability_description(character: Character) -> &'static str {
         Character::Oracle => "After every odd round, you may view one player's full history, locked at that moment. Permanently disabled if the King/Queen is Cast Out.",
         Character::Almanac => "Once per game, once Ton has won 2 rounds, you privately learn 3 players who are definitely not the Revolutionary Leader.",
         Character::Spymaster => "Once per game, you view a single player's faction color only.",
-        Character::PriestPriestess => "Once per Cult recruitment window, you may protect one person from conversion, without knowing that's what you're protecting against. You can't protect the same person twice all game.",
+        Character::PriestPriestess => "Once per recruitment window, you may protect one person from conversion, without knowing that's what you're protecting against. You can't protect the same person twice all game.",
         Character::PotionMaker => "Once per game, you may grant execution-immunity, saving whoever the public vote would Cast Out that round.",
         Character::Magistrate => "Once per game, your ballot counts as two votes at tally.",
         Character::Firebrand => "Once per game, your ballot counts as two votes at tally -- the Uprising's mirror to the Magistrate.",
@@ -3435,6 +3439,7 @@ fn Host() -> Element {
     let interest_levels = view().map(|v| v.interest_levels).unwrap_or_default();
     let raffle_closed = view().map(|v| v.raffle_closed).unwrap_or(false);
     let current_round = view().map(|v| v.current_round).unwrap_or(Round::One);
+    let round_one_started = view().is_some_and(|v| v.round_one_started);
     let assigned_characters = view().map(|v| v.assigned_characters).unwrap_or_default();
     let denouncement_phase = view().and_then(|v| v.denouncement);
     let open_tasks = view().map(|v| v.open_tasks).unwrap_or_default();
@@ -3604,12 +3609,14 @@ fn Host() -> Element {
             }
             if raffle_closed {
                 p { "Setup finalized -- roles and factions are assigned. Anyone who joins from now on becomes a Servant automatically." }
-                if current_round == Round::One {
+                if current_round == Round::One && !round_one_started {
                     button {
                         onclick: move |_| start_round_one(),
                         "Start Round 1"
                     }
                     p { "Pushes Round 1's tasks -- give your live intro first, then press this when you're ready for players to start." }
+                } else if current_round == Round::One {
+                    p { "Round 1 has started." }
                 }
             } else {
                 button {

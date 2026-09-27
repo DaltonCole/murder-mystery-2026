@@ -347,6 +347,20 @@ pub struct PlayerView {
     /// clicking "Run the raffle" actually did anything; this is purely so
     /// the Host UI can show a plain success/pending state, not a new secret.
     pub raffle_closed: bool,
+    /// Whether Round 1's tasks have actually been pushed yet -- public to
+    /// every viewer kind, same shape as `raffle_closed`. Distinct from
+    /// `raffle_closed`/`current_round == Round::One`: setup can finalize
+    /// (closing the raffle) well before the Host clicks "Start Round 1"
+    /// (Dalton's own explicit instruction: Round 1 waits for an explicit
+    /// Host click, giving a live host room for a scripted intro -- see
+    /// `game_server::start_round_one`'s doc comment), and `current_round`
+    /// stays `Round::One` for that entire gap. Without this, a player's
+    /// `/play` page had nothing to distinguish "setup's done but nothing's
+    /// started yet" from "Round 1 is actually underway," showing a
+    /// confusing "Round: One" the instant setup finalized. Computed as
+    /// "does any task exist yet" -- nothing else ever creates a task
+    /// before Round 1's own push in normal play.
+    pub round_one_started: bool,
     /// How many Cult recruitment slots are currently available to spend --
     /// `Viewer::Host` ONLY (a Cult Leader player already gets their own
     /// copy of this via `my_abilities.recruitment_slots_available`). A
@@ -565,6 +579,7 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         finale_cast_out_reveal,
         martyrdom_message,
         raffle_closed: state.raffle_closed(),
+        round_one_started: state.tasks().next().is_some(),
         recruitment_slots_available_for_host,
         assigned_characters,
     }
@@ -2497,6 +2512,43 @@ mod tests {
         assert!(view_for(&state, Viewer::Host).raffle_closed);
         assert!(view_for(&state, Viewer::Player(alice)).raffle_closed);
         assert!(view_for(&state, Viewer::Display).raffle_closed);
+    }
+
+    #[test]
+    fn round_one_started_flips_true_the_moment_any_task_is_pushed_for_every_viewer_kind() {
+        let mut state = GameState::new();
+        let alice = {
+            let events = apply_command(
+                &mut state,
+                Command::AddPlayer {
+                    name: "Alice".into(),
+                },
+            )
+            .unwrap();
+            match events[0] {
+                DomainEvent::PlayerAdded { id, .. } => id,
+                _ => unreachable!(),
+            }
+        };
+
+        assert!(!view_for(&state, Viewer::Host).round_one_started);
+        assert!(!view_for(&state, Viewer::Player(alice)).round_one_started);
+        assert!(!view_for(&state, Viewer::Display).round_one_started);
+
+        apply_command(
+            &mut state,
+            Command::PushTask {
+                prompt: "Do a thing".into(),
+                tier: crate::task::TaskTier::Easy,
+                qualifying_players: Default::default(),
+                expected_code: None,
+            },
+        )
+        .unwrap();
+
+        assert!(view_for(&state, Viewer::Host).round_one_started);
+        assert!(view_for(&state, Viewer::Player(alice)).round_one_started);
+        assert!(view_for(&state, Viewer::Display).round_one_started);
     }
 
     #[test]
