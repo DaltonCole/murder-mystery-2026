@@ -694,23 +694,31 @@ pub fn run_raffle() -> Result<Vec<DomainEvent>, String> {
             )
             .map_err(|e| e.to_string())?,
         );
-        // Round 1's tasks push automatically right here, the instant setup
-        // finalizes -- Dalton's own explicit instruction: no admin action
-        // should be needed to get any round's tasks moving, Round 1
-        // included, matching how Round 3/5 already auto-push on
-        // `AdvanceRound` (see `auto_push_on_round_advance`). An earlier
-        // version deliberately deferred this to a separate "Start Round 1"
-        // Host button, reasoning Dalton needs to give a live scripted
-        // intro before tasks appear -- since removed: that intro now
-        // happens before this button is pressed at all, not after.
+    }
+    // Same reasoning as `apply` above: nobody subscribed is a fine outcome
+    // to ignore, there's just nobody waiting to be told.
+    let _ = server().changed.send(());
+    Ok(events)
+}
+
+/// Pushes Round 1's tasks (rules.md §4) -- the Host console's own "Start
+/// Round 1" button. Dalton's own explicit instruction reversing an earlier
+/// choice: Round 1 should wait for an explicit Host click, exactly like
+/// every other round's task phase waits for `AdvanceRound` (see
+/// `auto_push_on_round_advance`), rather than firing automatically the
+/// instant setup finalizes -- a live host needs room to give a scripted
+/// intro before tasks appear. `push_tasks_for_round`'s own idempotency
+/// guard (`auto_tasks_pushed`) makes a double-click here harmless.
+pub fn start_round_one() -> Result<Vec<DomainEvent>, String> {
+    let events;
+    {
+        let mut state = lock_state();
         let mut pushed = server()
             .auto_tasks_pushed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        events.extend(push_tasks_for_round(&mut state, Round::One, &mut pushed));
+        events = push_tasks_for_round(&mut state, Round::One, &mut pushed);
     }
-    // Same reasoning as `apply` above: nobody subscribed is a fine outcome
-    // to ignore, there's just nobody waiting to be told.
     let _ = server().changed.send(());
     Ok(events)
 }

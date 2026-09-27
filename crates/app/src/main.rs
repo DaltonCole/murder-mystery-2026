@@ -155,6 +155,13 @@ enum ClientMsg {
     /// `Viewer::Host` (see `game_server::draw_intermission_entrants`'s doc
     /// comment). The server reads `GameState` directly instead.
     DrawIntermissionEntrants,
+    /// `/host` only: pushes Round 1's tasks server-side -- Dalton's own
+    /// explicit instruction reversing an earlier "auto-push the instant
+    /// setup finalizes" choice. Not a plain `Command` since the actual
+    /// push logic (`push_tasks_for_round`) lives in `game_server` and is
+    /// shared with the Round 3/5 auto-push path; see
+    /// `game_server::start_round_one`'s doc comment.
+    StartRoundOne,
     /// `/host` only: (re)starts the shared round/phase timer at this many
     /// seconds. Not a `Command` -- see `game_server::start_timer`'s doc
     /// comment on why wall-clock time is an app-layer concept here, never
@@ -514,6 +521,13 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         ClientMsg::DrawIntermissionEntrants => {
                             if is_host_authed {
                                 respond!(game_server::draw_intermission_entrants())
+                            } else {
+                                reject!("host login required")
+                            }
+                        }
+                        ClientMsg::StartRoundOne => {
+                            if is_host_authed {
+                                respond!(game_server::start_round_one())
                             } else {
                                 reject!("host login required")
                             }
@@ -1427,21 +1441,26 @@ fn BioForm(
                     p { "Character sheets are locked now that the game has started." }
                 }
             } else {
-            h4 { "How involved do you want to be tonight?" }
-            p {
-                "A higher interest level means you'll be more likely to have an important role tonight, and to be more involved."
+            div {
+                class: "interest-level-section",
+                h4 { "How involved do you want to be tonight?" }
+                p {
+                    "A higher interest level means you'll be more likely to have an important role tonight, and to be more involved."
+                }
+                input {
+                    r#type: "number",
+                    min: "1",
+                    max: "10",
+                    value: "{interest_level}",
+                    oninput: move |e| {
+                        if let Ok(n) = e.value().parse::<u8>() {
+                            interest_level.set(n.clamp(1, 10));
+                        }
+                    },
+                }
             }
-            input {
-                r#type: "number",
-                min: "1",
-                max: "10",
-                value: "{interest_level}",
-                oninput: move |e| {
-                    if let Ok(n) = e.value().parse::<u8>() {
-                        interest_level.set(n.clamp(1, 10));
-                    }
-                },
-            }
+            div {
+            class: "bio-section",
             input {
                 placeholder: "Character name (required)",
                 maxlength: "32",
@@ -1535,6 +1554,7 @@ fn BioForm(
                         });
                 },
                 if own_bio.is_some() { "Update bio" } else { "Submit bio" }
+            }
             }
             }
         }
@@ -2911,6 +2931,13 @@ fn Host() -> Element {
             let _ = socket.send(ClientMsg::DrawIntermissionEntrants).await;
         });
     };
+    let mut start_round_one = move || {
+        let socket = socket;
+        error.set(None);
+        spawn(async move {
+            let _ = socket.send(ClientMsg::StartRoundOne).await;
+        });
+    };
     let start_timer = move |seconds: u32| {
         let socket = socket;
         spawn(async move {
@@ -3000,6 +3027,7 @@ fn Host() -> Element {
     let roster = view().map(|v| v.roster).unwrap_or_default();
     let interest_levels = view().map(|v| v.interest_levels).unwrap_or_default();
     let raffle_closed = view().map(|v| v.raffle_closed).unwrap_or(false);
+    let current_round = view().map(|v| v.current_round).unwrap_or(Round::One);
     let assigned_characters = view().map(|v| v.assigned_characters).unwrap_or_default();
     let denouncement_phase = view().and_then(|v| v.denouncement);
     let open_tasks = view().map(|v| v.open_tasks).unwrap_or_default();
@@ -3169,13 +3197,20 @@ fn Host() -> Element {
             }
             if raffle_closed {
                 p { "Setup finalized -- roles and factions are assigned. Anyone who joins from now on becomes a Servant automatically." }
+                if current_round == Round::One {
+                    button {
+                        onclick: move |_| start_round_one(),
+                        "Start Round 1"
+                    }
+                    p { "Pushes Round 1's tasks -- give your live intro first, then press this when you're ready for players to start." }
+                }
             } else {
                 button {
                     onclick: move |_| run_raffle(),
                     "Finalize setup"
                 }
                 p {
-                    "Assigns every named role by weighted ticket (higher interest = more tickets), splits everyone else across Ton/Uprising, and starts Round 1 -- anyone who joins from now on becomes a Servant automatically."
+                    "Assigns every named role by weighted ticket (higher interest = more tickets), splits everyone else across Ton/Uprising -- anyone who joins from now on becomes a Servant automatically. Round 1's tasks don't push automatically; use \"Start Round 1\" below once setup is finalized."
                 }
             }
         }
