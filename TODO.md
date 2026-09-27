@@ -1,16 +1,48 @@
 # Tasks
 
-## Game
+* For character creation sheet, separate the interest level and the bio section.
+* Do not auto start round 1 after I finalize the setup. The admin needs to manually go to the next round for each round.
 
-* Players should automatically get sent tasks for every round, the admin should not have to push them.
-* "Play", "Host", "Display" should not be in a menu. They should just be known urls by the admin.
+## Contest Rounds
 
-## Player
+### Creativity
 
-* Interest: Be less verbose about the interest level. A higher interest level means you will be more likely to have an important role tonight and be required to be more involved.
-* Character sheet: Require the "Character name", "Real name", and "Occupation" fields. For Hobbies, Clothing, and Skills, require a minimum of 3 entries for each category and a maximum of 5.
+* For all creativity tasks, the median of the scores are used. The mean of the score is used to break ties.
 
-## Admin Portal
+#### Drawing game
 
-* Setup: Only have a Finalize setup button. Remove the "Add player", "Run the raffle", and "Assign faction/title" options. Finalize setup should do everything at once. Once finalized setup is pressed, any new players that join will be a servant automatically.
-* The admin should not have the power to do "Cult Leader: Convert". Only the cult leader has this power.
+* Each player is given a shared prompt and have to draw something for that prompt. They have one minute to draw the prompt. Voting then begins. Each player rates the drawings from 1 to 5 stars. Take heavy inspiration from: /home/drc/game-changer but keep the prompts more bridgerton themed.
+
+#### Joke game
+
+* Each player types up a bridgerton themed joke. They have 2 minutes to come up with a joke and then every player has 15 seconds to read and score the joke 1 to 5 stars. Highest rating wins
+
+#### Dictionarium
+
+* Each player creates a brand-new bridgerton themed word, writes a definition for it, and an example sentence. They have 3 minutes. For voting, players rate the new words 1 to 5 stars with 20 seconds per word. Take heavy inspiration from the jackbox game Dictionarium
+
+#### Smut-acular
+
+* Each player has 2 and a half minutes to write a short smut scene. Players then have 30 seconds per prompt to rate the smut scenes 1 to 5 stars.
+
+### Intelligence
+
+#### Trivia
+
+* Have 10 multiple choice history questions on the history of the time related to bridgerton. Whomever gets the most questions correct scores the highest. Ties are broken by quickest to answer all of the questions.
+
+#### Math
+
+* Ask 10 simple multiple choice math questions on topics related to: arithmetic, geometry, algebra, trigonometry, and calculus
+
+#### Memory
+
+* Implement a color memory game similar to Color Memory, Color Sequence, or the Simon game
+
+#### Wordle
+
+* Create a wordle clone. Fewest guesses wins. Ties are settled by quickest solutions.
+
+### Physical
+
+* Take inspiration from the physical games outlined in: /home/drc/game-changer. Include additional, more physically demanding games, like push-ups.
