@@ -221,6 +221,15 @@ enum ClientMsg {
     /// need no randomness and go through the plain `Do(Command::
     /// AdvanceCreativeRating { .. })` path instead.
     ForceAdvanceCreativeWriting { round: Round },
+    /// `/host` only: opens a Drawing Creativity session for `round` with a
+    /// randomly-drawn prompt -- not a plain `Command::OpenContestMinigame`,
+    /// since the draw needs a real RNG (see
+    /// `game_server::open_drawing_session`'s doc comment).
+    OpenDrawingSession { round: Round },
+    /// `/host` only: opens a Strength session for `round` with a
+    /// randomly-drawn physical challenge description -- see
+    /// `game_server::open_physical_session`'s doc comment.
+    OpenPhysicalSession { round: Round },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -553,6 +562,20 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         ClientMsg::ForceAdvanceCreativeWriting { round } => {
                             if is_host_authed {
                                 respond!(game_server::force_advance_creative_writing(round))
+                            } else {
+                                reject!("host login required")
+                            }
+                        }
+                        ClientMsg::OpenDrawingSession { round } => {
+                            if is_host_authed {
+                                respond!(game_server::open_drawing_session(round))
+                            } else {
+                                reject!("host login required")
+                            }
+                        }
+                        ClientMsg::OpenPhysicalSession { round } => {
+                            if is_host_authed {
+                                respond!(game_server::open_physical_session(round))
                             } else {
                                 reject!("host login required")
                             }
@@ -3307,6 +3330,20 @@ fn Host() -> Element {
                 .await;
         });
     };
+    let mut open_drawing_session = move |round: Round| {
+        let socket = socket;
+        error.set(None);
+        spawn(async move {
+            let _ = socket.send(ClientMsg::OpenDrawingSession { round }).await;
+        });
+    };
+    let mut open_physical_session = move |round: Round| {
+        let socket = socket;
+        error.set(None);
+        spawn(async move {
+            let _ = socket.send(ClientMsg::OpenPhysicalSession { round }).await;
+        });
+    };
     let start_timer = move |seconds: u32| {
         let socket = socket;
         spawn(async move {
@@ -3846,16 +3883,20 @@ fn Host() -> Element {
                     option { value: "Wordle", "Wordle" }
                 }
             }
-            if contest_category() != Some(ContestCategory::Intelligence)
+            if contest_category() == Some(ContestCategory::Strength) {
+                p { "Prompt is drawn randomly from a curated challenge bank -- see game_server::PHYSICAL_CHALLENGES." }
+            } else if contest_category() == Some(ContestCategory::Creativity)
+                && creativity_kind_pick() == Some(CreativityKind::Drawing)
+            {
+                p { "Prompt is drawn randomly from a curated bank -- see game_server::DRAWING_PROMPTS." }
+            } else if contest_category() != Some(ContestCategory::Intelligence)
                 || matches!(intelligence_kind_pick(), Some(IntelligencePick::Wordle))
             {
                 input {
-                    placeholder: if contest_category() == Some(ContestCategory::Strength) {
-                        "Challenge description (informational only) -- *** EDIT: no curated bank yet, type your own ***"
-                    } else if matches!(intelligence_kind_pick(), Some(IntelligencePick::Wordle)) {
+                    placeholder: if matches!(intelligence_kind_pick(), Some(IntelligencePick::Wordle)) {
                         "Secret 5-letter word"
                     } else {
-                        "Prompt (e.g. a Bridgerton-themed drawing prompt -- no curated bank yet)"
+                        "Prompt (optional flavor text shown to players)"
                     },
                     value: "{minigame_prompt}",
                     oninput: move |e| minigame_prompt.set(e.value()),
@@ -3865,7 +3906,7 @@ fn Host() -> Element {
                 disabled: {
                     match contest_category() {
                         None => true,
-                        Some(ContestCategory::Strength) => minigame_prompt().trim().is_empty(),
+                        Some(ContestCategory::Strength) => false,
                         Some(ContestCategory::Creativity) => creativity_kind_pick().is_none(),
                         Some(ContestCategory::Intelligence) => match intelligence_kind_pick() {
                             None => true,
@@ -3876,8 +3917,22 @@ fn Host() -> Element {
                 },
                 onclick: move |_| {
                     let Some(category) = contest_category() else { return };
+                    match category {
+                        ContestCategory::Strength => {
+                            open_physical_session(contest_round());
+                            return;
+                        }
+                        ContestCategory::Creativity
+                            if creativity_kind_pick() == Some(CreativityKind::Drawing) =>
+                        {
+                            open_drawing_session(contest_round());
+                            creativity_kind_pick.set(None);
+                            return;
+                        }
+                        _ => {}
+                    }
                     let detail = match category {
-                        ContestCategory::Strength => OpenMinigameDetail::Strength,
+                        ContestCategory::Strength => unreachable!(),
                         ContestCategory::Creativity => {
                             let Some(kind) = creativity_kind_pick() else { return };
                             OpenMinigameDetail::Creativity(kind)

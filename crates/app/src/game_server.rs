@@ -15,10 +15,10 @@
 use engine::{
     apply_command, raffle_priority, raffle_winners, task_candidates, ticket_count, ticket_slots,
     view_for, Command, ContestCategory, CreativityKind, CreativityPhase, DenouncementPhase,
-    DomainEvent, Faction, GameError, GameState, MinigamePayload, PlayerId, PlayerStatus,
-    PlayerView, RatingStep, Round, TaskTier, Viewer,
+    DomainEvent, Faction, GameError, GameState, MinigamePayload, OpenMinigameDetail, PlayerId,
+    PlayerStatus, PlayerView, RatingStep, Round, TaskTier, Viewer,
 };
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use rand::RngExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
@@ -1063,6 +1063,115 @@ pub fn location_task_templates() -> Vec<(usize, TaskTier, String)> {
         .enumerate()
         .map(|(i, &(tier, prompt, _code))| (i, tier, prompt.to_string()))
         .collect()
+}
+
+/// Bridgerton-themed drawing prompts for the Creativity round's Drawing
+/// game -- Dalton's own explicit instruction: "take heavy inspiration from
+/// [game-changer's `DRAWING_PROMPTS`] but keep the prompts more bridgerton
+/// themed." Same short "a X doing Y" shape as that list. Drawn randomly by
+/// `open_drawing_session` (real, OS-backed randomness, the same
+/// "randomness at the boundary" shape as `LOCATION_TASKS`'s own draw), not
+/// Host-typed -- consistent with this project's own recent shift away from
+/// Host-picked content (bio/location tasks are auto-drawn too).
+///
+/// *** EDIT THIS before game night *** to retheme/expand -- these are a
+/// first-draft bank, not a rules.md quote.
+const DRAWING_PROMPTS: &[&str] = &[
+    "a duke tripping over his own cravat",
+    "a debutante fainting into the punch bowl",
+    "a chaperone falling asleep at the ball",
+    "a carriage stuck in the mud on the way to Almack's",
+    "a viscount losing a duel to a crumpet",
+    "a lady scandalized by a shockingly modern waltz",
+    "a footman spilling tea on a duchess",
+    "a marquess proposing to the wrong sister",
+    "a gossip columnist spying through a hedge",
+    "a rake charming his way out of trouble",
+    "a bonnet blown clean off in the wind",
+    "an earl fencing in his nightshirt",
+    "a lady's fan hiding a mischievous grin",
+    "a wallflower secretly winning at cards",
+    "a suitor serenading the wrong window",
+    "a corset laced far too tight",
+    "a duel at dawn interrupted by a goose",
+    "a lady riding sidesaddle at full gallop",
+    "a butler eavesdropping at the parlor door",
+    "a matchmaking mama plotting in the corner",
+    "a prince tangled in his own cape",
+    "a garden party ruined by an escaped pig",
+    "a love letter delivered to the wrong house",
+    "a masquerade mask that won't come off",
+    "a scandal sheet blowing through the streets of Mayfair",
+    "a debutante curtsying a little too low",
+    "anything Bridgerton-themed you like!",
+    "anything Bridgerton-themed you like!",
+];
+
+/// Opens a Drawing Creativity session for `round` with a randomly-drawn
+/// prompt from `DRAWING_PROMPTS` -- the Host console's "Open" button for
+/// Drawing specifically. Not a plain `Command::OpenContestMinigame` sent
+/// directly from the client: the prompt draw needs a real RNG, which only
+/// exists server-side (same "randomness at the boundary" shape as
+/// `run_raffle`).
+pub fn open_drawing_session(round: Round) -> Result<Vec<DomainEvent>, String> {
+    let prompt = DRAWING_PROMPTS
+        .choose(&mut rand::rng())
+        .copied()
+        .unwrap_or("anything Bridgerton-themed you like!")
+        .to_string();
+    apply(Command::OpenContestMinigame {
+        round,
+        prompt,
+        detail: OpenMinigameDetail::Creativity(CreativityKind::Drawing),
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// A curated bank of physically-judged Strength challenges -- Dalton's own
+/// explicit instruction: "take inspiration from [game-changer's physical
+/// games]... include additional, more physically demanding games, like
+/// push-ups." Unlike game-changer's own mutual-agreement pair games, this
+/// project's Strength mechanic is a single live challenge with a
+/// self-reported finishing *placement* (see `SubmitPhysicalPlacement`), so
+/// these are phrased as one shared, simultaneous contest rather than a
+/// paired win/lose game -- the inspiration is the playful, low-prop party
+/// energy of Ninja/Item Hunt/Carrot, not their exact mechanic. Same
+/// `LOCATION_TASKS`-style shape and random draw as `DRAWING_PROMPTS` above.
+///
+/// *** EDIT THIS before game night *** against your actual venue/space --
+/// these are a first-draft bank, not a rules.md quote.
+const PHYSICAL_CHALLENGES: &[&str] = &[
+    "Push-ups: as many as you can manage in 60 seconds. Most reps wins.",
+    "Plank hold: last one still holding wins.",
+    "Wall sit: last one still sitting wins.",
+    "Sock-footed sprint down the hall and back -- fastest wins.",
+    "Balance on one foot with your eyes closed -- last one standing wins.",
+    "Stack 10 cups into a pyramid and back down -- fastest wins.",
+    "Carry an egg across the room on a spoon without dropping it -- fastest wins.",
+    "Burpees: as many as you can manage in 60 seconds. Most reps wins.",
+    "Hop on one foot across the room and back -- fastest wins.",
+    "Keep a balloon off the floor using only one hand -- longest streak wins.",
+    "Sit-ups: as many as you can manage in 60 seconds. Most reps wins.",
+    "Bridgerton-ballroom musical chairs -- last one seated wins.",
+    "Wheelbarrow race the length of the room with a partner -- fastest pair wins.",
+];
+
+/// Opens a Strength session for `round` with a randomly-drawn challenge
+/// description from `PHYSICAL_CHALLENGES` -- see `open_drawing_session`'s
+/// doc comment for why this needs to be server-side, not a plain
+/// `Command::OpenContestMinigame`.
+pub fn open_physical_session(round: Round) -> Result<Vec<DomainEvent>, String> {
+    let prompt = PHYSICAL_CHALLENGES
+        .choose(&mut rand::rng())
+        .copied()
+        .unwrap_or("Host's choice -- judge live and record placements as they finish.")
+        .to_string();
+    apply(Command::OpenContestMinigame {
+        round,
+        prompt,
+        detail: OpenMinigameDetail::Strength,
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// The single read path every route uses -- never hands out a raw

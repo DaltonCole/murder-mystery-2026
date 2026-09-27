@@ -34,13 +34,16 @@
 //!   individual scores, sum them by true faction (Ton vs. everyone else),
 //!   higher total wins, ties favor the room (`resolve_ton_won`).
 //!
-//! *** PLACEHOLDER CONTENT WARNING, Drawing/Physical only ***: Trivia and
-//! Math now ship with real, authored 10-question banks (`quiz::
-//! trivia_questions`/`math_questions`), and Wordle reuses game-changer's
-//! own real, audited word list -- but Drawing's prompt bank and the
-//! Physical challenge bank are still Host-typed at Open time. TODO(dalton):
-//! author real curated banks for those two (mirroring `game_server::
-//! LOCATION_TASKS`'s pattern) before game night.
+//! Every category now ships with real, authored content, not a
+//! placeholder: Trivia and Math have real 10-question banks (`quiz::
+//! trivia_questions`/`math_questions`), Wordle reuses game-changer's own
+//! real, audited word list, and Drawing/Strength draw randomly from
+//! `game_server::DRAWING_PROMPTS`/`PHYSICAL_CHALLENGES` (the same
+//! `LOCATION_TASKS`-style curated-bank pattern, server-side since the draw
+//! needs a real RNG) rather than being Host-typed. Joke/Dictionarium/Smut
+//! have no content bank of their own -- each player invents their own
+//! joke/word/scene live, so there's nothing to draw from a bank; the
+//! Host's optional prompt there is just flavor text.
 
 mod creativity;
 mod memory;
