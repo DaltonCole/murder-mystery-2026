@@ -50,9 +50,10 @@ use dioxus::fullstack::{use_websocket, WebSocketOptions, Websocket};
 use dioxus::prelude::*;
 use engine::{
     pascal_case, AbilityStatus, Ballot, Bio, Character, Command, ContestCategory,
-    ContestMinigameView, DenouncementView, DomainEvent, Faction, GalleryPrediction,
-    InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind, PlayerId, PlayerReveal, PlayerStatus,
-    PlayerView, RosterEntry, Round, RoundHistoryEntry, TaskHistoryEntry, TaskOutcome, TaskTier,
+    ContestMinigameView, CreativeEntry, CreativityKind, DenouncementView, DomainEvent, Faction,
+    GalleryPrediction, InfoCheckAnswer, InfoCheckDelivery, InfoQueryKind, IntelligenceKind,
+    LetterFeedback, OpenMinigameDetail, PlayerId, PlayerReveal, PlayerStatus, PlayerView,
+    RatingStep, RosterEntry, Round, RoundHistoryEntry, TaskHistoryEntry, TaskOutcome, TaskTier,
     TaskView, Viewer, WhistledownPost, MIN_CATEGORY_ENTRIES,
 };
 use serde::{Deserialize, Serialize};
@@ -209,6 +210,17 @@ enum ClientMsg {
     BanTaskPrompt { prompt: String },
     /// `/host` only: reverses `BanTaskPrompt`.
     UnbanTaskPrompt { prompt: String },
+    /// `/host` only, Creativity mini-games: forces the Writing phase to end
+    /// right now, ahead of its own auto-timer -- the Host console's "Force
+    /// next" button while a session is still in Writing. Not a plain
+    /// `Command::AdvanceCreativeWriting` -- that command's `order` field
+    /// needs a real, server-shuffled active-participant list (randomness
+    /// at the boundary), which the Host browser has no principled way to
+    /// produce itself. See `game_server::force_advance_creative_writing`'s
+    /// doc comment. Once a session reaches Rating, "Force next"/"Go back"
+    /// need no randomness and go through the plain `Do(Command::
+    /// AdvanceCreativeRating { .. })` path instead.
+    ForceAdvanceCreativeWriting { round: Round },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +306,10 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
         | Command::CloseTasks
         | Command::RecordContestResult { .. }
         | Command::OpenContestMinigame { .. }
+        | Command::AdvanceCreativeWriting { .. }
+        | Command::AdvanceCreativeRating { .. }
+        | Command::RecordQuizElapsedTime { .. }
+        | Command::RecordWordleElapsedTime { .. }
         | Command::CloseContestMinigame { .. }
         | Command::DrawIntermissionEntrants { .. }
         | Command::AwardServantPoints { .. }
@@ -321,7 +337,9 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
         | Command::OptIntoIntermission { player }
         | Command::SubmitCreativeEntry { player, .. }
         | Command::RateCreativeEntry { player, .. }
-        | Command::SubmitIntelligenceAnswer { player, .. }
+        | Command::SubmitQuizAnswer { player, .. }
+        | Command::SubmitMemoryScore { player, .. }
+        | Command::SubmitWordleGuess { player, .. }
         | Command::SubmitPhysicalPlacement { player, .. }
         | Command::SubmitGalleryPrediction { player, .. } => Some(*player),
 
@@ -528,6 +546,13 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         ClientMsg::StartRoundOne => {
                             if is_host_authed {
                                 respond!(game_server::start_round_one())
+                            } else {
+                                reject!("host login required")
+                            }
+                        }
+                        ClientMsg::ForceAdvanceCreativeWriting { round } => {
+                            if is_host_authed {
+                                respond!(game_server::force_advance_creative_writing(round))
                             } else {
                                 reject!("host login required")
                             }
@@ -962,7 +987,6 @@ fn Play() -> Element {
                     ContestMinigamePanel {
                         my_id: id,
                         sessions: v.open_contest_minigames.clone(),
-                        roster: v.roster.clone(),
                         on_command: send_cmd,
                     }
                 } else {
@@ -2606,7 +2630,6 @@ fn LocationTaskAttemptForm(
 fn ContestMinigamePanel(
     my_id: PlayerId,
     sessions: Vec<ContestMinigameView>,
-    roster: Vec<RosterEntry>,
     on_command: EventHandler<Command>,
 ) -> Element {
     if sessions.is_empty() {
@@ -2620,16 +2643,16 @@ fn ContestMinigamePanel(
                 key: "{session.round:?}-{session.category:?}",
                 h4 { "{session.category:?}" }
                 p { "{session.prompt}" }
-                match session.category {
-                    ContestCategory::Creativity => rsx! {
-                        CreativityMinigameForm { my_id, session, roster: roster.clone(), on_command }
-                    },
-                    ContestCategory::Intelligence => rsx! {
-                        IntelligenceMinigameForm { my_id, session, on_command }
-                    },
-                    ContestCategory::Strength => rsx! {
-                        PhysicalMinigameForm { my_id, session, on_command }
-                    },
+                if let Some(kind) = session.creativity_kind {
+                    CreativityMinigameForm { my_id, session, kind, on_command }
+                } else if session.is_memory {
+                    MemoryGame { my_id, round: session.round, on_command }
+                } else if session.is_wordle {
+                    WordleForm { my_id, session, on_command }
+                } else if session.quiz_kind.is_some() {
+                    QuizForm { my_id, session, on_command }
+                } else {
+                    PhysicalMinigameForm { my_id, session, on_command }
                 }
             }
         }
@@ -2640,66 +2663,30 @@ fn ContestMinigamePanel(
 fn CreativityMinigameForm(
     my_id: PlayerId,
     session: ContestMinigameView,
-    roster: Vec<RosterEntry>,
+    kind: CreativityKind,
     on_command: EventHandler<Command>,
 ) -> Element {
-    let mut entry_text = use_signal(String::new);
-    let mut rating_picks = use_signal(|| None::<u8>);
     let round = session.round;
-    let already_submitted = session.creative_entries.iter().any(|(id, _)| *id == my_id);
-    let others: Vec<(PlayerId, String)> = session
-        .creative_entries
-        .iter()
-        .filter(|(id, _)| *id != my_id)
-        .cloned()
-        .collect();
 
     rsx! {
-        if already_submitted {
-            p { "Your entry is in." }
+        if session.my_creative_entry_submitted {
+            p { "Your entry is in. Waiting for the rating phase..." }
         } else {
-            input {
-                placeholder: "Your entry",
-                value: "{entry_text}",
-                oninput: move |e| entry_text.set(e.value()),
-            }
-            button {
-                disabled: entry_text().trim().is_empty(),
-                onclick: move |_| {
-                    on_command.call(Command::SubmitCreativeEntry {
-                        player: my_id,
-                        round,
-                        text: entry_text.peek().trim().to_string(),
-                    });
-                    entry_text.set(String::new());
-                },
-                "Submit entry",
-            }
+            CreativeEntryForm { my_id, round, kind, on_command }
         }
-        if !others.is_empty() {
-            h5 { "Rate everyone else's entry" }
-            for (target , text) in others {
-                div {
-                    key: "{target.0}",
-                    p { "{names(&[target], &roster)}: {text}" }
-                    if session.my_creative_ratings_given.contains(&target) {
-                        " (already rated)"
-                    } else {
-                        select {
-                            onchange: move |e| rating_picks.set(e.value().parse().ok()),
-                            option { value: "", "-- stars --" }
-                            for stars in 1..=5u8 {
-                                option { value: "{stars}", "{stars}" }
-                            }
-                        }
-                        button {
-                            disabled: rating_picks().is_none(),
-                            onclick: move |_| {
-                                let Some(stars) = rating_picks() else { return };
-                                on_command.call(Command::RateCreativeEntry { player: my_id, round, target, stars });
-                                rating_picks.set(None);
-                            },
-                            "Rate",
+        if let Some(item) = session.current_rating_item.clone() {
+            div {
+                h5 { "Rate this entry ({item.index + 1} of {item.total})" }
+                if item.is_own_entry {
+                    p { em { "This one's yours." } }
+                }
+                CreativeEntryDisplay { entry: item.entry.clone() }
+                if item.already_rated {
+                    p { "Rated -- waiting for everyone else." }
+                } else {
+                    StarRating {
+                        on_rate: move |stars| {
+                            on_command.call(Command::RateCreativeEntry { player: my_id, round, stars });
                         }
                     }
                 }
@@ -2709,35 +2696,256 @@ fn CreativityMinigameForm(
 }
 
 #[component]
-fn IntelligenceMinigameForm(
+fn CreativeEntryForm(
+    my_id: PlayerId,
+    round: Round,
+    kind: CreativityKind,
+    on_command: EventHandler<Command>,
+) -> Element {
+    let mut text = use_signal(String::new);
+    let mut word = use_signal(String::new);
+    let mut definition = use_signal(String::new);
+    let mut example = use_signal(String::new);
+
+    let submit = move || {
+        let entry = match kind {
+            CreativityKind::Joke | CreativityKind::Smut => {
+                let t = text.peek().trim().to_string();
+                if t.is_empty() {
+                    return;
+                }
+                if kind == CreativityKind::Joke {
+                    CreativeEntry::Joke { text: t }
+                } else {
+                    CreativeEntry::Smut { text: t }
+                }
+            }
+            CreativityKind::Dictionarium => {
+                let (w, d, e) = (
+                    word.peek().trim().to_string(),
+                    definition.peek().trim().to_string(),
+                    example.peek().trim().to_string(),
+                );
+                if w.is_empty() || d.is_empty() || e.is_empty() {
+                    return;
+                }
+                CreativeEntry::Dictionarium {
+                    word: w,
+                    definition: d,
+                    example: e,
+                }
+            }
+            CreativityKind::Drawing => return, // handled by DrawingCanvas instead
+        };
+        on_command.call(Command::SubmitCreativeEntry {
+            player: my_id,
+            round,
+            entry,
+        });
+    };
+
+    match kind {
+        CreativityKind::Drawing => rsx! {
+            DrawingCanvas {
+                on_submit: move |data_url| {
+                    on_command.call(Command::SubmitCreativeEntry {
+                        player: my_id,
+                        round,
+                        entry: CreativeEntry::Drawing(data_url),
+                    });
+                }
+            }
+        },
+        CreativityKind::Joke | CreativityKind::Smut => rsx! {
+            input {
+                placeholder: if kind == CreativityKind::Joke { "Your joke" } else { "Your scene" },
+                value: "{text}",
+                oninput: move |e| text.set(e.value()),
+            }
+            button { onclick: move |_| submit(), "Submit" }
+        },
+        CreativityKind::Dictionarium => rsx! {
+            input { placeholder: "Your new word", value: "{word}", oninput: move |e| word.set(e.value()) }
+            input {
+                placeholder: "Definition",
+                value: "{definition}",
+                oninput: move |e| definition.set(e.value()),
+            }
+            input {
+                placeholder: "Example sentence",
+                value: "{example}",
+                oninput: move |e| example.set(e.value()),
+            }
+            button { onclick: move |_| submit(), "Submit" }
+        },
+    }
+}
+
+#[component]
+fn CreativeEntryDisplay(entry: CreativeEntry) -> Element {
+    rsx! {
+        match entry {
+            CreativeEntry::Drawing(data_url) => rsx! {
+                if data_url.is_empty() {
+                    p { "(no drawing submitted)" }
+                } else {
+                    img { class: "rating-image", src: "{data_url}" }
+                }
+            },
+            CreativeEntry::Joke { text } | CreativeEntry::Smut { text } => rsx! {
+                p { "{text}" }
+            },
+            CreativeEntry::Dictionarium { word, definition, example } => rsx! {
+                p { strong { "{word}" } }
+                p { "{definition}" }
+                p { em { "{example}" } }
+            },
+        }
+    }
+}
+
+#[component]
+fn StarRating(on_rate: EventHandler<u8>) -> Element {
+    let mut picked = use_signal(|| None::<u8>);
+    rsx! {
+        select {
+            onchange: move |e| picked.set(e.value().parse().ok()),
+            option { value: "", "-- stars --" }
+            for stars in 1..=5u8 {
+                option { value: "{stars}", "{stars}" }
+            }
+        }
+        button {
+            disabled: picked().is_none(),
+            onclick: move |_| {
+                let Some(stars) = picked() else { return };
+                on_rate.call(stars);
+                picked.set(None);
+            },
+            "Rate",
+        }
+    }
+}
+
+const CANVAS_ID: &str = "drawing-canvas";
+const CANVAS_SIZE: u32 = 320;
+
+fn canvas_setup_js() -> String {
+    format!(
+        "const c = document.getElementById('{CANVAS_ID}'); \
+         if (c) {{ const ctx = c.getContext('2d'); \
+         ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, c.width, c.height); \
+         ctx.strokeStyle = '#17181f'; ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; }}"
+    )
+}
+
+fn canvas_begin_stroke_js(x: f64, y: f64) -> String {
+    format!(
+        "const c = document.getElementById('{CANVAS_ID}'); \
+         if (c) {{ const ctx = c.getContext('2d'); ctx.beginPath(); ctx.moveTo({x}, {y}); }}"
+    )
+}
+
+fn canvas_extend_stroke_js(x: f64, y: f64) -> String {
+    format!(
+        "const c = document.getElementById('{CANVAS_ID}'); \
+         if (c) {{ const ctx = c.getContext('2d'); ctx.lineTo({x}, {y}); ctx.stroke(); }}"
+    )
+}
+
+const CANVAS_TO_DATA_URL_JS: &str =
+    "const c = document.getElementById('drawing-canvas'); return c ? c.toDataURL('image/png') : '';";
+
+/// A real freehand drawing canvas -- ported from `/home/drc/game-changer`'s
+/// `components/drawing_game.rs` (same author, same Dioxus version family,
+/// already proven): a plain `<canvas>`, raw pointer events, and small
+/// injected JS snippets for the actual 2D drawing calls, with
+/// `canvas.toDataURL('image/png')` producing the submitted entry.
+#[component]
+fn DrawingCanvas(on_submit: EventHandler<String>) -> Element {
+    let mut is_drawing = use_signal(|| false);
+    let mut submitting = use_signal(|| false);
+
+    use_effect(|| {
+        let _ = document::eval(&canvas_setup_js());
+    });
+
+    rsx! {
+        canvas {
+            id: "{CANVAS_ID}",
+            width: "{CANVAS_SIZE}",
+            height: "{CANVAS_SIZE}",
+            style: "border: 1px solid #888; touch-action: none;",
+            onpointerdown: move |evt: PointerEvent| {
+                is_drawing.set(true);
+                let pos = evt.element_coordinates();
+                let _ = document::eval(&canvas_begin_stroke_js(pos.x, pos.y));
+            },
+            onpointermove: move |evt: PointerEvent| {
+                if is_drawing() {
+                    let pos = evt.element_coordinates();
+                    let _ = document::eval(&canvas_extend_stroke_js(pos.x, pos.y));
+                }
+            },
+            onpointerup: move |_| is_drawing.set(false),
+            onpointercancel: move |_| is_drawing.set(false),
+        }
+        div {
+            button {
+                onclick: move |_| {
+                    let _ = document::eval(&canvas_setup_js());
+                },
+                "Clear",
+            }
+            button {
+                disabled: submitting(),
+                onclick: move |_| {
+                    submitting.set(true);
+                    spawn(async move {
+                        let data_url = document::eval(CANVAS_TO_DATA_URL_JS)
+                            .await
+                            .ok()
+                            .and_then(|v| v.as_str().map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        on_submit.call(data_url);
+                    });
+                },
+                "Submit drawing",
+            }
+        }
+    }
+}
+
+#[component]
+fn QuizForm(
     my_id: PlayerId,
     session: ContestMinigameView,
     on_command: EventHandler<Command>,
 ) -> Element {
-    let mut answer = use_signal(String::new);
     let round = session.round;
-
-    if session.my_intelligence_attempted {
+    let Some(question) = session.current_quiz_question.clone() else {
         return rsx! {
-            p { "You've already answered." }
+            p {
+                "You've answered all 10 -- waiting for everyone else. Correct so far: {session.my_quiz_correct_count.unwrap_or(0)}"
+            }
         };
-    }
+    };
     rsx! {
-        input {
-            placeholder: "Your answer",
-            value: "{answer}",
-            oninput: move |e| answer.set(e.value()),
-        }
-        button {
-            disabled: answer().trim().is_empty(),
-            onclick: move |_| {
-                on_command.call(Command::SubmitIntelligenceAnswer {
-                    player: my_id,
-                    round,
-                    answer: answer.peek().trim().to_string(),
-                });
-            },
-            "Submit answer",
+        p { "Question {question.index + 1} of {question.total}" }
+        p { "{question.prompt}" }
+        for (i , choice) in question.choices.iter().enumerate() {
+            button {
+                key: "{i}",
+                onclick: move |_| {
+                    on_command.call(Command::SubmitQuizAnswer {
+                        player: my_id,
+                        round,
+                        question_index: question.index,
+                        choice_index: i,
+                    });
+                },
+                "{choice}",
+            }
         }
     }
 }
@@ -2774,6 +2982,145 @@ fn PhysicalMinigameForm(
     }
 }
 
+#[component]
+fn WordleForm(
+    my_id: PlayerId,
+    session: ContestMinigameView,
+    on_command: EventHandler<Command>,
+) -> Element {
+    let mut guess = use_signal(String::new);
+    let round = session.round;
+    let exhausted = session.my_wordle_guesses.len() >= 6;
+
+    rsx! {
+        for g in session.my_wordle_guesses.iter() {
+            p {
+                key: "{g.word}",
+                for (i , letter) in g.word.chars().enumerate() {
+                    span {
+                        key: "{i}",
+                        style: match g.feedback[i] {
+                            LetterFeedback::Correct => "background:#4caf50; color:white; padding:2px 6px;",
+                            LetterFeedback::Present => "background:#ffc107; color:black; padding:2px 6px;",
+                            LetterFeedback::Absent => "background:#888; color:white; padding:2px 6px;",
+                        },
+                        "{letter}",
+                    }
+                }
+            }
+        }
+        if session.my_wordle_solved {
+            p { "Solved!" }
+        } else if exhausted {
+            p { "Out of guesses." }
+        } else {
+            input {
+                placeholder: "5-letter guess",
+                maxlength: "5",
+                value: "{guess}",
+                oninput: move |e| guess.set(e.value()),
+            }
+            button {
+                disabled: guess().trim().chars().count() != 5,
+                onclick: move |_| {
+                    on_command.call(Command::SubmitWordleGuess {
+                        player: my_id,
+                        round,
+                        guess: guess.peek().trim().to_string(),
+                    });
+                    guess.set(String::new());
+                },
+                "Guess",
+            }
+        }
+    }
+}
+
+/// Memory: a real Simon-style color-sequence game, entirely client-side --
+/// the browser generates the sequence with `Math.random()` via
+/// `document::eval` (the `web` build has no Rust-side randomness source at
+/// all) and the player's final score is self-reported, the same trust
+/// model as Strength's self-reported placement. Never touches the phase/
+/// deadline machinery Creativity uses.
+#[component]
+fn MemoryGame(my_id: PlayerId, round: Round, on_command: EventHandler<Command>) -> Element {
+    let mut sequence = use_signal(Vec::<u8>::new);
+    let mut input_index = use_signal(|| 0usize);
+    let mut status = use_signal(|| "Press Start to begin.".to_string());
+    let mut playing = use_signal(|| false);
+    let mut submitted = use_signal(|| false);
+    let colors = ["#e53935", "#1e88e5", "#43a047", "#fdd835"];
+
+    let next_round = move || {
+        spawn(async move {
+            let next: f64 = document::eval("return Math.floor(Math.random() * 4);")
+                .await
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            sequence.write().push(next as u8);
+            input_index.set(0);
+            status.set(format!(
+                "Watch closely: sequence length {}",
+                sequence.read().len()
+            ));
+        });
+    };
+
+    rsx! {
+        p { "{status}" }
+        if !playing() {
+            button {
+                onclick: move |_| {
+                    sequence.set(Vec::new());
+                    playing.set(true);
+                    next_round();
+                },
+                "Start",
+            }
+        } else {
+            div {
+                for (i , color) in colors.iter().enumerate() {
+                    button {
+                        key: "{i}",
+                        style: "width:60px;height:60px;margin:4px;background:{color};",
+                        onclick: move |_| {
+                            let seq = sequence.read().clone();
+                            let idx = input_index();
+                            if idx >= seq.len() {
+                                return;
+                            }
+                            if seq[idx] as usize == i {
+                                if idx + 1 == seq.len() {
+                                    next_round();
+                                } else {
+                                    input_index.set(idx + 1);
+                                }
+                            } else {
+                                playing.set(false);
+                                let longest = seq.len().saturating_sub(1) as u32;
+                                status.set(format!("Wrong! Final score: {longest}"));
+                                if !submitted() {
+                                    submitted.set(true);
+                                    on_command.call(Command::SubmitMemoryScore {
+                                        player: my_id,
+                                        round,
+                                        longest_sequence: longest,
+                                    });
+                                }
+                            }
+                        },
+                        "",
+                    }
+                }
+            }
+        }
+        if submitted() {
+            p { "Score submitted." }
+        }
+    }
+}
+
 // --- /host -----------------------------------------------------------------
 
 /// Which section of the Host console is currently showing. Dalton's own
@@ -2789,6 +3136,19 @@ fn PhysicalMinigameForm(
 /// "what's happening now" banner, and Whistledown stay visible on every
 /// page regardless of this -- they're ambient status, not
 /// section-specific content.
+/// The Host's Intelligence kind picker -- a plain UI-only enum (unlike
+/// `CreativityKind`, `IntelligenceKind`'s own variants carry data --
+/// Trivia/Math's question banks, Wordle's secret -- that isn't known until
+/// the Open button is actually pressed) converted into a real
+/// `IntelligenceKind` at that point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IntelligencePick {
+    Trivia,
+    Math,
+    Memory,
+    Wordle,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HostPage {
     Setup,
@@ -2938,6 +3298,15 @@ fn Host() -> Element {
             let _ = socket.send(ClientMsg::StartRoundOne).await;
         });
     };
+    let mut force_advance_creative_writing = move |round: Round| {
+        let socket = socket;
+        error.set(None);
+        spawn(async move {
+            let _ = socket
+                .send(ClientMsg::ForceAdvanceCreativeWriting { round })
+                .await;
+        });
+    };
     let start_timer = move |seconds: u32| {
         let socket = socket;
         spawn(async move {
@@ -3003,7 +3372,8 @@ fn Host() -> Element {
     let mut contest_category = use_signal(|| None::<ContestCategory>);
     let mut contest_ton_won = use_signal(|| None::<bool>);
     let mut minigame_prompt = use_signal(String::new);
-    let mut minigame_answer = use_signal(String::new);
+    let mut creativity_kind_pick = use_signal(|| None::<CreativityKind>);
+    let mut intelligence_kind_pick = use_signal(|| None::<IntelligencePick>);
     let mut servant_award_player = use_signal(|| None::<u32>);
     let mut servant_award_points = use_signal(|| 1u32);
     let mut gallery_winner = use_signal(|| Faction::Ton);
@@ -3426,33 +3796,119 @@ fn Host() -> Element {
                 option { value: "Intelligence", "Intelligence" }
             }
             h4 { "Open a mini-game session" }
-            input {
-                placeholder: if contest_category() == Some(ContestCategory::Strength) { "Challenge description (informational only)" } else { "Prompt / question" },
-                value: "{minigame_prompt}",
-                oninput: move |e| minigame_prompt.set(e.value()),
+            if contest_category() == Some(ContestCategory::Creativity) {
+                select {
+                    value: match creativity_kind_pick() {
+                        Some(CreativityKind::Drawing) => "Drawing",
+                        Some(CreativityKind::Joke) => "Joke",
+                        Some(CreativityKind::Dictionarium) => "Dictionarium",
+                        Some(CreativityKind::Smut) => "Smut",
+                        None => "",
+                    },
+                    onchange: move |e| {
+                        creativity_kind_pick.set(match e.value().as_str() {
+                            "Drawing" => Some(CreativityKind::Drawing),
+                            "Joke" => Some(CreativityKind::Joke),
+                            "Dictionarium" => Some(CreativityKind::Dictionarium),
+                            "Smut" => Some(CreativityKind::Smut),
+                            _ => None,
+                        });
+                    },
+                    option { value: "", "-- kind --" }
+                    option { value: "Drawing", "Drawing (60s write, 10s/rating)" }
+                    option { value: "Joke", "Joke (2min write, 15s/rating)" }
+                    option { value: "Dictionarium", "Dictionarium (3min write, 20s/rating)" }
+                    option { value: "Smut", "Smut-acular (2.5min write, 30s/rating)" }
+                }
             }
             if contest_category() == Some(ContestCategory::Intelligence) {
+                select {
+                    value: match intelligence_kind_pick() {
+                        Some(IntelligencePick::Trivia) => "Trivia",
+                        Some(IntelligencePick::Math) => "Math",
+                        Some(IntelligencePick::Memory) => "Memory",
+                        Some(IntelligencePick::Wordle) => "Wordle",
+                        None => "",
+                    },
+                    onchange: move |e| {
+                        intelligence_kind_pick.set(match e.value().as_str() {
+                            "Trivia" => Some(IntelligencePick::Trivia),
+                            "Math" => Some(IntelligencePick::Math),
+                            "Memory" => Some(IntelligencePick::Memory),
+                            "Wordle" => Some(IntelligencePick::Wordle),
+                            _ => None,
+                        });
+                    },
+                    option { value: "", "-- kind --" }
+                    option { value: "Trivia", "Trivia (10 real Regency-history questions)" }
+                    option { value: "Math", "Math (10 real questions)" }
+                    option { value: "Memory", "Memory (color sequence)" }
+                    option { value: "Wordle", "Wordle" }
+                }
+            }
+            if contest_category() != Some(ContestCategory::Intelligence)
+                || matches!(intelligence_kind_pick(), Some(IntelligencePick::Wordle))
+            {
                 input {
-                    placeholder: "Correct answer",
-                    value: "{minigame_answer}",
-                    oninput: move |e| minigame_answer.set(e.value()),
+                    placeholder: if contest_category() == Some(ContestCategory::Strength) {
+                        "Challenge description (informational only) -- *** EDIT: no curated bank yet, type your own ***"
+                    } else if matches!(intelligence_kind_pick(), Some(IntelligencePick::Wordle)) {
+                        "Secret 5-letter word"
+                    } else {
+                        "Prompt (e.g. a Bridgerton-themed drawing prompt -- no curated bank yet)"
+                    },
+                    value: "{minigame_prompt}",
+                    oninput: move |e| minigame_prompt.set(e.value()),
                 }
             }
             button {
-                disabled: contest_category().is_none() || minigame_prompt().trim().is_empty(),
+                disabled: {
+                    match contest_category() {
+                        None => true,
+                        Some(ContestCategory::Strength) => minigame_prompt().trim().is_empty(),
+                        Some(ContestCategory::Creativity) => creativity_kind_pick().is_none(),
+                        Some(ContestCategory::Intelligence) => match intelligence_kind_pick() {
+                            None => true,
+                            Some(IntelligencePick::Wordle) => minigame_prompt().trim().chars().count() != 5,
+                            _ => false,
+                        },
+                    }
+                },
                 onclick: move |_| {
                     let Some(category) = contest_category() else { return };
-                    let correct_answer = (category == ContestCategory::Intelligence)
-                        .then(|| minigame_answer())
-                        .filter(|a| !a.trim().is_empty());
-                    do_cmd(Command::OpenContestMinigame {
-                        round: contest_round(),
-                        category,
-                        prompt: minigame_prompt(),
-                        correct_answer,
-                    });
+                    let detail = match category {
+                        ContestCategory::Strength => OpenMinigameDetail::Strength,
+                        ContestCategory::Creativity => {
+                            let Some(kind) = creativity_kind_pick() else { return };
+                            OpenMinigameDetail::Creativity(kind)
+                        }
+                        ContestCategory::Intelligence => {
+                            let Some(pick) = intelligence_kind_pick() else { return };
+                            OpenMinigameDetail::Intelligence(match pick {
+                                IntelligencePick::Trivia => IntelligenceKind::Trivia {
+                                    questions: engine::trivia_questions(),
+                                },
+                                IntelligencePick::Math => IntelligenceKind::Math {
+                                    questions: engine::math_questions(),
+                                },
+                                IntelligencePick::Memory => IntelligenceKind::Memory,
+                                IntelligencePick::Wordle => IntelligenceKind::Wordle {
+                                    secret: minigame_prompt(),
+                                },
+                            })
+                        }
+                    };
+                    let prompt = match (category, intelligence_kind_pick()) {
+                        (ContestCategory::Intelligence, Some(IntelligencePick::Trivia)) => "Trivia!".to_string(),
+                        (ContestCategory::Intelligence, Some(IntelligencePick::Math)) => "Math!".to_string(),
+                        (ContestCategory::Intelligence, Some(IntelligencePick::Memory)) => "Memory!".to_string(),
+                        (ContestCategory::Intelligence, Some(IntelligencePick::Wordle)) => "Wordle!".to_string(),
+                        _ => minigame_prompt(),
+                    };
+                    do_cmd(Command::OpenContestMinigame { round: contest_round(), prompt, detail });
                     minigame_prompt.set(String::new());
-                    minigame_answer.set(String::new());
+                    creativity_kind_pick.set(None);
+                    intelligence_kind_pick.set(None);
                 },
                 "Open mini-game",
             }
@@ -3465,9 +3921,44 @@ fn Host() -> Element {
                         li {
                             key: "{session.round:?}-{session.category:?}",
                             "{session.round:?} / {session.category:?}: \"{session.prompt}\" -- {session.submission_count} submitted"
-                            if session.category == ContestCategory::Intelligence {
+                            if session.is_wordle {
                                 if let Some(answer) = &session.answer {
                                     " (answer: {answer})"
+                                }
+                            }
+                            if let Some(kind) = session.creativity_kind {
+                                {
+                                    let round = session.round;
+                                    match &session.current_rating_item {
+                                        None => rsx! {
+                                            " -- Writing ({kind:?}) "
+                                            button {
+                                                onclick: move |_| force_advance_creative_writing(round),
+                                                "Force next phase",
+                                            }
+                                        },
+                                        Some(item) => rsx! {
+                                            " -- Rating {item.index + 1}/{item.total} "
+                                            button {
+                                                onclick: move |_| {
+                                                    do_cmd(Command::AdvanceCreativeRating {
+                                                        round,
+                                                        direction: RatingStep::Backward,
+                                                    });
+                                                },
+                                                "Go back",
+                                            }
+                                            button {
+                                                onclick: move |_| {
+                                                    do_cmd(Command::AdvanceCreativeRating {
+                                                        round,
+                                                        direction: RatingStep::Forward,
+                                                    });
+                                                },
+                                                "Force next",
+                                            }
+                                        },
+                                    }
                                 }
                             }
                             " "

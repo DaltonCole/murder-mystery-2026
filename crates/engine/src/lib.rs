@@ -38,7 +38,13 @@ pub use bio::{
 pub use character::{Character, PlayerStatus};
 pub use command::Command;
 pub use contest::ContestCategory;
-pub use contest_minigame::{DEFAULT_TOP_N_SCORERS, MAX_CONTEST_ENTRY_LEN};
+pub use contest_minigame::{
+    math_questions, trivia_questions, ContestMinigameSession, CreativeEntry, CreativityKind,
+    CreativityPayload, CreativityPhase, IntelligenceKind, IntelligencePayload, LetterFeedback,
+    MinigamePayload, OpenMinigameDetail, QuizKind, QuizQuestion, RatingStep, WordleGuess,
+    DEFAULT_TOP_N_SCORERS, DRAWING_DATA_URL_PREFIX, MAX_CONTEST_ENTRY_LEN,
+    MAX_DRAWING_DATA_URL_LEN, MAX_GUESSES, MAX_MEMORY_SEQUENCE_LENGTH, WORD_LIST,
+};
 pub use denouncement::{Ballot, DenouncementPhase};
 pub use error::GameError;
 pub use event::DomainEvent;

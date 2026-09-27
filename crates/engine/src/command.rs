@@ -458,44 +458,103 @@ pub enum Command {
     // above stays as the manual fallback for a live-event fix-up, the same
     // "always keep a manual override" shape as `PushTask`'s Manual entry
     // or `CastOut`'s `fallback_replacement`. ---
-    /// Opens `category`'s mini-game session for `round` -- the Host's
-    /// prompt/question/challenge-description, typed in live (see
-    /// `contest_minigame`'s placeholder-content warning). Rejected if
-    /// `round` isn't a contest round, if that `(round, category)` already
-    /// has a session open, or if it's already been resolved.
-    /// `correct_answer` is Intelligence-only (the answer players' guesses
-    /// are checked against) -- `None` for Creativity/Strength.
+    /// Opens a mini-game session for `round` -- `detail` carries both
+    /// which category it belongs to (`OpenMinigameDetail::category`) and
+    /// whatever that category's kind needs (a `CreativityKind`, or an
+    /// `IntelligenceKind` carrying Trivia/Math's 10 questions or Wordle's
+    /// secret). Rejected if `round` isn't a contest round, if that
+    /// `(round, category)` already has a session open, if it's already
+    /// been resolved, or if `detail` itself is malformed (a quiz not
+    /// exactly 10 questions, a Wordle secret that isn't a real 5-letter
+    /// word).
     OpenContestMinigame {
         round: Round,
-        category: ContestCategory,
         prompt: String,
-        correct_answer: Option<String>,
+        detail: crate::contest_minigame::OpenMinigameDetail,
     },
-    /// Creativity: `player`'s one free-text entry to the round's shared
-    /// prompt. One-shot, like `AttemptTask`.
+    /// Creativity: `player`'s one entry to the round's Writing phase --
+    /// `entry`'s own variant must match the session's `CreativityKind`.
+    /// One-shot, like `AttemptTask`.
     SubmitCreativeEntry {
         player: PlayerId,
         round: Round,
-        text: String,
+        entry: crate::contest_minigame::CreativeEntry,
     },
-    /// Creativity: `player` rates `target`'s entry 1-5 stars. Rejects
-    /// self-rating and a `target` with no submitted entry. A repeat rating
-    /// of the same `target` replaces the earlier one, the same standing-
-    /// choice shape `Nominate`/`CastBallot` already use.
+    /// Creativity: `player` rates 1-5 stars whichever entry is currently
+    /// up in the Rating phase's one-at-a-time rotation (not player-chosen
+    /// -- see `CreativityPhase::Rating`'s `current_index`). Self-rating is
+    /// allowed by design. A repeat rating of the same entry replaces the
+    /// earlier one, the same standing-choice shape `Nominate`/`CastBallot`
+    /// already use.
     RateCreativeEntry {
         player: PlayerId,
         round: Round,
-        target: PlayerId,
         stars: u8,
     },
-    /// Intelligence: `player`'s one attempt at the round's shared
-    /// question, checked case-insensitively and trimmed against the
-    /// session's `correct_answer` -- the same check `AttemptLocationTask`
-    /// already does for a location's code. One-shot, right or wrong.
-    SubmitIntelligenceAnswer {
+    /// Creativity only, called by `game_server`'s automatic timer sweep or
+    /// its manual Host "force next" override -- never by an ordinary
+    /// player action. Writing -> Rating{0}; `order` is the app-shuffled
+    /// full active-participant list (randomness at the boundary, same
+    /// shape as `CastOut`'s `fallback_replacement`); anyone missing an
+    /// entry is blank-filled.
+    AdvanceCreativeWriting { round: Round, order: Vec<PlayerId> },
+    /// Creativity only, same caller restriction as `AdvanceCreativeWriting`.
+    /// Rating{i} -> Rating{i +/- 1} per `direction` (`RatingStep::Backward`
+    /// is the Host's explicit "go back" override; a no-op at index 0), or
+    /// -- Forward past the last entry -- closes and resolves the session
+    /// inline (the same work `CloseContestMinigame` does).
+    AdvanceCreativeRating {
+        round: Round,
+        direction: crate::contest_minigame::RatingStep,
+    },
+    /// Intelligence (Trivia or Math): `player`'s answer to question
+    /// `question_index`, checked engine-side against that question's
+    /// Host-only-visible `correct_choice`. Must arrive in order
+    /// (`question_index` must equal how many this player has already
+    /// answered) -- a quiz is answered front-to-back, never skipped
+    /// around.
+    SubmitQuizAnswer {
         player: PlayerId,
         round: Round,
-        answer: String,
+        question_index: usize,
+        choice_index: usize,
+    },
+    /// Intelligence (Trivia or Math), called only by `game_server`'s
+    /// internal follow-up to its own `DomainEvent::QuizCompleted` marker
+    /// -- never reachable from an ordinary player action (see
+    /// `command_actor`'s doc comment on why this must return `None`
+    /// there). Records `player`'s real, server-measured total time so the
+    /// "fewest guesses/most correct, ties by fastest" rule never trusts a
+    /// client-supplied number.
+    RecordQuizElapsedTime {
+        player: PlayerId,
+        round: Round,
+        elapsed_ms: u64,
+    },
+    /// Intelligence (Memory): `player`'s own final, self-reported score
+    /// (the longest color sequence they correctly repeated) -- fully
+    /// client-side and trusted, the same trust model as Strength's
+    /// self-reported placement. One-shot. No tiebreak (Dalton's own spec
+    /// states none).
+    SubmitMemoryScore {
+        player: PlayerId,
+        round: Round,
+        longest_sequence: u32,
+    },
+    /// Intelligence (Wordle): `player`'s one 5-letter guess, checked
+    /// engine-side against the session's Host-only-visible secret.
+    /// Rejected once solved or after 6 guesses.
+    SubmitWordleGuess {
+        player: PlayerId,
+        round: Round,
+        guess: String,
+    },
+    /// Intelligence (Wordle), same caller restriction and reasoning as
+    /// `RecordQuizElapsedTime`.
+    RecordWordleElapsedTime {
+        player: PlayerId,
+        round: Round,
+        elapsed_ms: u64,
     },
     /// Strength: `player`'s own self-reported finishing placement (1 =
     /// won outright) for a live, physically-judged event -- Dalton's own
@@ -506,9 +565,9 @@ pub enum Command {
         round: Round,
         placement: u32,
     },
-    /// Closes `category`'s mini-game session for `round`, computes each
-    /// participant's score (see `contest_minigame`'s doc comment for how
-    /// each category scores), and resolves `ton_won` via
+    /// Closes whichever category's mini-game session is open for `round`,
+    /// computes each participant's score (see `contest_minigame`'s doc
+    /// comment for how each mechanic scores), and resolves `ton_won` via
     /// `contest_minigame::resolve_ton_won` -- internally just
     /// `record_contest_result` with a computed `ton_won` instead of a
     /// host-asserted one, so it inherits that function's own round/

@@ -2,6 +2,10 @@ use crate::ability::{AbilityStatus, InfoCheckDelivery};
 use crate::bio::{Bio, TaskCandidate};
 use crate::character::{Character, PlayerStatus};
 use crate::contest::ContestCategory;
+use crate::contest_minigame::{
+    self, ContestMinigameSession, CreativeEntry, CreativityKind, CreativityPhase,
+    IntelligencePayload, MinigamePayload, QuizKind, WordleGuess,
+};
 use crate::denouncement::DenouncementPhase;
 use crate::finale_reveal::{self, FinaleReveal, PlayerReveal};
 use crate::history::{self, RoundHistoryEntry, TaskHistoryEntry};
@@ -118,32 +122,71 @@ pub struct ContestMinigameView {
     pub round: Round,
     pub category: ContestCategory,
     pub prompt: String,
-    /// How many participants have submitted something so far (an entry, an
-    /// attempt, or a placement, whichever this category uses) -- visible
-    /// to every viewer, mainly so the Host has a live signal for "is it
-    /// time to close this yet" without needing the standings themselves.
+    /// How many participants have submitted something so far (an entry, a
+    /// finished quiz/Wordle attempt, a memory score, or a placement,
+    /// whichever this category/kind uses) -- visible to every viewer,
+    /// mainly so the Host has a live signal for "is it time to close this
+    /// yet" without needing the standings themselves.
     pub submission_count: usize,
-    /// Creativity only: every submitted entry so far, including the
-    /// viewer's own -- safe to show every active player since rating
-    /// requires seeing what you're rating (unlike a task's qualifying set,
-    /// this was never meant to stay hidden). Empty for every other
-    /// category.
-    pub creative_entries: Vec<(PlayerId, String)>,
-    /// Creativity only: which targets the viewer has already rated this
-    /// session, so the UI can grey out an already-rated entry (a repeat
-    /// rating still succeeds -- see `Command::RateCreativeEntry`'s doc
-    /// comment -- this is just a UI convenience, not an enforced lock).
-    pub my_creative_ratings_given: Vec<PlayerId>,
-    /// Intelligence only: whether the viewer has already attempted (right
-    /// or wrong) -- one-shot, so the UI can hide the input once used.
-    pub my_intelligence_attempted: bool,
-    /// Strength only: the viewer's own submitted placement, if any.
+
+    // --- Strength only ---
     pub my_physical_placement: Option<u32>,
-    /// Host-only, Intelligence only: the correct answer -- the same
-    /// deliberate "Host sees the answer" reversal as
-    /// `TaskView::answer_code`. `None` for every non-Host viewer and for
-    /// every non-Intelligence category.
+
+    // --- Creativity only ---
+    pub creativity_kind: Option<CreativityKind>,
+    /// Whether the viewer has already submitted their own Writing-phase
+    /// entry -- so the UI can hide the write form once used.
+    pub my_creative_entry_submitted: bool,
+    /// The one entry currently up in the Rating phase's one-at-a-time
+    /// rotation, if any -- bounding the wire payload to a single entry at
+    /// a time (a real bandwidth concern for Drawing specifically) rather
+    /// than resending the whole list on every broadcast tick.
+    pub current_rating_item: Option<CreativityCurrentItemView>,
+
+    // --- Intelligence: Trivia/Math only ---
+    pub quiz_kind: Option<QuizKind>,
+    /// The one question the viewer is currently on (their own progress
+    /// determines the index) -- `None` once they've answered all 10, or
+    /// if this isn't a quiz session.
+    pub current_quiz_question: Option<QuizQuestionView>,
+    pub my_quiz_correct_count: Option<u32>,
+
+    // --- Intelligence: Memory only ---
+    pub is_memory: bool,
+    pub my_memory_score: Option<u32>,
+
+    // --- Intelligence: Wordle only ---
+    pub is_wordle: bool,
+    pub my_wordle_guesses: Vec<WordleGuess>,
+    pub my_wordle_solved: bool,
+
+    /// Host-only, Wordle only: the secret word -- the same deliberate
+    /// "Host sees the answer" reversal as `TaskView::answer_code`. `None`
+    /// for every non-Host viewer and for every non-Wordle session.
     pub answer: Option<String>,
+}
+
+/// One Creativity entry as it appears in the Rating phase's one-at-a-time
+/// rotation. Safe to show every viewer (rating requires seeing what
+/// you're rating) -- only `is_own_entry`/`already_rated` are
+/// viewer-specific.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreativityCurrentItemView {
+    pub index: usize,
+    pub total: usize,
+    pub is_own_entry: bool,
+    pub already_rated: bool,
+    pub entry: CreativeEntry,
+}
+
+/// A player-safe projection of one quiz question -- never carries
+/// `correct_choice` (see `QuizQuestion`'s own doc comment).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuizQuestionView {
+    pub index: usize,
+    pub total: usize,
+    pub prompt: String,
+    pub choices: Vec<String>,
 }
 
 /// What a single connection is allowed to see, fully pre-filtered
@@ -400,44 +443,8 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
 
     let open_contest_minigames = state
         .contest_minigames()
-        .map(|(&(round, category), session)| ContestMinigameView {
-            round,
-            category,
-            prompt: session.prompt.clone(),
-            submission_count: match category {
-                ContestCategory::Creativity => session.creative_entries.len(),
-                ContestCategory::Intelligence => session.intelligence_attempts.len(),
-                ContestCategory::Strength => session.placements.len(),
-            },
-            creative_entries: if category == ContestCategory::Creativity {
-                session
-                    .creative_entries
-                    .iter()
-                    .map(|(&id, text)| (id, text.clone()))
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            my_creative_ratings_given: viewer_id
-                .filter(|_| category == ContestCategory::Creativity)
-                .map(|id| {
-                    session
-                        .creative_ratings
-                        .get(&id)
-                        .map(|by_target| by_target.keys().copied().collect())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default(),
-            my_intelligence_attempted: category == ContestCategory::Intelligence
-                && viewer_id.is_some_and(|id| session.intelligence_attempts.contains(&id)),
-            my_physical_placement: viewer_id
-                .filter(|_| category == ContestCategory::Strength)
-                .and_then(|id| session.placements.get(&id).copied()),
-            answer: if is_host {
-                session.correct_answer.clone()
-            } else {
-                None
-            },
+        .map(|(&(round, category), session)| {
+            contest_minigame_view(round, category, session, viewer_id, is_host)
         })
         .collect();
 
@@ -563,10 +570,126 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     }
 }
 
+/// Projects one `ContestMinigameSession` into its viewer-scoped
+/// `ContestMinigameView` -- see that type's own doc comment for the
+/// scoping rules per field.
+fn contest_minigame_view(
+    round: Round,
+    category: ContestCategory,
+    session: &ContestMinigameSession,
+    viewer_id: Option<PlayerId>,
+    is_host: bool,
+) -> ContestMinigameView {
+    let mut view = ContestMinigameView {
+        round,
+        category,
+        prompt: session.prompt.clone(),
+        submission_count: 0,
+        my_physical_placement: None,
+        creativity_kind: None,
+        my_creative_entry_submitted: false,
+        current_rating_item: None,
+        quiz_kind: None,
+        current_quiz_question: None,
+        my_quiz_correct_count: None,
+        is_memory: false,
+        my_memory_score: None,
+        is_wordle: false,
+        my_wordle_guesses: Vec::new(),
+        my_wordle_solved: false,
+        answer: None,
+    };
+
+    match &session.payload {
+        MinigamePayload::Strength(payload) => {
+            view.submission_count = payload.placements.len();
+            view.my_physical_placement =
+                viewer_id.and_then(|id| payload.placements.get(&id).copied());
+        }
+        MinigamePayload::Creativity(payload) => {
+            view.submission_count = payload.entries.len();
+            view.creativity_kind = Some(payload.kind);
+            view.my_creative_entry_submitted =
+                viewer_id.is_some_and(|id| payload.entries.contains_key(&id));
+            if let (CreativityPhase::Rating { current_index }, Some(target)) =
+                (payload.phase, payload.current_target())
+            {
+                if let Some(entry) = payload.entries.get(&target) {
+                    view.current_rating_item = Some(CreativityCurrentItemView {
+                        index: current_index,
+                        total: payload.rating_order.len(),
+                        is_own_entry: viewer_id == Some(target),
+                        already_rated: viewer_id.is_some_and(|id| {
+                            payload
+                                .ratings
+                                .get(&id)
+                                .is_some_and(|by_target| by_target.contains_key(&target))
+                        }),
+                        entry: entry.clone(),
+                    });
+                }
+            }
+        }
+        MinigamePayload::Intelligence(IntelligencePayload::Trivia(quiz))
+        | MinigamePayload::Intelligence(IntelligencePayload::Math(quiz)) => {
+            view.submission_count = quiz
+                .progress
+                .values()
+                .filter(|p| p.answers.len() == quiz.questions.len())
+                .count();
+            view.quiz_kind = Some(
+                if matches!(
+                    session.payload,
+                    MinigamePayload::Intelligence(IntelligencePayload::Trivia(_))
+                ) {
+                    QuizKind::Trivia
+                } else {
+                    QuizKind::Math
+                },
+            );
+            if let Some(id) = viewer_id {
+                let answered = quiz.progress.get(&id).map_or(0, |p| p.answers.len());
+                view.my_quiz_correct_count = quiz.progress.get(&id).map(|p| p.correct_count);
+                if let Some(question) = quiz.questions.get(answered) {
+                    view.current_quiz_question = Some(QuizQuestionView {
+                        index: answered,
+                        total: quiz.questions.len(),
+                        prompt: question.prompt.clone(),
+                        choices: question.choices.clone(),
+                    });
+                }
+            }
+        }
+        MinigamePayload::Intelligence(IntelligencePayload::Memory(scores)) => {
+            view.submission_count = scores.len();
+            view.is_memory = true;
+            view.my_memory_score = viewer_id.and_then(|id| scores.get(&id).copied());
+        }
+        MinigamePayload::Intelligence(IntelligencePayload::Wordle(payload)) => {
+            view.submission_count = payload
+                .progress
+                .values()
+                .filter(|p| p.solved || p.guesses.len() >= contest_minigame::MAX_GUESSES)
+                .count();
+            view.is_wordle = true;
+            if let Some(progress) = viewer_id.and_then(|id| payload.progress.get(&id)) {
+                view.my_wordle_guesses = progress.guesses.clone();
+                view.my_wordle_solved = progress.solved;
+            }
+            if is_host {
+                view.answer = Some(payload.secret.clone());
+            }
+        }
+    }
+
+    view
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::command::Command;
+    use crate::contest_minigame::{IntelligenceKind, OpenMinigameDetail};
     use crate::event::DomainEvent;
     use crate::history::TaskOutcome;
     use crate::state::apply_command;
@@ -2210,25 +2333,26 @@ mod tests {
     }
 
     #[test]
-    fn contest_minigame_view_scopes_the_answer_to_host_only_but_entries_to_everyone() {
+    fn contest_minigame_view_scopes_the_wordle_secret_to_host_only_but_my_progress_to_me() {
         let mut state = three_player_state();
         apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
         apply_command(
             &mut state,
             Command::OpenContestMinigame {
                 round: Round::Two,
-                category: ContestCategory::Intelligence,
-                prompt: "2+2?".into(),
-                correct_answer: Some("Four".into()),
+                prompt: "Wordle!".into(),
+                detail: OpenMinigameDetail::Intelligence(IntelligenceKind::Wordle {
+                    secret: "apple".into(),
+                }),
             },
         )
         .unwrap();
         apply_command(
             &mut state,
-            Command::SubmitIntelligenceAnswer {
+            Command::SubmitWordleGuess {
                 player: PlayerId(0),
                 round: Round::Two,
-                answer: "Four".into(),
+                guess: "apple".into(),
             },
         )
         .unwrap();
@@ -2236,32 +2360,34 @@ mod tests {
         let alice_view = view_for(&state, Viewer::Player(PlayerId(0)));
         assert_eq!(alice_view.open_contest_minigames.len(), 1);
         let session = &alice_view.open_contest_minigames[0];
-        assert_eq!(session.prompt, "2+2?");
-        assert!(session.my_intelligence_attempted);
-        assert_eq!(session.answer, None, "a player must never see the answer");
+        assert_eq!(session.prompt, "Wordle!");
+        assert_eq!(session.my_wordle_guesses.len(), 1);
+        assert!(session.my_wordle_solved);
+        assert_eq!(session.answer, None, "a player must never see the secret");
 
         let bob_view = view_for(&state, Viewer::Player(PlayerId(1)));
-        assert!(!bob_view.open_contest_minigames[0].my_intelligence_attempted);
+        assert!(bob_view.open_contest_minigames[0]
+            .my_wordle_guesses
+            .is_empty());
 
         let host_view = view_for(&state, Viewer::Host);
         assert_eq!(
             host_view.open_contest_minigames[0].answer.as_deref(),
-            Some("Four"),
+            Some("APPLE"),
             "the Host is the one deliberate exception"
         );
     }
 
     #[test]
-    fn creativity_entries_are_visible_to_every_viewer_for_rating() {
+    fn creativity_current_rating_item_is_visible_to_every_viewer_for_rating() {
         let mut state = three_player_state();
         apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
         apply_command(
             &mut state,
             Command::OpenContestMinigame {
                 round: Round::Two,
-                category: ContestCategory::Creativity,
-                prompt: "Draw a cat".into(),
-                correct_answer: None,
+                prompt: "Tell a joke".into(),
+                detail: OpenMinigameDetail::Creativity(CreativityKind::Joke),
             },
         )
         .unwrap();
@@ -2270,18 +2396,44 @@ mod tests {
             Command::SubmitCreativeEntry {
                 player: PlayerId(0),
                 round: Round::Two,
-                text: "a cat".into(),
+                entry: CreativeEntry::Joke {
+                    text: "a cat joke".into(),
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::AdvanceCreativeWriting {
+                round: Round::Two,
+                order: vec![PlayerId(0), PlayerId(1), PlayerId(2)],
             },
         )
         .unwrap();
 
         for viewer in [Viewer::Player(PlayerId(1)), Viewer::Host, Viewer::Display] {
             let view = view_for(&state, viewer);
+            let item = view.open_contest_minigames[0]
+                .current_rating_item
+                .as_ref()
+                .unwrap();
             assert_eq!(
-                view.open_contest_minigames[0].creative_entries,
-                vec![(PlayerId(0), "a cat".to_string())]
+                item.entry,
+                CreativeEntry::Joke {
+                    text: "a cat joke".into()
+                }
             );
+            assert_eq!(item.index, 0);
+            assert_eq!(item.total, 3);
         }
+        let alice_view = view_for(&state, Viewer::Player(PlayerId(0)));
+        assert!(
+            alice_view.open_contest_minigames[0]
+                .current_rating_item
+                .as_ref()
+                .unwrap()
+                .is_own_entry
+        );
     }
 
     #[test]

@@ -245,9 +245,6 @@ pub enum GameError {
     #[error("player {0:?} already submitted to this mini-game session")]
     AlreadySubmittedToContestMinigame(PlayerId),
 
-    #[error("a contest mini-game rating cannot name the rating player themself")]
-    CannotRateSelfInContestMinigame,
-
     #[error("player {0:?} has no submitted entry to rate")]
     NoContestEntryToRate(PlayerId),
 
@@ -256,4 +253,28 @@ pub enum GameError {
 
     #[error("placement {0} is out of range -- must be at least 1")]
     PlacementOutOfRange(u32),
+
+    #[error("a quiz must have exactly 10 questions, got {0}")]
+    QuizMustHaveExactlyTenQuestions(usize),
+
+    #[error("a Wordle secret must be a real 5-letter word")]
+    WordleSecretMustBeAFiveLetterWord,
+
+    #[error("a Wordle guess must be a 5-letter word")]
+    WordleGuessMustBeAFiveLetterWord,
+
+    #[error("player {0:?} has no Wordle guesses remaining")]
+    NoWordleGuessesRemaining(PlayerId),
+
+    #[error("a submitted drawing must be a PNG data URL")]
+    DrawingMustBeAPngDataUrl,
+
+    #[error("memory sequence length {0} is out of range")]
+    MemorySequenceOutOfRange(u32),
+
+    #[error("that entry doesn't match this mini-game's kind")]
+    WrongEntryKindForContestMinigame,
+
+    #[error("quiz answers must arrive in order -- expected question {expected}, got {got}")]
+    QuizAnswerOutOfOrder { expected: usize, got: usize },
 }

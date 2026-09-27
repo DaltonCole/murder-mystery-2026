@@ -14,8 +14,9 @@
 
 use engine::{
     apply_command, raffle_priority, raffle_winners, task_candidates, ticket_count, ticket_slots,
-    view_for, Command, DenouncementPhase, DomainEvent, Faction, GameError, GameState, PlayerId,
-    PlayerStatus, PlayerView, Round, TaskTier, Viewer,
+    view_for, Command, ContestCategory, CreativityKind, CreativityPhase, DenouncementPhase,
+    DomainEvent, Faction, GameError, GameState, MinigamePayload, PlayerId, PlayerStatus,
+    PlayerView, RatingStep, Round, TaskTier, Viewer,
 };
 use rand::seq::SliceRandom;
 use rand::RngExt;
@@ -54,6 +55,18 @@ struct GameServer {
     // operational preference, not a fact about the game itself" shape as
     // `auto_tasks_pushed`.
     banned_task_prompts: Mutex<BTreeSet<String>>,
+    // Wall-clock deadlines for the currently-open Creativity mini-game
+    // sessions' auto-advancing phase timers -- see `track_minigame_timers`.
+    // Process-local, same as every other field here: lost on a restart, a
+    // mid-phase session just sits until the Host's manual "Force next"
+    // fast-forwards it a few times.
+    minigame_deadlines: Mutex<BTreeMap<(Round, ContestCategory), Instant>>,
+    // When each currently-open Intelligence session was opened -- lets
+    // `record_minigame_elapsed_time` compute a real, server-measured
+    // elapsed time for Trivia/Math/Wordle instead of trusting a
+    // client-supplied one. See `Command::RecordQuizElapsedTime`'s doc
+    // comment.
+    minigame_started_at: Mutex<BTreeMap<(Round, ContestCategory), Instant>>,
 }
 
 fn server() -> &'static GameServer {
@@ -66,6 +79,8 @@ fn server() -> &'static GameServer {
             auto_tasks_pushed: Mutex::new(BTreeSet::new()),
             timer: Mutex::new(None),
             banned_task_prompts: Mutex::new(BTreeSet::new()),
+            minigame_deadlines: Mutex::new(BTreeMap::new()),
+            minigame_started_at: Mutex::new(BTreeMap::new()),
         }
     })
 }
@@ -119,12 +134,22 @@ pub fn banned_task_prompts() -> Vec<String> {
 /// number is briefly stale, matching this feature's own "roughly how much
 /// time is remaining" framing. `OnceLock` guarantees this loop is spawned
 /// exactly once no matter how many times a timer gets started.
+///
+/// Also drives `sweep_minigame_deadlines` every tick, unconditionally --
+/// deliberately NOT gated by `timer_active` below. The display `GameTimer`
+/// (Host-started/stopped) and a Creativity session's own phase deadlines
+/// are independent concerns: a session must keep auto-advancing whether or
+/// not the Host has separately started the visible round timer. Called
+/// unconditionally from `apply` (not just from the Host's timer buttons)
+/// so the sweep is guaranteed running before any contest mini-game could
+/// possibly be opened.
 fn ensure_ticker_running() {
     static TICKER: OnceLock<()> = OnceLock::new();
     TICKER.get_or_init(|| {
         tokio::spawn(async {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                sweep_minigame_deadlines();
                 let timer_active = server()
                     .timer
                     .lock()
@@ -559,11 +584,240 @@ fn auto_close_tasks_on_denouncement_open_or_even_round(
     apply_command(state, Command::CloseTasks).unwrap_or_default()
 }
 
+/// Per-`CreativityKind` `(writing, rating-per-item)` durations -- Dalton's
+/// own explicit spec for each of the four games. Lives here, not the
+/// engine: these are wall-clock facts, not game rules -- the same
+/// "randomness/time is an app-layer concern" boundary this module already
+/// draws for `GameTimer` and every `_randomly` helper above.
+///
+/// *** EDIT THIS to retune pacing before game night -- no other code
+/// changes needed. ***
+fn creativity_durations(kind: CreativityKind) -> (Duration, Duration) {
+    match kind {
+        CreativityKind::Drawing => (Duration::from_secs(60), Duration::from_secs(10)),
+        CreativityKind::Joke => (Duration::from_secs(120), Duration::from_secs(15)),
+        CreativityKind::Dictionarium => (Duration::from_secs(180), Duration::from_secs(20)),
+        CreativityKind::Smut => (Duration::from_secs(150), Duration::from_secs(30)),
+    }
+}
+
+/// The currently-open Creativity session's kind and phase for `round`, if
+/// any -- `game_server`'s own read of `GameState::contest_minigames`
+/// (`pub` specifically for this), used to decide which duration to arm
+/// next and which command the deadline sweep should fire.
+fn creativity_kind_and_phase(
+    state: &GameState,
+    round: Round,
+) -> Option<(CreativityKind, CreativityPhase)> {
+    state
+        .contest_minigames()
+        .find_map(|(&(r, category), session)| {
+            if r != round || category != ContestCategory::Creativity {
+                return None;
+            }
+            match &session.payload {
+                MinigamePayload::Creativity(payload) => Some((payload.kind, payload.phase)),
+                _ => None,
+            }
+        })
+}
+
+fn set_minigame_deadline(round: Round, category: ContestCategory, duration: Duration) {
+    server()
+        .minigame_deadlines
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert((round, category), Instant::now() + duration);
+}
+
+/// Clears both this module's own deadline and started-at bookkeeping for
+/// `(round, category)` -- called once a session closes, so a stale entry
+/// never lingers to confuse a later session opened under the same key.
+fn clear_minigame_timer(round: Round, category: ContestCategory) {
+    server()
+        .minigame_deadlines
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(round, category));
+    server()
+        .minigame_started_at
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(round, category));
+}
+
+fn record_minigame_started(round: Round, category: ContestCategory) {
+    server()
+        .minigame_started_at
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert((round, category), Instant::now());
+}
+
+fn minigame_elapsed_ms(round: Round, category: ContestCategory) -> Option<u64> {
+    server()
+        .minigame_started_at
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&(round, category))
+        .map(|start| start.elapsed().as_millis() as u64)
+}
+
+/// Arms/clears this module's own wall-clock bookkeeping in response to
+/// whatever `events` a just-applied command produced -- same "scan the
+/// just-applied events" shape as `auto_push_on_round_advance`, but writes
+/// to `minigame_deadlines`/`minigame_started_at` instead of firing a
+/// follow-up command. Opening a Creativity session arms its Writing
+/// deadline; ending Writing or advancing Rating re-arms the per-item
+/// rating deadline; opening an Intelligence session records its start time
+/// (used by `record_minigame_elapsed_time` for Trivia/Math/Wordle); a
+/// session closing clears both maps for that key.
+fn track_minigame_timers(state: &GameState, events: &[DomainEvent]) {
+    for event in events {
+        match *event {
+            DomainEvent::ContestMinigameOpened {
+                round, category, ..
+            } => match category {
+                ContestCategory::Creativity => {
+                    if let Some((kind, _)) = creativity_kind_and_phase(state, round) {
+                        set_minigame_deadline(round, category, creativity_durations(kind).0);
+                    }
+                }
+                ContestCategory::Intelligence => record_minigame_started(round, category),
+                ContestCategory::Strength => {}
+            },
+            DomainEvent::CreativeWritingPhaseEnded { round }
+            | DomainEvent::CreativeRatingAdvanced { round } => {
+                if let Some((kind, _)) = creativity_kind_and_phase(state, round) {
+                    set_minigame_deadline(
+                        round,
+                        ContestCategory::Creativity,
+                        creativity_durations(kind).1,
+                    );
+                }
+            }
+            DomainEvent::ContestMinigameClosed { round, category } => {
+                clear_minigame_timer(round, category);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Catches `QuizCompleted`/`WordleAttemptFinished` (see
+/// `Command::RecordQuizElapsedTime`'s doc comment) and immediately records
+/// a real, server-measured elapsed time -- never a client-supplied one.
+/// Same "scan just-applied events, fire a follow-up command" shape as
+/// `auto_push_on_round_advance`.
+fn record_minigame_elapsed_time(state: &mut GameState, events: &[DomainEvent]) -> Vec<DomainEvent> {
+    let mut follow_up = Vec::new();
+    for event in events {
+        let command = match *event {
+            DomainEvent::QuizCompleted { player, round } => {
+                let Some(elapsed_ms) = minigame_elapsed_ms(round, ContestCategory::Intelligence)
+                else {
+                    continue;
+                };
+                Command::RecordQuizElapsedTime {
+                    player,
+                    round,
+                    elapsed_ms,
+                }
+            }
+            DomainEvent::WordleAttemptFinished { player, round } => {
+                let Some(elapsed_ms) = minigame_elapsed_ms(round, ContestCategory::Intelligence)
+                else {
+                    continue;
+                };
+                Command::RecordWordleElapsedTime {
+                    player,
+                    round,
+                    elapsed_ms,
+                }
+            }
+            _ => continue,
+        };
+        if let Ok(more) = apply_command(state, command) {
+            follow_up.extend(more);
+        }
+    }
+    follow_up
+}
+
+/// Every currently-active player, server-shuffled -- the real, OS-backed
+/// "randomness at the boundary" source for `Command::AdvanceCreativeWriting`'s
+/// `order` field, both from the automatic sweep below and from the Host's
+/// manual "Force next" override during Writing (`force_advance_creative_writing`).
+fn active_players_shuffled(state: &GameState) -> Vec<PlayerId> {
+    let mut ids: Vec<PlayerId> = state
+        .players()
+        .filter(|p| p.status == PlayerStatus::Active)
+        .map(|p| p.id)
+        .collect();
+    ids.shuffle(&mut rand::rng());
+    ids
+}
+
+/// Checks every open Creativity session's deadline and, for any that has
+/// passed, fires the matching advance command through `apply` itself --
+/// letting `track_minigame_timers` (run again from inside that `apply`
+/// call) re-derive and store the *next* deadline, exactly as a Host's
+/// manual override would. Only Creativity sessions ever get a deadline
+/// (see `track_minigame_timers`), so nothing else needs filtering here.
+fn sweep_minigame_deadlines() {
+    let due: Vec<(Round, ContestCategory)> = {
+        let now = Instant::now();
+        server()
+            .minigame_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|&(_, &deadline)| now >= deadline)
+            .map(|(&key, _)| key)
+            .collect()
+    };
+    for (round, category) in due {
+        let phase = creativity_kind_and_phase(&lock_state(), round).map(|(_, phase)| phase);
+        let Some(phase) = phase else {
+            // The session closed or changed shape some other way since the
+            // deadline was armed (e.g. a Host manual override raced this
+            // sweep) -- drop the stale entry instead of looping forever.
+            clear_minigame_timer(round, category);
+            continue;
+        };
+        let cmd = match phase {
+            CreativityPhase::Writing => Command::AdvanceCreativeWriting {
+                round,
+                order: active_players_shuffled(&lock_state()),
+            },
+            CreativityPhase::Rating { .. } => Command::AdvanceCreativeRating {
+                round,
+                direction: RatingStep::Forward,
+            },
+        };
+        let _ = apply(cmd);
+    }
+}
+
+/// Forces a Creativity session's Writing phase to end right now, ahead of
+/// its own auto-timer -- the Host console's "Force next" button while a
+/// session is still in Writing. Not a plain `Command::AdvanceCreativeWriting`
+/// sent directly from the client: that command's `order` field needs a
+/// real, server-shuffled active-participant list (randomness at the
+/// boundary), which the Host browser has no principled way to produce
+/// itself. Going back to Writing is not offered -- as with every other
+/// direction here, only Rating has a Backward step.
+pub fn force_advance_creative_writing(round: Round) -> Result<Vec<DomainEvent>, String> {
+    let order = active_players_shuffled(&lock_state());
+    apply(Command::AdvanceCreativeWriting { round, order }).map_err(|e| e.to_string())
+}
+
 /// Applies one command against the single canonical `GameState`, holding
 /// the lock only for the mutation itself. The only place in the whole app
 /// allowed to call `engine::apply_command` -- every route-driven mutation
 /// funnels through here.
 pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
+    ensure_ticker_running();
     let mut events;
     {
         let mut state = lock_state();
@@ -578,6 +832,9 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
             &mut state, &events,
         ));
         events.extend(auto_close_denouncement_phase(&mut state));
+        track_minigame_timers(&state, &events);
+        let elapsed_time_events = record_minigame_elapsed_time(&mut state, &events);
+        events.extend(elapsed_time_events);
     }
     // Errors here just mean nobody's subscribed right now -- fine to
     // ignore, there's nobody waiting to be told.

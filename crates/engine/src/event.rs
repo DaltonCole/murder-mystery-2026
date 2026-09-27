@@ -284,12 +284,58 @@ pub enum DomainEvent {
         round: Round,
         stars: u8,
     },
-    /// Never carries the guessed answer, right or wrong -- same
+    /// Writing -> Rating{0} -- see `Command::AdvanceCreativeWriting`.
+    CreativeWritingPhaseEnded {
+        round: Round,
+    },
+    /// The Rating rotation moved to a different item (forward or
+    /// backward) -- see `Command::AdvanceCreativeRating`. Never fires when
+    /// the session actually closes; `ContestMinigameClosed` covers that.
+    CreativeRatingAdvanced {
+        round: Round,
+    },
+    /// Never carries which choice was picked, right or wrong -- same
     /// no-spoiler reasoning as `TaskAttempted` never carrying `named`.
-    IntelligenceAnswerAttempted {
+    QuizAnswerSubmitted {
         player: PlayerId,
         round: Round,
+        question_index: usize,
         correct: bool,
+    },
+    /// Marker-only: `player` just answered their 10th question. Caught by
+    /// `game_server`'s own follow-up harness to compute and record a real
+    /// elapsed time -- see `Command::RecordQuizElapsedTime`'s doc comment.
+    QuizCompleted {
+        player: PlayerId,
+        round: Round,
+    },
+    QuizElapsedTimeRecorded {
+        player: PlayerId,
+        round: Round,
+    },
+    MemoryScoreSubmitted {
+        player: PlayerId,
+        round: Round,
+        longest_sequence: u32,
+    },
+    /// Safe to carry full feedback -- `view_for` only ever surfaces the
+    /// viewer's own Wordle progress, never another player's.
+    WordleGuessSubmitted {
+        player: PlayerId,
+        round: Round,
+        feedback: [crate::contest_minigame::LetterFeedback; 5],
+        guesses_used: usize,
+        solved: bool,
+    },
+    /// Marker-only, same shape as `QuizCompleted` -- `player` either
+    /// solved it or used their 6th guess.
+    WordleAttemptFinished {
+        player: PlayerId,
+        round: Round,
+    },
+    WordleElapsedTimeRecorded {
+        player: PlayerId,
+        round: Round,
     },
     PhysicalPlacementSubmitted {
         player: PlayerId,
