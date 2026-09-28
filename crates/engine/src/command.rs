@@ -576,6 +576,40 @@ pub enum Command {
         round: Round,
         category: ContestCategory,
     },
+    /// `game_server`-only (never a raw player action): opens `steps[0]`
+    /// immediately, exactly like `OpenContestMinigame`, and queues the
+    /// rest to auto-open one at a time as each prior step's session
+    /// closes -- Round 2's category-wide sequential activities (Drawing,
+    /// then Trivia, then a push-up contest) and Round 4's per-category
+    /// 3-game tracks are both just this, differing only in step count.
+    /// Every step must belong to the same category (derived from
+    /// `steps[0]`'s own `OpenMinigameDetail::category()`, the same
+    /// "detail carries its own category, so a mismatch is structurally
+    /// impossible" shape `OpenContestMinigame` already uses) -- rejected
+    /// otherwise, and rejected if `steps` is empty or the category
+    /// already has a session/result for `round`. Once the last step
+    /// closes, the category's one real result is the majority of every
+    /// step's own raw outcome (`contest_minigame::majority_ton_won`),
+    /// recorded exactly like a single-game category's result always has
+    /// been.
+    StartContestSequence {
+        round: Round,
+        steps: Vec<(String, crate::contest_minigame::OpenMinigameDetail)>,
+    },
+    /// Round 4 only: `player`'s own choice of which category to compete
+    /// in this round -- one-shot and locked (Dalton's own explicit
+    /// instruction): rejected outright if they've already chosen for this
+    /// round, unlike every other "standing choice" command in this engine
+    /// (`CastBallot`, `RateCreativeEntry`). Every Round 4 submit command
+    /// (`SubmitCreativeEntry`, `RateCreativeEntry`, `SubmitQuizAnswer`,
+    /// `SubmitMemoryScore`, `SubmitWordleGuess`, `SubmitPhysicalPlacement`)
+    /// rejects a player who chose a different category, or never chose at
+    /// all, from that category's session.
+    ChooseContestCategory {
+        player: PlayerId,
+        round: Round,
+        category: ContestCategory,
+    },
 
     // --- Phase 3: the Intermission lottery (rules.md §4) ---
     /// A player opts into "Who is Lorel's number one love?" -- rejected if

@@ -277,4 +277,23 @@ pub enum GameError {
 
     #[error("quiz answers must arrive in order -- expected question {expected}, got {got}")]
     QuizAnswerOutOfOrder { expected: usize, got: usize },
+
+    #[error("a contest sequence must have at least one step")]
+    ContestSequenceMustHaveAtLeastOneStep,
+
+    #[error("every step of a contest sequence must belong to the same category")]
+    ContestSequenceStepCategoryMismatch,
+
+    #[error("player {0:?} already chose a contest category this round")]
+    ContestCategoryAlreadyChosen(PlayerId),
+
+    #[error("player {0:?} must choose a contest category before competing this round")]
+    MustChooseContestCategoryFirst(PlayerId),
+
+    #[error("player {player:?} chose {chosen:?}, not {category:?}, this round")]
+    WrongContestCategoryChosen {
+        player: PlayerId,
+        chosen: ContestCategory,
+        category: ContestCategory,
+    },
 }

@@ -128,6 +128,12 @@ pub struct ContestMinigameView {
     /// mainly so the Host has a live signal for "is it time to close this
     /// yet" without needing the standings themselves.
     pub submission_count: usize,
+    /// `(current step, total steps)`, both 1-based, if this session is
+    /// part of an automated multi-game sequence (`Command::
+    /// StartContestSequence`) -- `None` for an ad-hoc, single-game
+    /// session, exactly today's only shape. Lets the Host/player UI show
+    /// "Step 2 of 3" without hardcoding step counts client-side.
+    pub sequence_progress: Option<(usize, usize)>,
 
     // --- Strength only ---
     pub my_physical_placement: Option<u32>,
@@ -253,6 +259,13 @@ pub struct PlayerView {
     /// ever the viewer's own status, never anyone else's. Always `false`
     /// for Host/Display.
     pub i_opted_into_intermission: bool,
+    /// Round 4 only: the viewer's own locked contest category choice for
+    /// `current_round` -- `None` once the round moves on, and never
+    /// another player's. See `Command::ChooseContestCategory`'s doc
+    /// comment: this is what a player's own `/play` routes their Round 4
+    /// mini-game UI by, and what the engine itself enforces submissions
+    /// against.
+    pub my_contest_category_choice: Option<ContestCategory>,
     /// The drawn Intermission entrants, once drawn -- `None` until then.
     /// Unlike the opt-in pool, this is public once it exists (rules.md §4
     /// frames the draw as a live, shared party moment), so every viewer
@@ -269,6 +282,14 @@ pub struct PlayerView {
     /// ends). Gives the host a self-audit view before recording another
     /// result, since `RecordContestResult` has no correction command.
     pub contest_results: Vec<((Round, ContestCategory), bool)>,
+    /// Every contest round whose 3 categories have all recorded a result,
+    /// with the majority-vote round-level winner (`true` = Ton) --
+    /// `Viewer::Host` ONLY, same self-audit framing as `contest_results`
+    /// (players never see this either). See
+    /// `contest_minigame::majority_ton_won`'s doc comment: the same rule
+    /// that decides a multi-game category's winner, applied one level up
+    /// to the round's 3 categories.
+    pub contest_round_winners: Vec<(Round, bool)>,
     /// The one faction currently winning, if any -- `Viewer::Host` ONLY,
     /// always `None` for `Viewer::Player`/`Viewer::Display` (see
     /// `GameState::winner_for_host`'s doc comment: public finale-reveal
@@ -458,7 +479,18 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     let open_contest_minigames = state
         .contest_minigames()
         .map(|(&(round, category), session)| {
-            contest_minigame_view(round, category, session, viewer_id, is_host)
+            let sequence_progress = state.contest_sequence(round, category).map(|sequence| {
+                let current_step = sequence.completed.len() + 1;
+                (current_step, current_step + sequence.upcoming.len())
+            });
+            contest_minigame_view(
+                round,
+                category,
+                session,
+                viewer_id,
+                is_host,
+                sequence_progress,
+            )
         })
         .collect();
 
@@ -492,6 +524,13 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
     } else {
         Vec::new()
     };
+    let contest_round_winners = if is_host {
+        state.contest_round_winners_for_host()
+    } else {
+        Vec::new()
+    };
+    let my_contest_category_choice =
+        viewer_id.and_then(|id| state.contest_category_choice(state.current_round(), id));
     let winner = if is_host {
         state.winner_for_host()
     } else {
@@ -563,9 +602,11 @@ pub fn view_for(state: &GameState, viewer: Viewer) -> PlayerView {
         revealed_leader,
         known_king_queen,
         i_opted_into_intermission,
+        my_contest_category_choice,
         intermission_entrants,
         servant_leaderboard: state.servant_leaderboard(),
         contest_results,
+        contest_round_winners,
         winner,
         gallery_resolved,
         whistledown: crate::whistledown::posts(state),
@@ -594,12 +635,14 @@ fn contest_minigame_view(
     session: &ContestMinigameSession,
     viewer_id: Option<PlayerId>,
     is_host: bool,
+    sequence_progress: Option<(usize, usize)>,
 ) -> ContestMinigameView {
     let mut view = ContestMinigameView {
         round,
         category,
         prompt: session.prompt.clone(),
         submission_count: 0,
+        sequence_progress,
         my_physical_placement: None,
         creativity_kind: None,
         my_creative_entry_submitted: false,

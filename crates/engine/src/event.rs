@@ -350,6 +350,24 @@ pub enum DomainEvent {
         round: Round,
         category: ContestCategory,
     },
+    /// An automated contest sequence (`Command::StartContestSequence`)
+    /// just moved on to its next step -- observability only, nothing
+    /// reacts to this: the next session is already open by the time this
+    /// fires, and the ordinary `changed` broadcast covers clients picking
+    /// it up. Never fires on the *last* step -- that's `ContestMinigameClosed`
+    /// (+ `ContestResultRecorded`) instead, exactly like a single-game
+    /// category's close today.
+    ContestSequenceStepAdvanced {
+        round: Round,
+        category: ContestCategory,
+    },
+    /// Round 4 only: `player` locked in `category` as their contest choice
+    /// for `round` -- see `Command::ChooseContestCategory`'s doc comment.
+    ContestCategoryChosen {
+        player: PlayerId,
+        round: Round,
+        category: ContestCategory,
+    },
     /// A bidirectional identity reveal (rules.md §3.2): `confidant` learns
     /// who `leader` is, and `leader` learns `confidant`'s identity in
     /// return (though `leader` already knew who every active Uprising

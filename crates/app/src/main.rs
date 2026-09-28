@@ -359,6 +359,7 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
         | Command::RecordQuizElapsedTime { .. }
         | Command::RecordWordleElapsedTime { .. }
         | Command::CloseContestMinigame { .. }
+        | Command::StartContestSequence { .. }
         | Command::DrawIntermissionEntrants { .. }
         | Command::AwardServantPoints { .. }
         | Command::ResolveGalleryPredictions { .. } => None,
@@ -389,6 +390,7 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
         | Command::SubmitMemoryScore { player, .. }
         | Command::SubmitWordleGuess { player, .. }
         | Command::SubmitPhysicalPlacement { player, .. }
+        | Command::ChooseContestCategory { player, .. }
         | Command::SubmitGalleryPrediction { player, .. } => Some(*player),
 
         Command::Convert { converter, .. } => Some(*converter),

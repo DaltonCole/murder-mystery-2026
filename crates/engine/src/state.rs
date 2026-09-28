@@ -6,8 +6,9 @@ use crate::character::{Character, PlayerStatus};
 use crate::command::Command;
 use crate::contest::ContestCategory;
 use crate::contest_minigame::{
-    self, ContestMinigameSession, CreativeEntry, CreativityPayload, IntelligencePayload,
-    MinigamePayload, OpenMinigameDetail, QuizPayload, RatingStep, WordleGuess, WordlePayload,
+    self, ContestMinigameSession, ContestSequence, CreativeEntry, CreativityPayload,
+    IntelligencePayload, MinigamePayload, OpenMinigameDetail, QuizPayload, RatingStep, WordleGuess,
+    WordlePayload,
 };
 use crate::denouncement::{
     execution_count, resolve_ballot, surfaced_nominees, Ballot, Denouncement, DenouncementPhase,
@@ -229,6 +230,19 @@ pub struct GameState {
     /// `contest_results` instead) rather than kept around -- there's
     /// nothing left that needs its submissions once resolved.
     contest_minigames: BTreeMap<(Round, ContestCategory), ContestMinigameSession>,
+    /// An in-progress automated multi-game contest sequence for (round,
+    /// category), if any -- Round 2's category-wide sequential activities
+    /// and Round 4's per-category 3-game tracks (TODO.md's Contest Rounds
+    /// rewrite). Absent/empty = an ad-hoc, single-game category, exactly
+    /// today's existing behavior -- see `close_contest_minigame`'s doc
+    /// comment for how this makes every existing close path sequence-aware
+    /// automatically.
+    contest_sequences: BTreeMap<(Round, ContestCategory), ContestSequence>,
+    /// Round 4 only: each player's own one-shot, locked choice of which
+    /// category to compete in this round (Dalton's own explicit
+    /// instruction: once chosen, a player can't switch, and the engine
+    /// actually enforces it -- see `check_contest_category_choice`).
+    contest_category_choices: BTreeMap<(Round, PlayerId), ContestCategory>,
     /// Every active Uprising member who currently knows the Revolutionary
     /// Leader's identity, grown one at a time by `trigger_leader_confidant`
     /// -- never shrinks, and self-limits once it covers every active
@@ -341,6 +355,8 @@ impl Default for GameState {
             grand_inquisitor_used: false,
             contest_results: BTreeMap::new(),
             contest_minigames: BTreeMap::new(),
+            contest_sequences: BTreeMap::new(),
+            contest_category_choices: BTreeMap::new(),
             leader_known_by: BTreeSet::new(),
             intermission_opt_ins: BTreeSet::new(),
             intermission_entrants: None,
@@ -519,6 +535,32 @@ impl GameState {
         &self,
     ) -> impl Iterator<Item = (&(Round, ContestCategory), &ContestMinigameSession)> {
         self.contest_minigames.iter()
+    }
+
+    /// The in-progress automated sequence backing `(round, category)`'s
+    /// currently-open session, if any -- `view.rs`'s own read of `GameState::
+    /// contest_sequences`, the same "real accessor" shape as
+    /// `contest_minigames()`, for `ContestMinigameView::sequence_progress`.
+    pub(crate) fn contest_sequence(
+        &self,
+        round: Round,
+        category: ContestCategory,
+    ) -> Option<&ContestSequence> {
+        self.contest_sequences.get(&(round, category))
+    }
+
+    /// Round 4 only: `player`'s own locked category choice for `round`, if
+    /// they've made one yet -- `pub` for the same reason `contest_minigames`
+    /// is: `game_server`'s auto-close-on-full-participation needs to know
+    /// who's actually expected to submit to a Round 4 session (see
+    /// `check_contest_category_choice`'s doc comment for the engine-side
+    /// enforcement this same data backs).
+    pub fn contest_category_choice(
+        &self,
+        round: Round,
+        player: PlayerId,
+    ) -> Option<ContestCategory> {
+        self.contest_category_choices.get(&(round, player)).copied()
     }
 
     pub fn is_task_open(&self, id: TaskId) -> bool {
@@ -768,6 +810,43 @@ impl GameState {
     /// going unnoticed for the rest of a live event.
     pub(crate) fn contest_results_for_host(&self) -> Vec<((Round, ContestCategory), bool)> {
         self.contest_results.iter().map(|(&k, &v)| (k, v)).collect()
+    }
+
+    /// Whether `round`'s overall winner is already decided, and which
+    /// faction -- `None` until either faction has an unbeatable majority
+    /// of that round's (at most 3) recorded contest categories (2 wins, or
+    /// all 3 recorded, which -- being an odd count -- always yields a
+    /// majority one way or the other). The same "2 of 3" reasoning
+    /// `ton_won_round` already uses for the Almanac gate, generalized to
+    /// report *which* faction rather than only ever checking Ton
+    /// specifically -- `PlayerView::contest_round_winners`' data source.
+    pub(crate) fn contest_round_winner(&self, round: Round) -> Option<bool> {
+        let recorded = self
+            .contest_results
+            .keys()
+            .filter(|&&(r, _)| r == round)
+            .count();
+        let ton_wins = self
+            .contest_results
+            .iter()
+            .filter(|(&(r, _), &ton_won)| r == round && ton_won)
+            .count();
+        if ton_wins >= 2 {
+            Some(true)
+        } else if recorded - ton_wins >= 2 {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Every contest round decided so far, in round order -- see
+    /// `contest_round_winner`'s doc comment.
+    pub(crate) fn contest_round_winners_for_host(&self) -> Vec<(Round, bool)> {
+        [Round::Two, Round::Four]
+            .into_iter()
+            .filter_map(|round| self.contest_round_winner(round).map(|won| (round, won)))
+            .collect()
     }
 
     /// Whether Ton won `round` overall -- Dalton's own explicit ruling:
@@ -1216,6 +1295,14 @@ pub fn apply_command(state: &mut GameState, cmd: Command) -> Result<Vec<DomainEv
         Command::CloseContestMinigame { round, category } => {
             close_contest_minigame(state, round, category)?
         }
+        Command::StartContestSequence { round, steps } => {
+            start_contest_sequence(state, round, steps)?
+        }
+        Command::ChooseContestCategory {
+            player,
+            round,
+            category,
+        } => choose_contest_category(state, player, round, category)?,
 
         Command::OptIntoIntermission { player } => opt_into_intermission(state, player)?,
         Command::DrawIntermissionEntrants { selected } => {
@@ -2384,6 +2471,7 @@ fn submit_creative_entry(
     if !state.is_active(player) {
         return Err(GameError::NotActive(player));
     }
+    check_contest_category_choice(state, player, round, ContestCategory::Creativity)?;
     contest_minigame::check_creative_entry(&entry)?;
     let payload = creativity_payload_mut(state, round)?;
     if entry.kind() != payload.kind {
@@ -2405,6 +2493,7 @@ fn rate_creative_entry(
     if !state.is_active(player) {
         return Err(GameError::NotActive(player));
     }
+    check_contest_category_choice(state, player, round, ContestCategory::Creativity)?;
     if !(1..=5).contains(&stars) {
         return Err(GameError::StarRatingOutOfRange(stars));
     }
@@ -2482,6 +2571,7 @@ fn submit_quiz_answer(
     if !state.is_active(player) {
         return Err(GameError::NotActive(player));
     }
+    check_contest_category_choice(state, player, round, ContestCategory::Intelligence)?;
     let quiz = quiz_payload_mut(state, round)?;
     let progress = quiz.progress.entry(player).or_default();
     if progress.answers.len() >= quiz.questions.len() {
@@ -2536,6 +2626,7 @@ fn submit_memory_score(
     if !state.is_active(player) {
         return Err(GameError::NotActive(player));
     }
+    check_contest_category_choice(state, player, round, ContestCategory::Intelligence)?;
     contest_minigame::check_memory_sequence_length(longest_sequence)?;
     let category = ContestCategory::Intelligence;
     let session = state
@@ -2581,6 +2672,7 @@ fn submit_wordle_guess(
     if !state.is_active(player) {
         return Err(GameError::NotActive(player));
     }
+    check_contest_category_choice(state, player, round, ContestCategory::Intelligence)?;
     let guess = contest_minigame::normalize_wordle_guess(&guess)
         .map_err(|_| GameError::WordleGuessMustBeAFiveLetterWord)?;
     let payload = wordle_payload_mut(state, round)?;
@@ -2638,6 +2730,7 @@ fn submit_physical_placement(
     if !state.is_active(player) {
         return Err(GameError::NotActive(player));
     }
+    check_contest_category_choice(state, player, round, ContestCategory::Strength)?;
     if placement == 0 {
         return Err(GameError::PlacementOutOfRange(placement));
     }
@@ -2660,9 +2753,30 @@ fn submit_physical_placement(
     }])
 }
 
-/// Closes `category`'s mini-game session for `round` and resolves it into
-/// a real contest result -- see `Command::CloseContestMinigame`'s doc
-/// comment.
+/// What happens next when the currently-open `(round, category)` session
+/// closes -- computed read-only from `state`, before any mutation, so a
+/// caller that hits an error partway through (see `close_contest_minigame`)
+/// never loses/corrupts anything already there.
+enum CloseOutcome {
+    /// No sequence running here -- today's original single-game shape.
+    NoSequence,
+    /// A sequence is running and has more steps -- open this one next.
+    Advance {
+        prompt: String,
+        detail: OpenMinigameDetail,
+    },
+    /// A sequence is running and this was its last step -- finalize by
+    /// majority vote across every step's own raw result.
+    Finalize { majority: bool },
+}
+
+/// Closes `category`'s mini-game session for `round` -- the one place
+/// every existing close path bottoms out (the explicit
+/// `Command::CloseContestMinigame` handler, and `advance_creative_rating`'s
+/// own "Rating reached the end" branch), which is what makes *every* such
+/// path automatically sequence-aware with no other call site needing
+/// changes. See `Command::StartContestSequence`'s doc comment for how a
+/// sequence gets started in the first place.
 fn close_contest_minigame(
     state: &mut GameState,
     round: Round,
@@ -2676,13 +2790,156 @@ fn close_contest_minigame(
     let ton_won =
         contest_minigame::resolve_ton_won(state, &scores, contest_minigame::DEFAULT_TOP_N_SCORERS);
 
-    // `record_contest_result` re-validates the round and rejects a
-    // duplicate on its own -- if it fails, the session stays open rather
-    // than being silently discarded, so the Host can retry.
-    let mut events = record_contest_result(state, round, category, ton_won)?;
-    state.contest_minigames.remove(&(round, category));
-    events.push(DomainEvent::ContestMinigameClosed { round, category });
-    Ok(events)
+    let outcome = match state.contest_sequences.get(&(round, category)) {
+        None => CloseOutcome::NoSequence,
+        Some(sequence) => match sequence.upcoming.front() {
+            Some((prompt, detail)) => CloseOutcome::Advance {
+                prompt: prompt.clone(),
+                detail: detail.clone(),
+            },
+            None => {
+                let mut completed = sequence.completed.clone();
+                completed.push(ton_won);
+                CloseOutcome::Finalize {
+                    majority: contest_minigame::majority_ton_won(&completed),
+                }
+            }
+        },
+    };
+
+    match outcome {
+        CloseOutcome::NoSequence => {
+            // `record_contest_result` re-validates the round and rejects a
+            // duplicate on its own -- if it fails, the session stays open
+            // rather than being silently discarded, so the Host can retry.
+            let mut events = record_contest_result(state, round, category, ton_won)?;
+            state.contest_minigames.remove(&(round, category));
+            events.push(DomainEvent::ContestMinigameClosed { round, category });
+            Ok(events)
+        }
+        CloseOutcome::Advance { prompt, detail } => {
+            // Same "don't mutate until the fallible part succeeds" shape:
+            // build the next session before touching `contest_sequences`
+            // or `contest_minigames` at all.
+            let next_session = contest_minigame::new_session(prompt, detail)?;
+            let sequence = state
+                .contest_sequences
+                .get_mut(&(round, category))
+                .expect("checked Some above");
+            sequence.completed.push(ton_won);
+            sequence.upcoming.pop_front();
+            state
+                .contest_minigames
+                .insert((round, category), next_session);
+            Ok(vec![DomainEvent::ContestSequenceStepAdvanced {
+                round,
+                category,
+            }])
+        }
+        CloseOutcome::Finalize { majority } => {
+            let mut events = record_contest_result(state, round, category, majority)?;
+            state.contest_sequences.remove(&(round, category));
+            state.contest_minigames.remove(&(round, category));
+            events.push(DomainEvent::ContestMinigameClosed { round, category });
+            Ok(events)
+        }
+    }
+}
+
+/// Starts an automated multi-game contest sequence -- see
+/// `Command::StartContestSequence`'s doc comment.
+fn start_contest_sequence(
+    state: &mut GameState,
+    round: Round,
+    mut steps: Vec<(String, OpenMinigameDetail)>,
+) -> Result<Vec<DomainEvent>, GameError> {
+    contest_minigame::check_is_contest_round(round)?;
+    let Some((first_prompt, first_detail)) = steps.first().cloned() else {
+        return Err(GameError::ContestSequenceMustHaveAtLeastOneStep);
+    };
+    let category = first_detail.category();
+    for (prompt, detail) in &steps {
+        contest_minigame::check_prompt_len(prompt)?;
+        if detail.category() != category {
+            return Err(GameError::ContestSequenceStepCategoryMismatch);
+        }
+    }
+    if state.contest_results.contains_key(&(round, category)) {
+        return Err(GameError::ContestResultAlreadyRecorded { round, category });
+    }
+    if state.contest_minigames.contains_key(&(round, category)) {
+        return Err(GameError::ContestMinigameAlreadyOpen { round, category });
+    }
+
+    steps.remove(0);
+    let session = contest_minigame::new_session(first_prompt.clone(), first_detail)?;
+    state.contest_minigames.insert((round, category), session);
+    state.contest_sequences.insert(
+        (round, category),
+        ContestSequence {
+            upcoming: steps.into(),
+            completed: Vec::new(),
+        },
+    );
+    Ok(vec![DomainEvent::ContestMinigameOpened {
+        round,
+        category,
+        prompt: first_prompt,
+    }])
+}
+
+/// Round 4 only: rejects `player`'s submission to `category`'s session for
+/// `round` unless they chose exactly that category -- see
+/// `Command::ChooseContestCategory`'s doc comment. A no-op for every other
+/// round, since no choice exists (or matters) there.
+fn check_contest_category_choice(
+    state: &GameState,
+    player: PlayerId,
+    round: Round,
+    category: ContestCategory,
+) -> Result<(), GameError> {
+    if round != Round::Four {
+        return Ok(());
+    }
+    match state.contest_category_choice(round, player) {
+        None => Err(GameError::MustChooseContestCategoryFirst(player)),
+        Some(chosen) if chosen == category => Ok(()),
+        Some(chosen) => Err(GameError::WrongContestCategoryChosen {
+            player,
+            chosen,
+            category,
+        }),
+    }
+}
+
+/// Round 4 only: `player`'s one-shot, locked choice of contest category --
+/// see `Command::ChooseContestCategory`'s doc comment.
+fn choose_contest_category(
+    state: &mut GameState,
+    player: PlayerId,
+    round: Round,
+    category: ContestCategory,
+) -> Result<Vec<DomainEvent>, GameError> {
+    if !state.is_active(player) {
+        return Err(GameError::NotActive(player));
+    }
+    if round != Round::Four {
+        return Err(GameError::NotAContestRound(round));
+    }
+    if state
+        .contest_category_choices
+        .contains_key(&(round, player))
+    {
+        return Err(GameError::ContestCategoryAlreadyChosen(player));
+    }
+    state
+        .contest_category_choices
+        .insert((round, player), category);
+    Ok(vec![DomainEvent::ContestCategoryChosen {
+        player,
+        round,
+        category,
+    }])
 }
 
 /// Opts `player` into the Intermission lottery (rules.md §4). Rejected for
@@ -12569,5 +12826,406 @@ mod tests {
                 correct_predictions: 0,
             }]
         );
+    }
+
+    // --- Contest sequences (TODO.md's Contest Rounds rewrite) ---
+
+    fn start_creativity_sequence(
+        state: &mut GameState,
+        round: Round,
+        steps: &[(&str, CreativityKind)],
+    ) {
+        apply_command(
+            state,
+            Command::StartContestSequence {
+                round,
+                steps: steps
+                    .iter()
+                    .map(|&(prompt, kind)| {
+                        (prompt.to_string(), OpenMinigameDetail::Creativity(kind))
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn start_contest_sequence_rejects_empty_steps() {
+        let (mut state, ..) = setup_for_contest(1, 1);
+        let result = apply_command(
+            &mut state,
+            Command::StartContestSequence {
+                round: Round::Two,
+                steps: vec![],
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::ContestSequenceMustHaveAtLeastOneStep)
+        );
+    }
+
+    #[test]
+    fn start_contest_sequence_rejects_mismatched_step_categories() {
+        let (mut state, ..) = setup_for_contest(1, 1);
+        let result = apply_command(
+            &mut state,
+            Command::StartContestSequence {
+                round: Round::Two,
+                steps: vec![
+                    (
+                        "Tell a joke".into(),
+                        OpenMinigameDetail::Creativity(CreativityKind::Joke),
+                    ),
+                    ("Trivia!".into(), OpenMinigameDetail::Strength),
+                ],
+            },
+        );
+        assert_eq!(result, Err(GameError::ContestSequenceStepCategoryMismatch));
+    }
+
+    #[test]
+    fn a_one_step_sequence_finalizes_exactly_like_the_ad_hoc_path() {
+        let (mut state, ton, room) = setup_for_contest(2, 2);
+        start_creativity_sequence(
+            &mut state,
+            Round::Two,
+            &[("Tell a joke", CreativityKind::Joke)],
+        );
+
+        for (i, &player) in [ton[0], room[0], ton[1], room[1]].iter().enumerate() {
+            apply_command(
+                &mut state,
+                Command::SubmitCreativeEntry {
+                    player,
+                    round: Round::Two,
+                    entry: joke(&format!("joke {i}")),
+                },
+            )
+            .unwrap();
+        }
+        apply_command(
+            &mut state,
+            Command::AdvanceCreativeWriting {
+                round: Round::Two,
+                order: vec![ton[0], room[0], ton[1], room[1]],
+            },
+        )
+        .unwrap();
+
+        // A single-step sequence should behave exactly like today's ad-hoc
+        // path: no `ContestSequenceStepAdvanced` at all, exactly one
+        // `ContestResultRecorded`, and the sequence bookkeeping cleared.
+        let events = for_each_remaining_rating(&mut state, Round::Two, 4);
+
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestSequenceStepAdvanced { .. })));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, DomainEvent::ContestResultRecorded { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(state.contest_results_for_host().len(), 1);
+        assert!(state
+            .contest_sequence(Round::Two, ContestCategory::Creativity)
+            .is_none());
+    }
+
+    /// Rates every remaining item in the current Rating rotation with 5
+    /// stars from every one of `voter_count` active players, one item at a
+    /// time, returning every event emitted along the way -- a small
+    /// helper so multi-step sequence tests don't have to hand-roll the
+    /// rating rotation themselves.
+    /// Rates every item currently in the Creativity Rating rotation with 5
+    /// stars from each of `voter_count` players, explicitly advancing the
+    /// rotation (`AdvanceCreativeRating`) after each one -- `RateCreativeEntry`
+    /// itself never moves the rotation on its own (that's a distinct
+    /// command, ordinarily fired by `game_server`'s own timer sweep or a
+    /// Host "Force next" click), so a loop that only ever rates without
+    /// also advancing would spin forever. Stops once the session actually
+    /// closes (advancing past the last item).
+    fn for_each_remaining_rating(
+        state: &mut GameState,
+        round: Round,
+        voter_count: usize,
+    ) -> Vec<DomainEvent> {
+        let voters: Vec<PlayerId> = state.players().map(|p| p.id).take(voter_count).collect();
+        let mut all_events = Vec::new();
+        loop {
+            for &voter in &voters {
+                let result = apply_command(
+                    state,
+                    Command::RateCreativeEntry {
+                        player: voter,
+                        round,
+                        stars: 5,
+                    },
+                );
+                match result {
+                    Ok(events) => all_events.extend(events),
+                    Err(GameError::ContestMinigameNotOpen { .. }) => return all_events,
+                    Err(e) => panic!("unexpected error rating: {e:?}"),
+                }
+            }
+            let advance_events = apply_command(
+                state,
+                Command::AdvanceCreativeRating {
+                    round,
+                    direction: RatingStep::Forward,
+                },
+            )
+            .unwrap();
+            all_events.extend(advance_events);
+            if !state
+                .contest_minigames()
+                .any(|(&(r, c), _)| r == round && c == ContestCategory::Creativity)
+            {
+                return all_events;
+            }
+        }
+    }
+
+    #[test]
+    fn a_multi_step_sequence_only_records_one_result_after_the_last_step() {
+        let (mut state, ton, room) = setup_for_contest(1, 1);
+        start_creativity_sequence(
+            &mut state,
+            Round::Two,
+            &[
+                ("Tell a joke", CreativityKind::Joke),
+                ("Tell another joke", CreativityKind::Joke),
+            ],
+        );
+
+        // Step 1: nobody writes anything (blank-filled), rate it and let
+        // the rotation reach the end -- should advance to step 2, NOT
+        // record a result yet.
+        apply_command(
+            &mut state,
+            Command::AdvanceCreativeWriting {
+                round: Round::Two,
+                order: vec![ton[0], room[0]],
+            },
+        )
+        .unwrap();
+        let step_events = for_each_remaining_rating(&mut state, Round::Two, 2);
+        assert!(step_events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestSequenceStepAdvanced { .. })));
+        assert!(!step_events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestResultRecorded { .. })));
+        assert!(state.contest_results_for_host().is_empty());
+        // The session is still open -- now on step 2.
+        assert!(state
+            .contest_minigames()
+            .any(|(&(r, c), _)| r == Round::Two && c == ContestCategory::Creativity));
+
+        // Step 2: same thing, but this is the LAST step -- must finalize.
+        apply_command(
+            &mut state,
+            Command::AdvanceCreativeWriting {
+                round: Round::Two,
+                order: vec![ton[0], room[0]],
+            },
+        )
+        .unwrap();
+        let final_events = for_each_remaining_rating(&mut state, Round::Two, 2);
+        assert!(final_events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestResultRecorded { .. })));
+        assert_eq!(state.contest_results_for_host().len(), 1);
+        assert!(!state
+            .contest_minigames()
+            .any(|(&(r, c), _)| r == Round::Two && c == ContestCategory::Creativity));
+    }
+
+    // --- Round 4 category choice ---
+
+    fn setup_for_round_four(
+        n_ton: usize,
+        n_room: usize,
+    ) -> (GameState, Vec<PlayerId>, Vec<PlayerId>) {
+        let (mut state, ton, room) = setup_for_contest(n_ton, n_room);
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Four
+        (state, ton, room)
+    }
+
+    #[test]
+    fn choose_contest_category_is_one_shot_and_locked() {
+        let (mut state, ton, _room) = setup_for_round_four(1, 1);
+        apply_command(
+            &mut state,
+            Command::ChooseContestCategory {
+                player: ton[0],
+                round: Round::Four,
+                category: ContestCategory::Creativity,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::ChooseContestCategory {
+                player: ton[0],
+                round: Round::Four,
+                category: ContestCategory::Strength,
+            },
+        );
+        assert_eq!(result, Err(GameError::ContestCategoryAlreadyChosen(ton[0])));
+        assert_eq!(
+            state.contest_category_choice(Round::Four, ton[0]),
+            Some(ContestCategory::Creativity)
+        );
+    }
+
+    #[test]
+    fn choose_contest_category_rejects_a_non_round_four() {
+        let (mut state, ton, _room) = setup_for_contest(1, 1);
+        let result = apply_command(
+            &mut state,
+            Command::ChooseContestCategory {
+                player: ton[0],
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+            },
+        );
+        assert_eq!(result, Err(GameError::NotAContestRound(Round::Two)));
+    }
+
+    #[test]
+    fn contest_category_choice_gates_round_four_submissions() {
+        let (mut state, ton, _room) = setup_for_round_four(2, 1);
+        apply_command(
+            &mut state,
+            Command::StartContestSequence {
+                round: Round::Four,
+                steps: vec![("push-ups".into(), OpenMinigameDetail::Strength)],
+            },
+        )
+        .unwrap();
+
+        // Never chose at all.
+        let result = apply_command(
+            &mut state,
+            Command::SubmitPhysicalPlacement {
+                player: ton[0],
+                round: Round::Four,
+                placement: 1,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::MustChooseContestCategoryFirst(ton[0]))
+        );
+
+        // Chose a different category.
+        apply_command(
+            &mut state,
+            Command::ChooseContestCategory {
+                player: ton[0],
+                round: Round::Four,
+                category: ContestCategory::Creativity,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::SubmitPhysicalPlacement {
+                player: ton[0],
+                round: Round::Four,
+                placement: 1,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(GameError::WrongContestCategoryChosen {
+                player: ton[0],
+                chosen: ContestCategory::Creativity,
+                category: ContestCategory::Strength,
+            })
+        );
+
+        // Chose the right category.
+        apply_command(
+            &mut state,
+            Command::ChooseContestCategory {
+                player: ton[1],
+                round: Round::Four,
+                category: ContestCategory::Strength,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitPhysicalPlacement {
+                player: ton[1],
+                round: Round::Four,
+                placement: 1,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn contest_round_winner_is_none_until_a_faction_has_an_unbeatable_majority() {
+        let (mut state, ..) = setup_for_contest(1, 1);
+        assert_eq!(state.contest_round_winner(Round::Two), None);
+
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        // Only 1 of 3 recorded -- still undecided.
+        assert_eq!(state.contest_round_winner(Round::Two), None);
+
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Intelligence,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        // 2 of 3 for Ton -- an unbeatable majority, decided early.
+        assert_eq!(state.contest_round_winner(Round::Two), Some(true));
+        assert_eq!(
+            state.contest_round_winners_for_host(),
+            vec![(Round::Two, true)]
+        );
+    }
+
+    #[test]
+    fn contest_round_winner_resolves_the_room_the_same_way() {
+        let (mut state, ..) = setup_for_contest(1, 1);
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.contest_round_winner(Round::Two), Some(false));
     }
 }

@@ -48,6 +48,7 @@
 mod creativity;
 mod memory;
 mod quiz;
+mod sequence;
 mod wordle;
 
 pub use creativity::{
@@ -56,6 +57,7 @@ pub use creativity::{
 };
 pub use memory::{MemoryPayload, MAX_MEMORY_SEQUENCE_LENGTH};
 pub use quiz::{math_questions, trivia_questions, QuizKind, QuizPayload, QuizQuestion};
+pub use sequence::{majority_ton_won, ContestSequence};
 pub use wordle::{LetterFeedback, WordleGuess, WordlePayload, MAX_GUESSES, WORD_LIST};
 
 // Crate-internal only -- `state.rs`'s command handlers need these, but
