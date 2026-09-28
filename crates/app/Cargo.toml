@@ -17,10 +17,15 @@ tokio = { version = "1.53.1", features = ["sync", "macros"], optional = true }
 # real RNG, and `game_server` itself only compiles under this feature.
 # Same version `bots`/`sim` already pin.
 rand = { version = "0.10.2", optional = true }
+# Only pulled in client-side (see the `web` feature below) -- the round
+# transition banner's auto-dismiss needs an async sleep, and the `web`/WASM
+# build has no `tokio` (that's a `server`-feature-only dependency, and
+# tokio's own timer driver isn't available on wasm32 anyway).
+gloo-timers = { version = "0.3", features = ["futures"], optional = true }
 
 [features]
 default = ["web"]
-web = ["dioxus/web"]
+web = ["dioxus/web", "dep:gloo-timers"]
 server = ["dioxus/server", "dep:tokio", "dep:rand"]
 
 # `bots` drives a real, spawned `app` server binary over its actual

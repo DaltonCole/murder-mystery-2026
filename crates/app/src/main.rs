@@ -792,6 +792,21 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
     }))
 }
 
+/// An async sleep that works on both build targets -- `web`'s WASM build
+/// has no `tokio` (that's a `server`-feature-only dependency, and tokio's
+/// timer driver isn't available on wasm32 regardless), so this picks
+/// whichever runtime's own timer the current build actually has. Used only
+/// by the round transition banner's auto-dismiss for now.
+#[cfg(feature = "web")]
+async fn sleep_ms(ms: u32) {
+    gloo_timers::future::TimeoutFuture::new(ms).await;
+}
+
+#[cfg(feature = "server")]
+async fn sleep_ms(ms: u32) {
+    tokio::time::sleep(std::time::Duration::from_millis(u64::from(ms))).await;
+}
+
 // --- /play -----------------------------------------------------------------
 
 /// The three screens a player sees once they've finished Character
@@ -826,6 +841,17 @@ fn Play() -> Element {
     let mut name_draft = use_signal(String::new);
     let mut timer = use_signal(|| None::<TimerState>);
     let mut minigame_timers = use_signal(Vec::<MinigameTimer>::new);
+    // The story-driven transition banner (Dalton's own explicit instruction:
+    // something like "the party goers become restless..." between rounds,
+    // "more on theme and elegant") -- entirely client-side, no new server
+    // state needed: `round_transition_flavor` is a pure `Round -> &str`
+    // lookup, so a client just has to notice its own `current_round`
+    // changed since the last `View` it saw. `None` until the second `View`
+    // ever arrives, specifically so the very first page load doesn't show a
+    // transition banner for whatever round the game already happens to be
+    // in.
+    let mut last_seen_round = use_signal(|| None::<Round>);
+    let mut round_banner = use_signal(|| None::<&'static str>);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
@@ -841,7 +867,22 @@ fn Play() -> Element {
                 // could silently wipe a just-shown rejection before this
                 // player finished reading it. `send_cmd` below clears it
                 // instead, only on this player's own next action.
-                Ok(ServerMsg::View(v)) => view.set(Some(v)),
+                Ok(ServerMsg::View(v)) => {
+                    let round = v.current_round;
+                    if let Some(prev) = last_seen_round() {
+                        if round != prev {
+                            if let Some(text) = round_transition_flavor(round) {
+                                round_banner.set(Some(text));
+                                spawn(async move {
+                                    sleep_ms(7000).await;
+                                    round_banner.set(None);
+                                });
+                            }
+                        }
+                    }
+                    last_seen_round.set(Some(round));
+                    view.set(Some(v));
+                }
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
                 // `/play` never watches as `Viewer::Host`, and never sends
                 // `HostLogin`/`ViewPlayer`/task-ban commands either -- see
@@ -994,6 +1035,9 @@ fn Play() -> Element {
         h1 { "Murder Mystery 2026" }
         if let Some(e) = error() {
             p { class: "error-text", "{e}" }
+        }
+        if let Some(text) = round_banner() {
+            p { class: "round-transition-banner", "{text}" }
         }
         if v.raffle_closed {
             if v.round_one_started {
@@ -2276,6 +2320,36 @@ fn faction_flavor(faction: Faction) -> &'static str {
             "A separate, non-competing track tonight, outside the three-way conflict."
         }
         Faction::Unassigned => "Not yet assigned.",
+    }
+}
+
+/// One line of narrative flavor shown the moment `round` actually begins
+/// (a plain `Round -> &str` lookup, not tied to any game state) -- a
+/// short, in-theme transition line bridging what the room just finished
+/// into what's coming next, mirroring `character_flavor`'s own "narrative
+/// color, not a mechanical explanation" shape. `Round::One` has none: it's
+/// the game's own opening, not a transition *into* anything -- see
+/// `RoundTransitionBanner`'s doc comment for how a viewer's `/play` page
+/// detects "this round just started" without any new server-side state.
+///
+/// *** EDIT THIS to retheme/expand -- first-draft copy, not a rules.md
+/// quote. ***
+fn round_transition_flavor(round: Round) -> Option<&'static str> {
+    match round {
+        Round::One => None,
+        Round::Two => Some(
+            "The Ton lays down its secrets for the evening and takes up a new challenge -- wit, nerve, and grace, put to the test.",
+        ),
+        Round::Three => Some(
+            "The games conclude. Once more, the ballroom's whispers turn to watchful eyes and waiting knives.",
+        ),
+        Round::Four => Some(
+            "One mask has fallen -- but the night is young, and society calls for sport once again.",
+        ),
+        Round::Five => Some(
+            "The games fade to silence. Old suspicions stir anew beneath the chandeliers.",
+        ),
+        Round::Finale => Some("The final verdict awaits. Let the truth, at last, be told."),
     }
 }
 

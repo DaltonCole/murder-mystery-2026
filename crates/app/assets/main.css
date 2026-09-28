@@ -318,6 +318,35 @@ strong {
   width: 100%;
 }
 
+/* The story-driven round transition banner (Dalton's own explicit
+ * instruction: something in-theme between rounds) -- shown briefly then
+ * auto-dismissed client-side (see `round_transition_flavor`'s doc
+ * comment), so it deserves a distinct, momentary "announcement" look
+ * rather than reading like routine status text. `fade-in` only: the
+ * banner disappears by being removed from the DOM entirely (the signal
+ * goes to `None`), not by animating out. */
+.round-transition-banner {
+  background: var(--color-primary);
+  color: var(--color-bg-card);
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+  font-family: var(--font-heading);
+  font-style: italic;
+  text-align: center;
+  animation: round-transition-fade-in 0.6s ease-out;
+}
+
+@keyframes round-transition-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-0.5rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* The finale's public Cast-Out reveal (rules.md §4: "revealed publicly on
  * a shared screen") -- the emotional climax of the whole night deserves
  * more than plain paragraphs indistinguishable from routine status text. */
