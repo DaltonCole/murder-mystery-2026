@@ -1,4 +1,6 @@
+use crate::bio::Bio;
 use crate::event::DomainEvent;
+use crate::player::PlayerId;
 use crate::round::Round;
 use crate::state::GameState;
 use serde::{Deserialize, Serialize};
@@ -28,18 +30,46 @@ pub struct WhistledownPost {
 const TEASER: &str =
     "The Ton dances on, unaware -- or is it unwilling? -- of what stirs beneath the ballroom floor.";
 
-/// rules.md §6's three given Cast-Out templates, verbatim, rotated by
-/// player ID (a stable, already-committed value -- keeps this function
-/// pure with no caller-supplied randomness, per the engine's "randomness
-/// at the boundary" convention, while still varying across different
-/// victims). Note the second template names no one at all, by design --
-/// rules.md is explicit that "no template ever correlates with who was
-/// actually Cast Out," so the absence of a name here is not a bug.
-const CAST_OUT_TEMPLATES: [&str; 3] = [
-    "Dearest reader, the Ton awoke to shocking news -- Lord {name} was cast from society's good graces at last night's gathering, denounced by the very peers who once toasted his health. Whether justice was served or a grave error made, this author cannot say.",
-    "Society lost one of its own last night, and this author confesses genuine sorrow at the loss -- though whether the room's judgment was righteous or rash, only time (and perhaps a guilty conscience) will tell.",
-    "A most curious turn at last night's gathering -- {name}, cast out before the assembled Ton, protested their innocence to the last. This author has heard such protests before. Sometimes they are even true.",
+/// Cast-Out templates, rotated by player ID (a stable, already-committed
+/// value -- keeps this function pure with no caller-supplied randomness,
+/// per the engine's "randomness at the boundary" convention, while still
+/// varying across different victims). Dalton's own explicit instruction,
+/// replacing an earlier draft that quoted rules.md's own three generic
+/// templates verbatim: never reveal the Cast-Out player's true allegiance
+/// (never has, and still never does -- these never mentioned Ton/Uprising/
+/// Cult to begin with), but make a real, specific-sounding comment about
+/// *them* -- their appearance or a skill -- instead of vague generalities.
+/// `{detail}` is filled from `bio_detail` below (a hobby, clothing
+/// feature, or skill straight from the player's own submitted `Bio`, or a
+/// deliberately vague fallback phrase if they never submitted one).
+///
+/// *** EDIT THIS to retheme/expand -- first-draft copy, not a rules.md
+/// quote. ***
+const CAST_OUT_TEMPLATES: [&str; 4] = [
+    "Dearest reader, the Ton awoke to shocking news -- {name}, {detail}, was cast from society's good graces at last night's gathering. Whether justice was served or a grave error made, this author cannot say.",
+    "Society lost one of its own last night -- {name}, long known for {detail}, cast out before the assembled Ton. This author confesses genuine sorrow at the loss, though whether the room's judgment was righteous or rash, only time will tell.",
+    "A most curious turn at last night's gathering -- {name}, {detail}, protested their innocence to the last. This author has heard such protests before. Sometimes they are even true.",
+    "Whatever secrets {name} carried out the door last night, this author can attest only to {detail} -- a small mercy, perhaps, for a reputation now in tatters.",
 ];
+
+/// One flavor detail about `id` for `CAST_OUT_TEMPLATES`'s `{detail}` slot
+/// -- a hobby, clothing feature, or skill, picked deterministically from
+/// their own submitted `Bio` (same "stable, no caller-supplied randomness"
+/// reasoning as the template rotation itself), never anything about their
+/// true faction/role. Falls back to a deliberately vague, detail-free
+/// phrase if they never submitted a bio at all (e.g. a very late-arriving
+/// Servant) -- still grammatical wherever `{detail}` appears in a template.
+fn bio_detail(bio: Option<&Bio>, id: PlayerId) -> String {
+    let Some(bio) = bio else {
+        return "a reputation this author has yet to properly uncover".to_string();
+    };
+    let index = (id.0 as usize / CAST_OUT_TEMPLATES.len()) % 5;
+    match id.0 as usize % 3 {
+        0 => format!("an enthusiasm for {}", bio.hobbies[index]),
+        1 => format!("being seen everywhere in {}", bio.clothing_features[index]),
+        _ => format!("a considerable talent for {}", bio.skills[index]),
+    }
+}
 
 /// Not covered by any rules.md template: a repeat tie (rules.md §5) can
 /// leave a Denouncement's slot completely unfilled, with nobody actually
@@ -123,8 +153,11 @@ fn round_post(
                     .player(id)
                     .map(|p| p.name.as_str())
                     .unwrap_or("a departed guest");
+                let detail = bio_detail(state.bio(id), id);
                 let template = CAST_OUT_TEMPLATES[id.0 as usize % CAST_OUT_TEMPLATES.len()];
-                template.replace("{name}", name)
+                template
+                    .replace("{name}", name)
+                    .replace("{detail}", &detail)
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -233,11 +266,6 @@ mod tests {
 
         let p = posts(&state);
         let round_three = p.iter().find(|post| post.round == Round::Three).unwrap();
-        // Not asserting the name appears: PlayerId(1) (leader, added second
-        // in `base_state`) happens to land on the one template that never
-        // names anyone at all (`CAST_OUT_TEMPLATES[1]`), by design -- see
-        // that constant's doc comment. The point here is just that a real,
-        // non-teaser post exists the instant the ballot closes.
         assert_ne!(round_three.text, TEASER);
         assert!(!round_three.text.is_empty());
     }
@@ -357,7 +385,7 @@ mod tests {
     #[test]
     fn cast_out_templates_rotate_across_different_victims_in_the_same_round() {
         // Two Cast-Outs in the same multi-slot Denouncement, at IDs chosen
-        // specifically to land on two different templates (0 and 1 mod 3)
+        // specifically to land on two different templates (0 and 1 mod 4)
         // -- proves `round_post` actually varies the template per victim
         // rather than always picking the same one.
         let mut state = GameState::new();
@@ -421,12 +449,46 @@ mod tests {
         let round_three = p.iter().find(|post| post.round == Round::Three).unwrap();
         // Order isn't asserted (depends on `resolve_ballot`'s own tiebreak,
         // which isn't this test's concern) -- just that both victims'
-        // distinct templates both appear.
-        assert!(round_three
-            .text
-            .contains(&CAST_OUT_TEMPLATES[0].replace("{name}", "P0")));
-        assert!(round_three
-            .text
-            .contains(&CAST_OUT_TEMPLATES[1].replace("{name}", "P1")));
+        // distinct templates both appear. Neither `P0` nor `P1` ever
+        // submitted a bio, so `{detail}` resolves to `bio_detail`'s
+        // no-bio fallback phrase for both.
+        let fallback = bio_detail(None, victim_a);
+        assert!(round_three.text.contains(
+            &CAST_OUT_TEMPLATES[0]
+                .replace("{name}", "P0")
+                .replace("{detail}", &fallback)
+        ));
+        assert!(round_three.text.contains(
+            &CAST_OUT_TEMPLATES[1]
+                .replace("{name}", "P1")
+                .replace("{detail}", &fallback)
+        ));
+    }
+
+    #[test]
+    fn bio_detail_draws_from_the_players_own_submitted_bio() {
+        let mut state = GameState::new();
+        let id = add_player(&mut state, "Alice", Faction::Ton);
+        apply_command(
+            &mut state,
+            Command::SubmitBio {
+                player: id,
+                bio: crate::bio::Bio {
+                    character_name: "Lady A".into(),
+                    real_name: "Alice".into(),
+                    occupation: "Debutante".into(),
+                    hobbies: std::array::from_fn(|i| format!("hobby{i}")),
+                    clothing_features: std::array::from_fn(|i| format!("feature{i}")),
+                    skills: std::array::from_fn(|i| format!("skill{i}")),
+                },
+            },
+        )
+        .unwrap();
+        let detail = bio_detail(state.bio(id), id);
+        assert_ne!(
+            detail,
+            bio_detail(None, id),
+            "a submitted bio must change the detail"
+        );
     }
 }
