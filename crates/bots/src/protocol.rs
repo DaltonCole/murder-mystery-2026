@@ -11,7 +11,7 @@
 //! shows up immediately as a JSON deserialization failure at connect
 //! time, not a silent behavioral mismatch.
 
-use engine::{Command, PlayerId, PlayerView, TaskTier, Viewer};
+use engine::{Command, ContestCategory, PlayerId, PlayerView, Round, TaskTier, Viewer};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -37,6 +37,23 @@ pub enum ClientMsg {
     },
 }
 
+/// Mirrors `app`'s own `TimerState` -- see `ServerMsg::Timer`'s doc
+/// comment below.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TimerState {
+    pub remaining_secs: i64,
+    pub total_secs: u32,
+}
+
+/// Mirrors `app`'s own `MinigameTimer` -- see `ServerMsg::MinigameTimers`'s
+/// doc comment below.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MinigameTimer {
+    pub round: Round,
+    pub category: ContestCategory,
+    pub state: TimerState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMsg {
     Joined {
@@ -58,7 +75,15 @@ pub enum ServerMsg {
     /// countdown is a pure display aid with no effect on game rules or
     /// state (see `game_server::GameTimer`'s doc comment), so this crate
     /// only needs to parse it, never act on it.
-    Timer(Option<i64>),
+    Timer(Option<TimerState>),
+    /// Mirrors `app`'s own `ServerMsg::MinigameTimers` -- a Creativity
+    /// session's own Writing/Rating phase countdown, sent alongside
+    /// `Timer` on the same occasions. This crate never acts on it either
+    /// (bots exercise contest mini-games only through `RecordContestResult`,
+    /// never the real timed Writing/Rating flow), but it still has to
+    /// parse, for the same "protocol drift fails loudly" reason as
+    /// `BannedTaskPrompts` below.
+    MinigameTimers(Vec<MinigameTimer>),
     /// Mirrors `app`'s own `ServerMsg::HostLoginResult` -- the direct reply
     /// to `ClientMsg::HostLogin`, which `Conn::host_login` now sends and
     /// waits for.
@@ -243,6 +268,7 @@ impl Conn {
                 // doc comment for why it still has to be parseable.
                 Some(ServerMsg::LocationTaskTemplates(_)) => {}
                 Some(ServerMsg::Timer(_)) => {}
+                Some(ServerMsg::MinigameTimers(_)) => {}
                 Some(ServerMsg::HostLoginResult { .. }) => {}
                 Some(ServerMsg::ViewedPlayer(_)) => {}
                 Some(ServerMsg::BannedTaskPrompts(_)) => {}
@@ -266,6 +292,7 @@ impl Conn {
                 Some(ServerMsg::Joined { .. }) => continue,
                 Some(ServerMsg::LocationTaskTemplates(_)) => continue,
                 Some(ServerMsg::Timer(_)) => continue,
+                Some(ServerMsg::MinigameTimers(_)) => continue,
                 Some(ServerMsg::HostLoginResult { .. }) => continue,
                 Some(ServerMsg::ViewedPlayer(_)) => continue,
                 Some(ServerMsg::BannedTaskPrompts(_)) => continue,
@@ -283,6 +310,7 @@ impl Conn {
                 | Some(ServerMsg::Failed { .. })
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
+                | Some(ServerMsg::MinigameTimers(_))
                 | Some(ServerMsg::HostLoginResult { .. })
                 | Some(ServerMsg::ViewedPlayer(_))
                 | Some(ServerMsg::BannedTaskPrompts(_)) => continue,
@@ -305,6 +333,7 @@ impl Conn {
                 Some(ServerMsg::View(_))
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
+                | Some(ServerMsg::MinigameTimers(_))
                 | Some(ServerMsg::HostLoginResult { .. })
                 | Some(ServerMsg::ViewedPlayer(_))
                 | Some(ServerMsg::BannedTaskPrompts(_)) => continue,
@@ -334,6 +363,7 @@ impl Conn {
                 | Some(ServerMsg::Failed { .. })
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
+                | Some(ServerMsg::MinigameTimers(_))
                 | Some(ServerMsg::ViewedPlayer(_))
                 | Some(ServerMsg::BannedTaskPrompts(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),

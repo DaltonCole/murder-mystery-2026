@@ -155,7 +155,17 @@ fn ensure_ticker_running() {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .is_some();
-                if timer_active {
+                // Also broadcast on every tick a Creativity phase deadline is
+                // running, even if the sweep didn't just fire an advance --
+                // otherwise a player's progress bar would only visibly move
+                // at the moments something actually happens instead of
+                // draining smoothly every second.
+                let minigame_timer_active = !server()
+                    .minigame_deadlines
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_empty();
+                if timer_active || minigame_timer_active {
                     let _ = server().changed.send(());
                 }
             }
@@ -230,13 +240,16 @@ pub fn clear_timer() {
 /// budget a phase has run). Computed fresh from a real `Instant` on every
 /// call rather than stored/ticked, so it's never stale by more than however
 /// often a caller asks.
-pub fn timer_remaining_secs() -> Option<i64> {
+pub fn timer_remaining_secs() -> Option<crate::TimerState> {
     server()
         .timer
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
-        .map(|t| t.duration.as_secs() as i64 - t.started_at.elapsed().as_secs() as i64)
+        .map(|t| crate::TimerState {
+            remaining_secs: t.duration.as_secs() as i64 - t.started_at.elapsed().as_secs() as i64,
+            total_secs: t.duration.as_secs() as u32,
+        })
 }
 
 /// Whether `password` matches the configured Host passphrase, read fresh
@@ -661,6 +674,50 @@ fn minigame_elapsed_ms(round: Round, category: ContestCategory) -> Option<u64> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&(round, category))
         .map(|start| start.elapsed().as_millis() as u64)
+}
+
+/// Every currently-armed Creativity phase deadline, as a countdown the
+/// client can render a progress bar from -- `ServerMsg::MinigameTimers`'s
+/// data source. The engine itself can't supply this (`ContestMinigameView`
+/// has no notion of wall-clock time at all, by design), so this reads
+/// `minigame_deadlines` directly and re-derives each entry's total
+/// duration from its session's current kind/phase, the same lookup
+/// `track_minigame_timers` uses to arm the deadline in the first place.
+/// `saturating_duration_since` (never negative) rather than signed
+/// subtraction: a deadline that's already passed just reads as "0
+/// remaining" for the brief instant before the next sweep tick actually
+/// advances the phase, rather than a confusing negative countdown (unlike
+/// the Host's own `GameTimer`, a Creativity deadline always resolves
+/// itself, so there's no real "overtime" state to show here).
+pub fn minigame_timer_states() -> Vec<crate::MinigameTimer> {
+    let now = Instant::now();
+    let deadlines: Vec<((Round, ContestCategory), Instant)> = server()
+        .minigame_deadlines
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .map(|(&key, &deadline)| (key, deadline))
+        .collect();
+    let state = lock_state();
+    deadlines
+        .into_iter()
+        .filter_map(|((round, category), deadline)| {
+            let (kind, phase) = creativity_kind_and_phase(&state, round)?;
+            let total_secs = match phase {
+                CreativityPhase::Writing => creativity_durations(kind).0,
+                CreativityPhase::Rating { .. } => creativity_durations(kind).1,
+            }
+            .as_secs() as u32;
+            Some(crate::MinigameTimer {
+                round,
+                category,
+                state: crate::TimerState {
+                    remaining_secs: deadline.saturating_duration_since(now).as_secs() as i64,
+                    total_secs,
+                },
+            })
+        })
+        .collect()
 }
 
 /// Arms/clears this module's own wall-clock bookkeeping in response to

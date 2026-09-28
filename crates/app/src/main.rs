@@ -232,6 +232,38 @@ enum ClientMsg {
     OpenPhysicalSession { round: Round },
 }
 
+/// A running timer's remaining and total duration -- enough for
+/// `TimerDisplay` to render a diminishing progress bar, not just a plain
+/// number. Shared shape for both `ServerMsg::Timer` (the round/phase
+/// GameTimer) and `ServerMsg::MinigameTimers` (Creativity's per-phase
+/// auto-advance deadlines) -- defined here, outside the `server`-only
+/// `game_server` module, since both `web` and `server` builds need it to
+/// even compile `ServerMsg`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct TimerState {
+    /// Can go negative (rendered as "overtime") for the Host-controlled
+    /// GameTimer, which never auto-advances -- never negative for a
+    /// Creativity minigame timer, which always advances itself the moment
+    /// it would otherwise go negative.
+    remaining_secs: i64,
+    total_secs: u32,
+}
+
+/// One open Creativity session's current phase-timer state -- `round`/
+/// `category` identify which session this is (`category` is always
+/// `Creativity` today, but carried explicitly rather than assumed, the
+/// same shape `ContestMinigameView` itself uses). Sent alongside `Timer`
+/// so the player/Host UI can show a live countdown for the Writing/Rating
+/// phase's own auto-advance deadline -- see `game_server::
+/// minigame_timer_states`'s doc comment for why the engine itself can't
+/// supply this (it deliberately stays wall-clock-free).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct MinigameTimer {
+    round: Round,
+    category: ContestCategory,
+    state: TimerState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ServerMsg {
     Joined {
@@ -248,12 +280,19 @@ enum ServerMsg {
     /// code itself never rides along.
     LocationTaskTemplates(Vec<(usize, TaskTier, String)>),
     /// Sent to every viewer kind (this is rules.md's "shared timer") on
-    /// every `Watch` and every broadcast tick -- seconds remaining, or
-    /// `None` if no timer is currently running. Deliberately not part of
-    /// `PlayerView`/`ServerMsg::View` -- see `game_server::GameTimer`'s
-    /// doc comment on why wall-clock time stays out of the engine's
-    /// deterministic state entirely.
-    Timer(Option<i64>),
+    /// every `Watch` and every broadcast tick -- `None` if no timer is
+    /// currently running. Deliberately not part of `PlayerView`/
+    /// `ServerMsg::View` -- see `game_server::GameTimer`'s doc comment on
+    /// why wall-clock time stays out of the engine's deterministic state
+    /// entirely.
+    Timer(Option<TimerState>),
+    /// Sent alongside `Timer` on the same occasions -- every currently-open
+    /// Creativity session's own Writing/Rating phase countdown. Usually 0
+    /// or 1 entries (only Creativity has a phase timer at all, and only
+    /// one Creativity session is normally open at once), but a `Vec` since
+    /// nothing structurally forbids more than one round's session being
+    /// open at the same time.
+    MinigameTimers(Vec<MinigameTimer>),
     /// `/host` only, direct reply to `ClientMsg::HostLogin`: whether the
     /// submitted passphrase was correct.
     HostLoginResult {
@@ -421,11 +460,24 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                 match $result {
                     Ok(_) => {
                         drain_self_echo(&mut changed);
-                        if let Some(v) = viewer {
+                        let sent_view = if let Some(v) = viewer {
                             socket.send(ServerMsg::View(game_server::view(v))).await.is_ok()
                         } else {
                             true
-                        }
+                        };
+                        // A command that just opened/advanced a Creativity
+                        // session arms or re-arms its deadline synchronously
+                        // inside `game_server::apply` -- send the fresh
+                        // countdown right away rather than making the
+                        // client wait for the next once-a-second tick to
+                        // find out (harmless to send on every other kind of
+                        // successful command too, same reasoning as
+                        // `Timer`'s own periodic-tick push).
+                        let sent_minigame_timers = socket
+                            .send(ServerMsg::MinigameTimers(game_server::minigame_timer_states()))
+                            .await
+                            .is_ok();
+                        sent_view && sent_minigame_timers
                     }
                     Err(e) => socket
                         .send(ServerMsg::Failed { error: e.to_string() })
@@ -472,6 +524,12 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                             .is_ok()
                                         && socket
                                             .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                                            .await
+                                            .is_ok()
+                                        && socket
+                                            .send(ServerMsg::MinigameTimers(
+                                                game_server::minigame_timer_states(),
+                                            ))
                                             .await
                                             .is_ok()
                                 }
@@ -528,7 +586,17 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                     .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
                                     .await
                                     .is_ok();
-                                sent_view && sent_templates && sent_banned && sent_timer
+                                let sent_minigame_timers = socket
+                                    .send(ServerMsg::MinigameTimers(
+                                        game_server::minigame_timer_states(),
+                                    ))
+                                    .await
+                                    .is_ok();
+                                sent_view
+                                    && sent_templates
+                                    && sent_banned
+                                    && sent_timer
+                                    && sent_minigame_timers
                             }
                         }
                         ClientMsg::Do(cmd) => {
@@ -709,6 +777,15 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                     {
                         break;
                     }
+                    // Same reasoning, for a Creativity session's own
+                    // Writing/Rating phase countdown.
+                    if socket
+                        .send(ServerMsg::MinigameTimers(game_server::minigame_timer_states()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -747,7 +824,8 @@ fn Play() -> Element {
     let mut my_id = use_signal(|| None::<PlayerId>);
     let mut error = use_signal(|| None::<String>);
     let mut name_draft = use_signal(String::new);
-    let mut timer = use_signal(|| None::<i64>);
+    let mut timer = use_signal(|| None::<TimerState>);
+    let mut minigame_timers = use_signal(Vec::<MinigameTimer>::new);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
@@ -776,6 +854,7 @@ fn Play() -> Element {
                     | ServerMsg::BannedTaskPrompts(_),
                 ) => {}
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
+                Ok(ServerMsg::MinigameTimers(timers)) => minigame_timers.set(timers),
                 Err(_) => break,
             }
         }
@@ -1015,6 +1094,7 @@ fn Play() -> Element {
                         my_id: id,
                         sessions: v.open_contest_minigames.clone(),
                         on_command: send_cmd,
+                        minigame_timers: minigame_timers(),
                     }
                 } else {
                     for task in v.open_tasks.clone() {
@@ -1383,6 +1463,27 @@ fn WhistledownPosts(posts: Vec<WhistledownPost>, heading_level: u8) -> Element {
     }
 }
 
+/// A diminishing progress-bar fill for a `TimerState` -- 100% at the start,
+/// draining to 0% at the deadline, pinned full (in the danger color) once
+/// past it. Shared by `TimerDisplay` and `MinigameTimerBar` below.
+#[component]
+fn ProgressBarFill(state: TimerState) -> Element {
+    let overtime = state.remaining_secs < 0;
+    let pct = if overtime || state.total_secs == 0 {
+        100
+    } else {
+        (state.remaining_secs as u64 * 100 / u64::from(state.total_secs)).min(100)
+    };
+    rsx! {
+        div { class: "progress-bar-track",
+            div {
+                class: if overtime { "progress-bar-fill overtime" } else { "progress-bar-fill" },
+                style: if !overtime { "--fill: {pct}%" },
+            }
+        }
+    }
+}
+
 /// The shared round/phase countdown (rules.md's "shared timer") -- read-only
 /// rendering shared by `/play`, `/display`, and (alongside its own start/add/
 /// clear controls) the Host console. Renders nothing while no timer is
@@ -1391,12 +1492,12 @@ fn WhistledownPosts(posts: Vec<WhistledownPost>, heading_level: u8) -> Element {
 /// with no indication of how far over budget the room actually is would be
 /// worse than no timer at all.
 #[component]
-fn TimerDisplay(remaining_secs: Option<i64>) -> Element {
-    let Some(secs) = remaining_secs else {
+fn TimerDisplay(remaining_secs: Option<TimerState>) -> Element {
+    let Some(state) = remaining_secs else {
         return rsx! {};
     };
-    let overtime = secs < 0;
-    let abs = secs.unsigned_abs();
+    let overtime = state.remaining_secs < 0;
+    let abs = state.remaining_secs.unsigned_abs();
     let (minutes, seconds) = (abs / 60, abs % 60);
     rsx! {
         p {
@@ -1407,6 +1508,25 @@ fn TimerDisplay(remaining_secs: Option<i64>) -> Element {
                 "~{minutes}:{seconds:02} remaining"
             }
         }
+        ProgressBarFill { state }
+    }
+}
+
+/// A Creativity mini-game's own Writing/Rating phase countdown -- the same
+/// diminishing-progress-bar treatment as `TimerDisplay`, but for `round`'s
+/// entry in the `MinigameTimer` list (if any is currently open). Renders
+/// nothing if `round` has no active phase timer right now (not a
+/// Creativity session at all, or between phases for an instant).
+#[component]
+fn MinigameTimerBar(timers: Vec<MinigameTimer>, round: Round) -> Element {
+    let Some(timer) = timers.into_iter().find(|t| t.round == round) else {
+        return rsx! {};
+    };
+    let abs = timer.state.remaining_secs.max(0).unsigned_abs();
+    let (minutes, seconds) = (abs / 60, abs % 60);
+    rsx! {
+        p { "~{minutes}:{seconds:02} until this phase auto-advances" }
+        ProgressBarFill { state: timer.state }
     }
 }
 
@@ -2658,6 +2778,7 @@ fn ContestMinigamePanel(
     my_id: PlayerId,
     sessions: Vec<ContestMinigameView>,
     on_command: EventHandler<Command>,
+    minigame_timers: Vec<MinigameTimer>,
 ) -> Element {
     if sessions.is_empty() {
         return rsx! {
@@ -2671,7 +2792,13 @@ fn ContestMinigamePanel(
                 h4 { "{session.category:?}" }
                 p { "{session.prompt}" }
                 if let Some(kind) = session.creativity_kind {
-                    CreativityMinigameForm { my_id, session, kind, on_command }
+                    CreativityMinigameForm {
+                        my_id,
+                        session,
+                        kind,
+                        on_command,
+                        minigame_timers: minigame_timers.clone(),
+                    }
                 } else if session.is_memory {
                     MemoryGame { my_id, round: session.round, on_command }
                 } else if session.is_wordle {
@@ -2692,10 +2819,12 @@ fn CreativityMinigameForm(
     session: ContestMinigameView,
     kind: CreativityKind,
     on_command: EventHandler<Command>,
+    minigame_timers: Vec<MinigameTimer>,
 ) -> Element {
     let round = session.round;
 
     rsx! {
+        MinigameTimerBar { timers: minigame_timers, round }
         if session.my_creative_entry_submitted {
             p { "Your entry is in. Waiting for the rating phase..." }
         } else {
@@ -3191,7 +3320,8 @@ fn Host() -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut location_task_templates = use_signal(Vec::<(usize, TaskTier, String)>::new);
     let mut banned_task_prompts: Signal<Vec<String>> = use_signal(Vec::new);
-    let mut timer = use_signal(|| None::<i64>);
+    let mut timer = use_signal(|| None::<TimerState>);
+    let mut minigame_timers = use_signal(Vec::<MinigameTimer>::new);
     // Gates the whole console behind `game_server::check_host_password` --
     // the server itself now enforces this too (`command_authorized`/the
     // `Watch`/`ViewPlayer`/etc. checks in `game_ws`), not just this UI
@@ -3233,6 +3363,7 @@ fn Host() -> Element {
                     location_task_templates.set(templates);
                 }
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
+                Ok(ServerMsg::MinigameTimers(timers)) => minigame_timers.set(timers),
                 Ok(ServerMsg::ViewedPlayer(v)) => viewed_player.set(v),
                 Ok(ServerMsg::BannedTaskPrompts(prompts)) => banned_task_prompts.set(prompts),
                 Ok(ServerMsg::HostLoginResult { ok }) => {
@@ -4023,6 +4154,9 @@ fn Host() -> Element {
                                     }
                                 }
                             }
+                            if session.creativity_kind.is_some() {
+                                MinigameTimerBar { timers: minigame_timers(), round: session.round }
+                            }
                             " "
                             button {
                                 onclick: move |_| {
@@ -4337,7 +4471,7 @@ fn describe_key_event(event: &DomainEvent, everyone: &[engine::PlayerReveal]) ->
 #[component]
 fn Display() -> Element {
     let mut view = use_signal(|| None::<PlayerView>);
-    let mut timer = use_signal(|| None::<i64>);
+    let mut timer = use_signal(|| None::<TimerState>);
     let mut socket = use_websocket(|| game_ws(WebSocketOptions::new()));
 
     use_future(move || async move {
@@ -4352,7 +4486,8 @@ fn Display() -> Element {
                     | ServerMsg::LocationTaskTemplates(_)
                     | ServerMsg::HostLoginResult { .. }
                     | ServerMsg::ViewedPlayer(_)
-                    | ServerMsg::BannedTaskPrompts(_),
+                    | ServerMsg::BannedTaskPrompts(_)
+                    | ServerMsg::MinigameTimers(_),
                 ) => {}
                 // See the identical comment in `Host` -- without this, a
                 // closed connection spins this loop forever with no yield.

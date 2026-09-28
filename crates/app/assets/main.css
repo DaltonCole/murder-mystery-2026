@@ -293,6 +293,31 @@ strong {
   font-weight: bold;
 }
 
+/* A diminishing countdown -- shared by the round/phase GameTimer and a
+ * Creativity mini-game's own Writing/Rating phase deadline. `--fill`
+ * (0-100, set inline per instance) drives the actual width; the track
+ * underneath stays fixed so the fill visibly drains toward empty rather
+ * than the bar itself resizing. */
+.progress-bar-track {
+  background: var(--color-border);
+  border-radius: 999px;
+  height: 0.5rem;
+  overflow: hidden;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.progress-bar-fill {
+  background: var(--color-accent);
+  height: 100%;
+  width: var(--fill, 100%);
+  transition: width 1s linear;
+}
+
+.progress-bar-fill.overtime {
+  background: var(--color-danger);
+  width: 100%;
+}
+
 /* The finale's public Cast-Out reveal (rules.md §4: "revealed publicly on
  * a shared screen") -- the emotional climax of the whole night deserves
  * more than plain paragraphs indistinguishable from routine status text. */

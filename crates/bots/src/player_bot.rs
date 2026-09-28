@@ -168,6 +168,7 @@ impl PlayerBot {
                 Some(ServerMsg::Joined { .. }) => {}
                 Some(ServerMsg::LocationTaskTemplates(_)) => {}
                 Some(ServerMsg::Timer(_)) => {}
+                Some(ServerMsg::MinigameTimers(_)) => {}
                 Some(ServerMsg::HostLoginResult { .. }) => {}
                 Some(ServerMsg::ViewedPlayer(_)) => {}
                 Some(ServerMsg::BannedTaskPrompts(_)) => {}
