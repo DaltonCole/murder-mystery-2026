@@ -13,10 +13,11 @@
 //! 20-30 player, single-process, one-event-at-a-time party game.
 
 use engine::{
-    apply_command, raffle_priority, raffle_winners, task_candidates, ticket_count, ticket_slots,
-    view_for, Command, ContestCategory, CreativityKind, CreativityPhase, DenouncementPhase,
-    DomainEvent, Faction, GameError, GameState, MinigamePayload, OpenMinigameDetail, PlayerId,
-    PlayerStatus, PlayerView, RatingStep, Round, TaskTier, Viewer,
+    apply_command, contest_submission_count, math_questions, raffle_priority, raffle_winners,
+    task_candidates, ticket_count, ticket_slots, trivia_questions, view_for, Command,
+    ContestCategory, CreativityKind, CreativityPhase, DenouncementPhase, DomainEvent, Faction,
+    GameError, GameState, IntelligenceKind, MinigamePayload, OpenMinigameDetail, PlayerId,
+    PlayerStatus, PlayerView, RatingStep, Round, TaskTier, Viewer, WORD_LIST,
 };
 use rand::seq::{IndexedRandom, SliceRandom};
 use rand::RngExt;
@@ -67,6 +68,14 @@ struct GameServer {
     // client-supplied one. See `Command::RecordQuizElapsedTime`'s doc
     // comment.
     minigame_started_at: Mutex<BTreeMap<(Round, ContestCategory), Instant>>,
+    // Round 4's "declare your category" window deadline, if one is
+    // currently open -- keyed by round so a stale deadline from an
+    // earlier round can never be mistaken for the current one. Separate
+    // from `minigame_deadlines`: this isn't any one category's own
+    // session, it's the room-wide choice phase that precedes all three
+    // categories' sequences starting at once. See
+    // `category_choice_window_seconds`'s doc comment for the duration.
+    category_choice_deadline: Mutex<Option<(Round, Instant)>>,
 }
 
 fn server() -> &'static GameServer {
@@ -81,6 +90,7 @@ fn server() -> &'static GameServer {
             banned_task_prompts: Mutex::new(BTreeSet::new()),
             minigame_deadlines: Mutex::new(BTreeMap::new()),
             minigame_started_at: Mutex::new(BTreeMap::new()),
+            category_choice_deadline: Mutex::new(None),
         }
     })
 }
@@ -150,22 +160,29 @@ fn ensure_ticker_running() {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 sweep_minigame_deadlines();
+                sweep_category_choice_window();
                 let timer_active = server()
                     .timer
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .is_some();
-                // Also broadcast on every tick a Creativity phase deadline is
-                // running, even if the sweep didn't just fire an advance --
-                // otherwise a player's progress bar would only visibly move
-                // at the moments something actually happens instead of
-                // draining smoothly every second.
+                // Also broadcast on every tick a Creativity phase deadline or
+                // Round 4's category-choice window is running, even if the
+                // sweep didn't just fire an advance -- otherwise a player's
+                // progress bar would only visibly move at the moments
+                // something actually happens instead of draining smoothly
+                // every second.
                 let minigame_timer_active = !server()
                     .minigame_deadlines
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .is_empty();
-                if timer_active || minigame_timer_active {
+                let choice_window_active = server()
+                    .category_choice_deadline
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some();
+                if timer_active || minigame_timer_active || choice_window_active {
                     let _ = server().changed.send(());
                 }
             }
@@ -597,6 +614,211 @@ fn auto_close_tasks_on_denouncement_open_or_even_round(
     apply_command(state, Command::CloseTasks).unwrap_or_default()
 }
 
+/// Every player currently expected to submit to `(round, category)`'s
+/// open session. Round 4: every active player whose stored choice for
+/// this round equals `category` -- `Command::ChooseContestCategory`'s own
+/// enforcement guarantees nobody *else* could have submitted to it
+/// anyway. Everything else (Round 2, or an ad-hoc Host-opened session
+/// outside either automated flow): every active player, unchanged from
+/// today's "no participation gating" model.
+fn expected_contest_participants(
+    state: &GameState,
+    round: Round,
+    category: ContestCategory,
+) -> BTreeSet<PlayerId> {
+    state
+        .players()
+        .filter(|p| p.status == PlayerStatus::Active)
+        .filter(|p| {
+            round != Round::Four || state.contest_category_choice(round, p.id) == Some(category)
+        })
+        .map(|p| p.id)
+        .collect()
+}
+
+/// Auto-closes any currently-open Intelligence(Trivia/Math/Wordle/Memory)
+/// or Strength session the instant every expected participant has
+/// finished -- an automation review found these always needed a Host's
+/// manual "Close & resolve" click, unlike Nomination/Ballot/Runoff, which
+/// already auto-close the same way (`auto_close_denouncement_phase`).
+/// Never Creativity, which already has its own real-timer auto-advance.
+/// This is what actually drives Round 2/4's non-Creativity steps forward
+/// with no Host click (and, as a bonus, speeds up any ad-hoc Host-opened
+/// session the same way).
+///
+/// Never fires on an empty required set -- same guard
+/// `auto_close_denouncement_phase` already documents, so a Round 4
+/// category literally nobody chose just sits open for the Host's manual
+/// fallback rather than auto-closing vacuously. Checked unconditionally
+/// on every `apply` call (not scoped to a specific triggering event, the
+/// way most other `auto_*` functions here are) since a session can become
+/// fully-submitted as a side effect of several different submit commands.
+fn auto_close_contest_session_on_full_participation(state: &mut GameState) -> Vec<DomainEvent> {
+    let to_close: Vec<(Round, ContestCategory)> = state
+        .contest_minigames()
+        .filter(|(_, session)| !matches!(session.payload, MinigamePayload::Creativity(_)))
+        .filter_map(|(&(round, category), session)| {
+            let expected = expected_contest_participants(state, round, category);
+            if expected.is_empty() {
+                return None;
+            }
+            (contest_submission_count(session) >= expected.len()).then_some((round, category))
+        })
+        .collect();
+
+    let mut events = Vec::new();
+    for (round, category) in to_close {
+        if let Ok(close_events) =
+            apply_command(state, Command::CloseContestMinigame { round, category })
+        {
+            events.extend(close_events);
+        }
+    }
+    events
+}
+
+/// The category that follows `category` in Round 2's fixed
+/// Creativity -> Intelligence -> Strength order (Dalton's own explicit
+/// spec), or `None` once Strength -- the last step -- closes.
+fn round_two_next_category(category: ContestCategory) -> Option<ContestCategory> {
+    match category {
+        ContestCategory::Creativity => Some(ContestCategory::Intelligence),
+        ContestCategory::Intelligence => Some(ContestCategory::Strength),
+        ContestCategory::Strength => None,
+    }
+}
+
+fn start_round_two_category(state: &mut GameState, category: ContestCategory) -> Vec<DomainEvent> {
+    let (prompt, detail) = round_two_step(category);
+    apply_command(
+        state,
+        Command::StartContestSequence {
+            round: Round::Two,
+            steps: vec![(prompt, detail)],
+        },
+    )
+    .unwrap_or_default()
+}
+
+/// Round 2's fully-automated sequence (Dalton's own explicit "this should
+/// be automated" instruction): Drawing, then Trivia, then a push-up
+/// contest, strictly one after another with no Host click. Kicked off the
+/// instant the round is reached (`RoundAdvanced{Two}`, the same "no admin
+/// action needed" precedent Round 3/5's task auto-push already
+/// established), then chained forward by each category's own
+/// `ContestMinigameClosed` -- same "scan just-applied events" shape as
+/// `auto_push_on_round_advance`.
+fn auto_advance_round_two_contests(
+    state: &mut GameState,
+    events: &[DomainEvent],
+) -> Vec<DomainEvent> {
+    let mut new_events = Vec::new();
+    for event in events {
+        match *event {
+            DomainEvent::RoundAdvanced { round: Round::Two } => {
+                new_events.extend(start_round_two_category(state, ContestCategory::Creativity));
+            }
+            DomainEvent::ContestMinigameClosed {
+                round: Round::Two,
+                category,
+            } => {
+                if let Some(next) = round_two_next_category(category) {
+                    new_events.extend(start_round_two_category(state, next));
+                }
+            }
+            _ => {}
+        }
+    }
+    new_events
+}
+
+/// How long Round 4's category-choice window stays open before all three
+/// tracks auto-start regardless of who's chosen -- Dalton's own
+/// "everything should be automated" instruction, the same real-timer
+/// treatment Creativity's own phases already get.
+///
+/// *** EDIT THIS to retune pacing before game night -- no other code
+/// changes needed. ***
+const CATEGORY_CHOICE_WINDOW_SECS: u64 = 45;
+
+/// Opens Round 4's category-choice window -- a real, fixed-duration timer,
+/// not a second manual Host click, per Dalton's own "everything should be
+/// automated" instruction. Separate from `minigame_deadlines`: this is a
+/// room-wide phase that precedes all three categories' sequences starting
+/// at once, not any one category's own session.
+fn open_category_choice_window(round: Round) {
+    *server()
+        .category_choice_deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((
+        round,
+        Instant::now() + Duration::from_secs(CATEGORY_CHOICE_WINDOW_SECS),
+    ));
+}
+
+fn auto_open_round_four_choice_window(events: &[DomainEvent]) {
+    if events
+        .iter()
+        .any(|e| matches!(e, DomainEvent::RoundAdvanced { round: Round::Four }))
+    {
+        open_category_choice_window(Round::Four);
+    }
+}
+
+/// Locks in Round 4's category choices and starts all three categories'
+/// 3-game sequences simultaneously ("3 simultaneous zones," this
+/// project's own established framing for Round 4) -- called once the
+/// choice window's deadline passes (`sweep_category_choice_window`) or
+/// the Host force-closes it early (`force_close_category_choice_window`).
+/// Each category's sequence then runs itself to completion independently
+/// via `close_contest_minigame`'s own sequence-awareness -- no further
+/// cross-category orchestration needed, unlike Round 2.
+fn begin_round_four_contests(round: Round) {
+    *server()
+        .category_choice_deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    for category in [
+        ContestCategory::Creativity,
+        ContestCategory::Intelligence,
+        ContestCategory::Strength,
+    ] {
+        let steps = round_four_steps(category);
+        let _ = apply(Command::StartContestSequence { round, steps });
+    }
+}
+
+/// Checks Round 4's category-choice window and, once its deadline has
+/// passed, locks in choices and starts all three tracks -- called from
+/// the same once-a-second ticker as `sweep_minigame_deadlines`.
+fn sweep_category_choice_window() {
+    let due = server()
+        .category_choice_deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .filter(|&(_, deadline)| Instant::now() >= deadline)
+        .map(|(round, _)| round);
+    if let Some(round) = due {
+        begin_round_four_contests(round);
+    }
+}
+
+/// The Host console's "force-close the choice window now" override --
+/// mirrors `force_advance_creative_writing`'s own "always keep a manual
+/// escape hatch" reasoning.
+pub fn force_close_category_choice_window() -> Result<(), String> {
+    let round = server()
+        .category_choice_deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .map(|(round, _)| round);
+    let Some(round) = round else {
+        return Err("no category-choice window is currently open".to_string());
+    };
+    begin_round_four_contests(round);
+    Ok(())
+}
+
 /// Per-`CreativityKind` `(writing, rating-per-item)` durations -- Dalton's
 /// own explicit spec for each of the four games. Lives here, not the
 /// engine: these are wall-clock facts, not game rules -- the same
@@ -733,6 +955,14 @@ fn track_minigame_timers(state: &GameState, events: &[DomainEvent]) {
     for event in events {
         match *event {
             DomainEvent::ContestMinigameOpened {
+                round, category, ..
+            }
+            // A sequence's own step-to-step transition (`close_contest_minigame`'s
+            // internal "more steps remain" branch, see `contest_minigame::
+            // ContestSequence`'s doc comment) opens a fresh session exactly
+            // like `OpenContestMinigame` does, just under a different event
+            // -- same arming logic applies.
+            | DomainEvent::ContestSequenceStepAdvanced {
                 round, category, ..
             } => match category {
                 ContestCategory::Creativity => {
@@ -889,6 +1119,9 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
             &mut state, &events,
         ));
         events.extend(auto_close_denouncement_phase(&mut state));
+        events.extend(auto_close_contest_session_on_full_participation(&mut state));
+        events.extend(auto_advance_round_two_contests(&mut state, &events));
+        auto_open_round_four_choice_window(&events);
         track_minigame_timers(&state, &events);
         let elapsed_time_events = record_minigame_elapsed_time(&mut state, &events);
         events.extend(elapsed_time_events);
@@ -1164,6 +1397,14 @@ const DRAWING_PROMPTS: &[&str] = &[
     "anything Bridgerton-themed you like!",
 ];
 
+fn random_drawing_prompt() -> String {
+    DRAWING_PROMPTS
+        .choose(&mut rand::rng())
+        .copied()
+        .unwrap_or("anything Bridgerton-themed you like!")
+        .to_string()
+}
+
 /// Opens a Drawing Creativity session for `round` with a randomly-drawn
 /// prompt from `DRAWING_PROMPTS` -- the Host console's "Open" button for
 /// Drawing specifically. Not a plain `Command::OpenContestMinigame` sent
@@ -1171,14 +1412,9 @@ const DRAWING_PROMPTS: &[&str] = &[
 /// exists server-side (same "randomness at the boundary" shape as
 /// `run_raffle`).
 pub fn open_drawing_session(round: Round) -> Result<Vec<DomainEvent>, String> {
-    let prompt = DRAWING_PROMPTS
-        .choose(&mut rand::rng())
-        .copied()
-        .unwrap_or("anything Bridgerton-themed you like!")
-        .to_string();
     apply(Command::OpenContestMinigame {
         round,
-        prompt,
+        prompt: random_drawing_prompt(),
         detail: OpenMinigameDetail::Creativity(CreativityKind::Drawing),
     })
     .map_err(|e| e.to_string())
@@ -1229,6 +1465,88 @@ pub fn open_physical_session(round: Round) -> Result<Vec<DomainEvent>, String> {
         detail: OpenMinigameDetail::Strength,
     })
     .map_err(|e| e.to_string())
+}
+
+/// Round 2's fixed Creativity/Intelligence/Strength step -- Dalton's own
+/// explicit spec: "First... drawing... second... trivia... finally... a
+/// pushup contest." Drawing draws its prompt the same random way the
+/// Host's own manual "Open Drawing" button does; Trivia uses the real
+/// 10-question bank; Strength is fixed to `PHYSICAL_CHALLENGES[0]`
+/// specifically (the exact push-up prompt Dalton names), not a random
+/// draw -- unlike Round 4's Strength track below.
+fn round_two_step(category: ContestCategory) -> (String, OpenMinigameDetail) {
+    match category {
+        ContestCategory::Creativity => (
+            random_drawing_prompt(),
+            OpenMinigameDetail::Creativity(CreativityKind::Drawing),
+        ),
+        ContestCategory::Intelligence => (
+            "Trivia!".to_string(),
+            OpenMinigameDetail::Intelligence(IntelligenceKind::Trivia {
+                questions: trivia_questions(),
+            }),
+        ),
+        ContestCategory::Strength => (
+            PHYSICAL_CHALLENGES[0].to_string(),
+            OpenMinigameDetail::Strength,
+        ),
+    }
+}
+
+fn random_wordle_secret() -> String {
+    WORD_LIST
+        .choose(&mut rand::rng())
+        .copied()
+        .unwrap_or("HOUSE")
+        .to_string()
+}
+
+/// Round 4's three-game track for `category` -- whichever games Round 2
+/// didn't already use for it. Creativity/Intelligence's remaining kinds
+/// are fixed (all 4 kinds are named outright, nothing to draw from a
+/// bank); Strength draws 3 *distinct* random challenges excluding
+/// `PHYSICAL_CHALLENGES[0]` (Round 2's exact push-up prompt), so it's
+/// never an immediate repeat.
+fn round_four_steps(category: ContestCategory) -> Vec<(String, OpenMinigameDetail)> {
+    match category {
+        ContestCategory::Creativity => [
+            (CreativityKind::Joke, "Tell a Bridgerton-themed joke!"),
+            (
+                CreativityKind::Dictionarium,
+                "Invent a Bridgerton-themed word!",
+            ),
+            (
+                CreativityKind::Smut,
+                "Write a short Bridgerton-themed scene!",
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, prompt)| (prompt.to_string(), OpenMinigameDetail::Creativity(kind)))
+        .collect(),
+        ContestCategory::Intelligence => vec![
+            (
+                "Math!".to_string(),
+                OpenMinigameDetail::Intelligence(IntelligenceKind::Math {
+                    questions: math_questions(),
+                }),
+            ),
+            (
+                "Memory!".to_string(),
+                OpenMinigameDetail::Intelligence(IntelligenceKind::Memory),
+            ),
+            (
+                "Wordle!".to_string(),
+                OpenMinigameDetail::Intelligence(IntelligenceKind::Wordle {
+                    secret: random_wordle_secret(),
+                }),
+            ),
+        ],
+        ContestCategory::Strength => PHYSICAL_CHALLENGES[1..]
+            .sample(&mut rand::rng(), 3)
+            .into_iter()
+            .map(|&prompt| (prompt.to_string(), OpenMinigameDetail::Strength))
+            .collect(),
+    }
 }
 
 /// The single read path every route uses -- never hands out a raw

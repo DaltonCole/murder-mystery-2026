@@ -641,7 +641,7 @@ fn contest_minigame_view(
         round,
         category,
         prompt: session.prompt.clone(),
-        submission_count: 0,
+        submission_count: contest_minigame::submission_count(session),
         sequence_progress,
         my_physical_placement: None,
         creativity_kind: None,
@@ -660,12 +660,10 @@ fn contest_minigame_view(
 
     match &session.payload {
         MinigamePayload::Strength(payload) => {
-            view.submission_count = payload.placements.len();
             view.my_physical_placement =
                 viewer_id.and_then(|id| payload.placements.get(&id).copied());
         }
         MinigamePayload::Creativity(payload) => {
-            view.submission_count = payload.entries.len();
             view.creativity_kind = Some(payload.kind);
             view.my_creative_entry_submitted =
                 viewer_id.is_some_and(|id| payload.entries.contains_key(&id));
@@ -690,11 +688,6 @@ fn contest_minigame_view(
         }
         MinigamePayload::Intelligence(IntelligencePayload::Trivia(quiz))
         | MinigamePayload::Intelligence(IntelligencePayload::Math(quiz)) => {
-            view.submission_count = quiz
-                .progress
-                .values()
-                .filter(|p| p.answers.len() == quiz.questions.len())
-                .count();
             view.quiz_kind = Some(
                 if matches!(
                     session.payload,
@@ -719,16 +712,10 @@ fn contest_minigame_view(
             }
         }
         MinigamePayload::Intelligence(IntelligencePayload::Memory(scores)) => {
-            view.submission_count = scores.len();
             view.is_memory = true;
             view.my_memory_score = viewer_id.and_then(|id| scores.get(&id).copied());
         }
         MinigamePayload::Intelligence(IntelligencePayload::Wordle(payload)) => {
-            view.submission_count = payload
-                .progress
-                .values()
-                .filter(|p| p.solved || p.guesses.len() >= contest_minigame::MAX_GUESSES)
-                .count();
             view.is_wordle = true;
             if let Some(progress) = viewer_id.and_then(|id| payload.progress.get(&id)) {
                 view.my_wordle_guesses = progress.guesses.clone();

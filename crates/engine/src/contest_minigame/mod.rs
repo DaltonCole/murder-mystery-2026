@@ -218,6 +218,35 @@ pub(crate) fn scores(session: &ContestMinigameSession) -> Vec<(PlayerId, i64)> {
     }
 }
 
+/// How many participants have *finished* submitting to this session -- an
+/// entry (Creativity), a completed quiz/Wordle attempt (not just started),
+/// a memory score, or a placement, whichever this session's mechanic uses.
+/// `pub` (not `pub(crate)`): both `view::contest_minigame_view` (the
+/// player-facing `ContestMinigameView::submission_count`) and
+/// `game_server`'s auto-close-on-full-participation sweep need this same
+/// count -- the latter compares it against how many players are actually
+/// expected to submit, to decide when a session (never Creativity, which
+/// has its own real-timer auto-advance) can close itself with no Host
+/// click.
+pub fn submission_count(session: &ContestMinigameSession) -> usize {
+    match &session.payload {
+        MinigamePayload::Strength(payload) => payload.placements.len(),
+        MinigamePayload::Creativity(payload) => payload.entries.len(),
+        MinigamePayload::Intelligence(IntelligencePayload::Trivia(quiz))
+        | MinigamePayload::Intelligence(IntelligencePayload::Math(quiz)) => quiz
+            .progress
+            .values()
+            .filter(|p| p.answers.len() == quiz.questions.len())
+            .count(),
+        MinigamePayload::Intelligence(IntelligencePayload::Memory(scores)) => scores.len(),
+        MinigamePayload::Intelligence(IntelligencePayload::Wordle(payload)) => payload
+            .progress
+            .values()
+            .filter(|p| p.solved || p.guesses.len() >= MAX_GUESSES)
+            .count(),
+    }
+}
+
 fn physical_scores(payload: &PhysicalPayload) -> Vec<(PlayerId, i64)> {
     let n = payload.placements.len() as i64;
     payload
