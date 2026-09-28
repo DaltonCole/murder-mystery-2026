@@ -94,7 +94,7 @@ Servants sit entirely outside this three-way race.
 **Recruitment schedule:** at 20 players or fewer, the Cult recruits one new member every 2 rounds, flat, for the whole game. **At 21-30 players**, that same flat cadence holds through Round 3, but from Round 4 onward, each recruitment window brings in **2 new members instead of 1**.
 
 - The Cult secretly aids whichever public faction is currently behind, each round.
-- If the King/Queen is *converted* before using their title-transfer ability, that ability auto-fires, and the Prince/Princess is swept into the Cult too, staying in play as a secret cultist. (A separate cascade applies if the King/Queen is instead *Cast Out* at the Round 3 Denouncement specifically — see §5, where the Prince/Princess is removed from the game rather than converted.) No equivalent cascade applies to the Revolutionary Leader.
+- If the King/Queen is *converted* before using their title-transfer ability, **and before Round 3**, that ability auto-fires, and the Prince/Princess is swept into the Cult too, staying in play as a secret cultist. (A separate cascade applies if the King/Queen is instead *Cast Out* before Round 3 — see §5, where the Prince/Princess is removed from the game rather than converted.) At Round 3 or later, either kind of fall just burns the ability with no cascade — the title-transfer window has passed. No equivalent cascade applies to the Revolutionary Leader.
 - A converted player keeps their original character and abilities, letting them keep fooling their original side.
 
 ### 3.4 Revolutionary Leader secrecy
@@ -107,13 +107,15 @@ Nothing in the app or rules can actually *prevent* a Leader from telling a trust
 
 ## 4. Round Structure
 
-**Round 1** (intro) → **Round 2** (contest) → **Round 3** (task + Denouncement) → **Round 4** (contest) → **Intermission** → **Round 5** (task + Denouncement) → **The Last Denouncement** (finale).
+**Round 1** (intro + Denouncement) → **Round 2** (contest + Denouncement) → **Round 3** (task + Denouncement) → **Round 4** (contest + Denouncement) → **Intermission** → **Round 5** (task + Denouncement) → **The Last Denouncement** (finale).
 
-### Round 1 — soft intro, no vote
+Every round now closes with a full Denouncement (Nomination → Discussion → Ballot → Runoff → Cast-Out, §5) — not just Rounds 3 and 5. Round 2 and 4's Denouncement opens automatically the instant that round's 3 contest categories are all decided; Round 1, 3, and 5 still open on Dalton's own manual call, once he judges the round's ready to close.
+
+### Round 1 — soft intro
 1. Dalton gives a short scripted intro (the masquerade conceit, the Ton and the Uprising named, the Cult only hinted at, the phone-privacy rule, and the Leader-secrecy rule above) and live-demos the press-and-hold reveal on a dummy screen.
 2. Everyone privately reveals their character.
 3. The app pushes exactly 2 fixed tasks (1 easy, 1 medium); players mingle and self-report by naming 3 people they talked to.
-4. No nomination, no vote — the round ends on the timer. Completion rate is tallied silently, for Whistledown flavor only.
+4. A Denouncement (§5), opened whenever Dalton judges the room's ready. Completion rate on the 2 tasks is tallied silently, for Whistledown flavor only.
 
 ### Rounds 3 & 5 — task rounds with a Denouncement
 1. **Task phase**, easy/medium/hard tiers live.
@@ -129,6 +131,7 @@ Nothing in the app or rules can actually *prevent* a Leader from telling a trust
 ### Contest rounds (2, 4)
 - **Round 2:** the whole room plays together as one group, moving through Strength, Creativity, and Intelligence in sequence — this is everyone's first look at all 3 categories.
 - **Round 4:** the room splits into 3 sub-groups, one per category (Strength, Creativity, Intelligence), each player choosing which zone to join. Staff each zone's scoring with an already-Cast-Out player from an earlier round.
+- Once all 3 categories have a recorded result, the round's Denouncement (§5) opens automatically — no admin click needed.
 
 ### Intermission
 "Who is Lorel's number one love?" — anyone Cast Out earlier is ineligible to enter. Everyone who wants to take part opts in via the app; **5 entrants are then selected at random** from that pool.
@@ -154,7 +157,7 @@ In-fiction, this mechanic is never called an "execution" or a "vote" — to play
 
 - **The Revolutionary Leader, correctly identified:** the title passes immediately and privately to a successor. Never announced — the room only ever learns "someone was Cast Out." This closes off Paths A and B for the *executed* Leader specifically (they can no longer be converted), but **opens the door to Path C** (§2) if the King/Queen is, or later becomes, converted. The new successor is a fresh, unconverted Leader — the Cult would need to identify and convert them separately for the Uprising's threat to renew.
 - **The King/Queen, Cast Out (not converted):** allowed, no immunity. Permanently disables the Oracle for the rest of the game — a real cost, but not a loss condition; the Ton can still win. This closes off Path A (both converted) for good, but **opens the door to Path B** (§2) if the Revolutionary Leader is, or later becomes, converted.
-  - **If this happens at the Round 3 Denouncement specifically** (i.e., before Round 4 — the earliest the King/Queen can fall), the **Prince/Princess is Cast Out in the same moment**, removed from the game alongside the King/Queen. The title then passes to a random remaining Ton player, the same way it would if the King/Queen had used their own transfer ability. No new Prince/Princess is assigned — that role is simply gone for the rest of the game. This doesn't apply if the King/Queen falls later, at Round 5 or the finale.
+  - **If this happens at any Denouncement before Round 3** (Round 1 or Round 2 — the earliest the King/Queen can now fall), the **Prince/Princess is Cast Out in the same moment**, removed from the game alongside the King/Queen. The title then passes to a random remaining Ton player, the same way it would if the King/Queen had used their own transfer ability. No new Prince/Princess is assigned — that role is simply gone for the rest of the game. This doesn't apply if the King/Queen falls at Round 3 or later.
 - **The Cult Leader, Cast Out:** if a royal conversion had already landed, this triggers Cult Path D — the martyrdom path — resolved privately and immediately, revealed publicly only at the finale. *(Because nobody outside the Cult can ever be sure a conversion has already happened, Casting Out a suspected Cult Leader always carries real risk — the "safe" choice and the "correct" choice aren't always the same thing.)*
 - **A regular Cultist, an innocent bystander, or anyone else:** simply removed. No faction or role is ever confirmed publicly for any Cast-Out player, including a correctly-caught Cultist — every result gets the same deliberately uninformative public treatment (§6). Full transparency is saved entirely for the Last Denouncement.
 

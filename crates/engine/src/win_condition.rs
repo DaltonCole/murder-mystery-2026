@@ -455,11 +455,10 @@ mod tests {
     #[test]
     fn cult_path_b_leader_converted_king_queen_denounced() {
         let (mut state, king_queen, leader, cult_leader, prince) = base_state();
-        // King/Queen falls at Round 3 -- exercises the full cascade, not
-        // just the flag, to keep this test honest about what actually
-        // happens in play.
+        // King/Queen falls at Round 2 (cascade-eligible, before Round 3)
+        // -- exercises the full cascade, not just the flag, to keep this
+        // test honest about what actually happens in play.
         apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
         apply_command(
             &mut state,
             Command::CastOut {

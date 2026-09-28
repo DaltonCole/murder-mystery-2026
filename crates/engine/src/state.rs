@@ -840,6 +840,29 @@ impl GameState {
         }
     }
 
+    /// Whether every one of `round`'s 3 contest categories (Strength/
+    /// Creativity/Intelligence) has a recorded result yet -- distinct from
+    /// `contest_round_winner` above, which can resolve *before* all 3 are
+    /// in once one faction already has an unbeatable 2-0 majority.
+    /// `game_server`'s auto-open-Denouncement trigger needs this stricter
+    /// "actually done" signal instead: Round 2's 3rd category (Strength)
+    /// is still an open, live session for players at the exact moment a
+    /// 2-0 majority would otherwise resolve `contest_round_winner` early,
+    /// and Round 4's 3 categories run in parallel, so the same
+    /// early-majority risk applies there too -- opening a Denouncement
+    /// while a category's session is still active would strand it,
+    /// abandoned, with no way to close. `pub`, not `pub(crate)`, since
+    /// `game_server.rs` (a different crate) is the one caller that needs
+    /// it, the same "real accessor for game_server" shape as
+    /// `contest_category_choice`/`contest_minigames`.
+    pub fn contest_round_fully_decided(&self, round: Round) -> bool {
+        self.contest_results
+            .keys()
+            .filter(|&&(r, _)| r == round)
+            .count()
+            >= 3
+    }
+
     /// Every contest round decided so far, in round order -- see
     /// `contest_round_winner`'s doc comment.
     pub(crate) fn contest_round_winners_for_host(&self) -> Vec<(Round, bool)> {
@@ -1548,12 +1571,16 @@ fn submit_bio(
 /// underlying operation: both keep their existing `character` (and thus
 /// their existing ability) exactly as rules.md §3.3 requires -- only their
 /// `converted` flag and true faction change. Converting the current
-/// King/Queen before they've used their transfer
-/// ability triggers the auto-cascade from rules.md §4.3: the title
+/// King/Queen before they've used their transfer ability, and before
+/// Round 3, triggers the auto-cascade from rules.md §4.3: the title
 /// auto-transfers to a random remaining Ton player, and the Prince/Princess
 /// (if any, and still active) is converted too, staying in play as a secret
 /// cultist -- distinct from the *Cast-Out* cascade in `resolve_cast_out`,
-/// which removes the Prince/Princess from the game instead.
+/// which removes the Prince/Princess from the game instead. At Round 3 or
+/// later the transfer ability is still burned (so it can't be manually used
+/// later either) but produces no cascade -- mirrors the Cast-Out cascade's
+/// own "before Round 3" bound, generalized the same way once Round 1/2
+/// gained their own Denouncements (see `resolve_cast_out`'s doc comment).
 fn convert(
     state: &mut GameState,
     converter: PlayerId,
@@ -1613,33 +1640,41 @@ fn convert(
     if is_king_queen {
         state.king_queen_ever_converted = true;
         if !state.king_queen_transfer_used {
+            // The ability is always burned exactly once here, cascading or
+            // not -- at Round 3+ this just quietly does nothing further,
+            // the same "ability spent, no effect" treatment the Cast-Out
+            // cascade gives a Round-3-or-later fall (see `resolve_cast_out`).
             state.king_queen_transfer_used = true;
-            let replacement = state.first_eligible(Faction::Ton, &[target]);
-            // If nobody else is available, the crown has nowhere to go --
-            // the now-converted King/Queen simply keeps it (they're still
-            // physically, publicly the King/Queen; conversion doesn't
-            // remove them from play the way a Cast-Out does). Only
-            // overwrite `state.king_queen` when a real replacement exists;
-            // leaving it alone when `replacement` is `None` is what keeps
-            // it pointing at `target` rather than going vacant.
-            if let Some(new_holder) = replacement {
-                state.players.get_mut(&new_holder).unwrap().character = Some(Character::KingQueen);
-                state.king_queen = replacement;
-            }
-
-            let mut prince_princess_converted = None;
-            if let Some(pp) = state.prince_princess {
-                if state.is_active(pp) {
-                    state.players.get_mut(&pp).unwrap().converted = true;
-                    prince_princess_converted = Some(pp);
+            if state.current_round < Round::Three {
+                let replacement = state.first_eligible(Faction::Ton, &[target]);
+                // If nobody else is available, the crown has nowhere to go
+                // -- the now-converted King/Queen simply keeps it (they're
+                // still physically, publicly the King/Queen; conversion
+                // doesn't remove them from play the way a Cast-Out does).
+                // Only overwrite `state.king_queen` when a real replacement
+                // exists; leaving it alone when `replacement` is `None` is
+                // what keeps it pointing at `target` rather than going
+                // vacant.
+                if let Some(new_holder) = replacement {
+                    state.players.get_mut(&new_holder).unwrap().character =
+                        Some(Character::KingQueen);
+                    state.king_queen = replacement;
                 }
-            }
 
-            events.push(DomainEvent::KingQueenConversionCascade {
-                old_king_queen: target,
-                new_king_queen: state.king_queen,
-                prince_princess_converted,
-            });
+                let mut prince_princess_converted = None;
+                if let Some(pp) = state.prince_princess {
+                    if state.is_active(pp) {
+                        state.players.get_mut(&pp).unwrap().converted = true;
+                        prince_princess_converted = Some(pp);
+                    }
+                }
+
+                events.push(DomainEvent::KingQueenConversionCascade {
+                    old_king_queen: target,
+                    new_king_queen: state.king_queen,
+                    prince_princess_converted,
+                });
+            }
         }
     }
     if is_leader {
@@ -1754,12 +1789,19 @@ fn resolve_cast_out(
             events.push(DomainEvent::OracleDisabled);
             state.king_queen_ever_denounced_unconverted = true;
 
-            // The Round-3-specific cascade (rules.md §5) -- does NOT apply
-            // at Round 5 or the Finale, where the King/Queen simply has no
-            // successor at all (the throne stays vacant for the rest of
-            // the game, unlike the Revolutionary Leader's succession,
-            // which rules.md describes as unconditional).
-            if state.current_round == Round::Three {
+            // The cascade (rules.md §5) fires for any Denouncement before
+            // Round 3 (Round 1 or Round 2) -- generalized from an earlier
+            // "Round 3 specifically" rule written back when Round 3 was
+            // structurally the game's first-ever Denouncement. Now that
+            // Round 1/2 can each have one too, "before Round 3" is what
+            // actually matches rules.md's own stated intent ("the earliest
+            // the King/Queen can fall"), whichever literal round that ends
+            // up being. Does NOT apply at Round 3 or later, where the
+            // King/Queen simply has no successor at all (the throne stays
+            // vacant for the rest of the game, unlike the Revolutionary
+            // Leader's succession, which rules.md describes as
+            // unconditional).
+            if state.current_round < Round::Three {
                 let mut prince_princess_cast_out = None;
                 if let Some(pp) = state.prince_princess {
                     if state.is_active(pp) {
@@ -4857,6 +4899,53 @@ mod tests {
     }
 
     #[test]
+    fn converting_king_queen_at_round_three_burns_the_ability_with_no_cascade() {
+        // Generalized alongside the Cast-Out cascade: the transfer ability
+        // is still spent exactly once (so it can't be manually used
+        // later either), but at Round 3 or later that's all that happens
+        // -- no crown transfer, no Prince/Princess sweep.
+        let (mut state, king_queen, prince, _leader, cult_leader) = setup_full_game();
+        let extra_ton = add_player(&mut state, "ExtraTon", Faction::Ton);
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        assert_eq!(state.current_round(), Round::Three);
+        grant_recruitment_slots(&mut state, 1);
+
+        let events = apply_command(
+            &mut state,
+            Command::Convert {
+                converter: cult_leader,
+                target: king_queen,
+            },
+        )
+        .unwrap();
+
+        assert!(state.player(king_queen).unwrap().converted);
+        assert_eq!(
+            state.king_queen(),
+            Some(king_queen),
+            "no successor mechanic exists at Round 3+, so the converted King/Queen keeps the title"
+        );
+        assert!(!state.player(prince).unwrap().converted);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::KingQueenConversionCascade { .. })));
+
+        // The ability is burned even though it didn't cascade -- a later
+        // manual TransferKingQueen must now be rejected.
+        assert_eq!(
+            apply_command(
+                &mut state,
+                Command::TransferKingQueen {
+                    player: king_queen,
+                    new_holder: extra_ton,
+                },
+            ),
+            Err(GameError::KingQueenTransferAlreadyUsed)
+        );
+    }
+
+    #[test]
     fn converting_revolutionary_leader_sets_the_ever_converted_flag_but_no_cascade() {
         let (mut state, _king_queen, _prince, leader, cult_leader) = setup_full_game();
         grant_recruitment_slots(&mut state, 1);
@@ -5194,13 +5283,10 @@ mod tests {
     }
 
     #[test]
-    fn king_queen_cast_out_at_round_three_sweeps_prince_princess_and_installs_a_new_king_queen() {
+    fn king_queen_cast_out_at_round_one_sweeps_prince_princess_and_installs_a_new_king_queen() {
         let (mut state, king_queen, prince, ..) = setup_full_game();
         let extra_ton = add_player(&mut state, "ExtraTon", Faction::Ton);
-        apply_command(&mut state, Command::FinalizeSetup).unwrap();
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
-        assert_eq!(state.current_round(), Round::Three);
+        assert_eq!(state.current_round(), Round::One);
 
         apply_command(
             &mut state,
@@ -5221,7 +5307,7 @@ mod tests {
     }
 
     #[test]
-    fn king_queen_cast_out_at_round_three_with_no_prince_princess_still_reassigns() {
+    fn king_queen_cast_out_at_round_two_with_no_prince_princess_still_reassigns() {
         // No Prince/Princess was ever assigned -- the cascade's sweep step
         // must handle a vacant slot without panicking, and still reassign
         // the title.
@@ -5247,8 +5333,7 @@ mod tests {
         .unwrap();
         apply_command(&mut state, Command::FinalizeSetup).unwrap();
         apply_command(&mut state, Command::AdvanceRound).unwrap();
-        apply_command(&mut state, Command::AdvanceRound).unwrap();
-        assert_eq!(state.current_round(), Round::Three);
+        assert_eq!(state.current_round(), Round::Two);
 
         apply_command(
             &mut state,
@@ -5264,8 +5349,8 @@ mod tests {
     }
 
     #[test]
-    fn king_queen_round_three_cascade_fallback_skips_an_already_converted_candidate() {
-        // Regression test: the Round-3 cascade's own fallback filter (and
+    fn king_queen_round_two_cascade_fallback_skips_an_already_converted_candidate() {
+        // Regression test: the cascade's own fallback filter (and
         // `first_eligible` beneath it) used to check the apparent `faction`
         // field, not `true_faction()`, so an already-secretly-converted Ton
         // member could inherit the crown. `turncoat` has a lower PlayerId
@@ -5283,8 +5368,7 @@ mod tests {
             },
         )
         .unwrap();
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
-        assert_eq!(state.current_round(), Round::Three);
+        assert_eq!(state.current_round(), Round::Two);
 
         apply_command(
             &mut state,
@@ -5318,6 +5402,39 @@ mod tests {
     }
 
     #[test]
+    fn king_queen_cast_out_at_round_three_does_not_sweep_prince_princess_or_reassign() {
+        // Round 3 used to be the cascade's own trigger round; now that it's
+        // generalized to "before Round 3" (Round 1 or 2), Round 3 itself
+        // joins Round 5/Finale in the no-cascade bucket.
+        let (mut state, king_queen, prince, ..) = setup_full_game();
+        let extra_ton = add_player(&mut state, "ExtraTon", Faction::Ton);
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        assert_eq!(state.current_round(), Round::Three);
+
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: king_queen,
+                fallback_replacement: Some(extra_ton),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.player(prince).unwrap().status,
+            PlayerStatus::Active,
+            "the before-Round-3 cascade must not fire at Round 3 or later"
+        );
+        assert_eq!(state.prince_princess(), Some(prince));
+        assert_eq!(
+            state.king_queen(),
+            None,
+            "no successor mechanic exists for the King/Queen outside the before-Round-3 cascade"
+        );
+    }
+
+    #[test]
     fn king_queen_cast_out_at_round_five_does_not_sweep_prince_princess_or_reassign() {
         let (mut state, king_queen, prince, ..) = setup_full_game();
         let extra_ton = add_player(&mut state, "ExtraTon", Faction::Ton);
@@ -5339,13 +5456,13 @@ mod tests {
         assert_eq!(
             state.player(prince).unwrap().status,
             PlayerStatus::Active,
-            "the Round-3-only cascade must not fire outside Round 3"
+            "the before-Round-3 cascade must not fire outside Round 1/2"
         );
         assert_eq!(state.prince_princess(), Some(prince));
         assert_eq!(
             state.king_queen(),
             None,
-            "no successor mechanic exists for the King/Queen outside the Round 3 cascade"
+            "no successor mechanic exists for the King/Queen outside the before-Round-3 cascade"
         );
     }
 
@@ -6131,9 +6248,13 @@ mod tests {
 
     #[test]
     fn a_clean_runoff_resolves_and_closes_the_denouncement() {
+        // Plain Ton extras, not the King/Queen/Prince-Princess slots --
+        // this test is about generic runoff-closing mechanics, not the
+        // King/Queen cascade (which now also fires at Round 1, where this
+        // test's fixture leaves `state`).
         let (mut state, everyone) = setup_game_with_extra_voters(3);
-        let a = everyone[0];
-        let b = everyone[1];
+        let a = everyone[4];
+        let b = everyone[5];
 
         apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
@@ -6453,27 +6574,27 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_slot_round_three_denouncement_can_cast_out_the_king_queen_and_prince_princess_together(
+    fn a_multi_slot_cascade_eligible_denouncement_can_cast_out_the_king_queen_and_prince_princess_together(
     ) {
         // Regression test: at 21+ competing players, execution_count() is
         // 2. If the King/Queen AND the Prince/Princess both surface and
-        // both win a slot in the *same* Round 3 Denouncement, resolving
-        // the King/Queen's own Cast-Out cascade (rules.md §5) already
-        // Casts Out the Prince/Princess directly -- so by the time the
-        // batch loop in `close_ballot` reaches the Prince/Princess as its
-        // own, independently-voted-out slot, they're already inactive.
-        // Before the fix, `resolve_cast_out` correctly rejected that as
-        // `NotActive`, but that error propagated out of `close_ballot`
-        // *after* the King/Queen's cascade had already mutated `state` --
-        // silently violating `apply_command`'s "on error, state is left
-        // unchanged" contract. This must now resolve cleanly instead.
+        // both win a slot in the *same* cascade-eligible (before Round 3)
+        // Denouncement, resolving the King/Queen's own Cast-Out cascade
+        // (rules.md §5) already Casts Out the Prince/Princess directly --
+        // so by the time the batch loop in `close_ballot` reaches the
+        // Prince/Princess as its own, independently-voted-out slot,
+        // they're already inactive. Before the fix, `resolve_cast_out`
+        // correctly rejected that as `NotActive`, but that error
+        // propagated out of `close_ballot` *after* the King/Queen's
+        // cascade had already mutated `state` -- silently violating
+        // `apply_command`'s "on error, state is left unchanged" contract.
+        // This must now resolve cleanly instead.
         let (mut state, everyone) = setup_game_with_extra_voters(17); // 4 + 17 = 21
         assert_eq!(state.competing_player_count(), 21);
         let king_queen = everyone[0];
         let prince_princess = everyone[1];
 
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, cascade-eligible
 
         apply_command(&mut state, Command::OpenDenouncement).unwrap();
         for &voter in &everyone[4..14] {
@@ -6549,8 +6670,8 @@ mod tests {
             state.player(prince_princess).unwrap().status,
             PlayerStatus::CastOut
         );
-        // The Round-3 cascade still installs a new King/Queen from the
-        // remaining untitled Ton pool.
+        // The cascade still installs a new King/Queen from the remaining
+        // untitled Ton pool.
         assert!(state.king_queen().is_some());
         assert_ne!(state.king_queen(), Some(king_queen));
     }
@@ -7264,8 +7385,7 @@ mod tests {
         let king_queen = everyone[0];
         let z = everyone[4];
 
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, cascade-eligible
 
         apply_command(&mut state, Command::OpenDenouncement).unwrap();
         apply_command(
@@ -7544,7 +7664,7 @@ mod tests {
         // The King/Queen locks in cleanly from the *original* ballot
         // (`already_locked_in`), while the Prince/Princess separately wins
         // the runoff for the tied last slot. Closing the runoff resolves
-        // the King/Queen first, whose own Round-3 cascade already casts
+        // the King/Queen first, whose own cascade already casts
         // out the Prince/Princess directly -- so by the time the loop
         // reaches the Prince/Princess as their own, independently-won
         // runoff slot, they're already inactive. This is the same
@@ -7558,8 +7678,7 @@ mod tests {
         let prince_princess = everyone[1];
         let y = everyone[17];
 
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two
-        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Three
+        apply_command(&mut state, Command::AdvanceRound).unwrap(); // -> Two, cascade-eligible
 
         apply_command(&mut state, Command::OpenDenouncement).unwrap();
         for &voter in &everyone[4..14] {
@@ -13227,5 +13346,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.contest_round_winner(Round::Two), Some(false));
+    }
+
+    #[test]
+    fn contest_round_fully_decided_waits_for_all_three_categories_even_after_an_early_majority() {
+        // Distinct from `contest_round_winner`: a 2-0 majority resolves
+        // *who won* early, but `game_server`'s auto-open-Denouncement
+        // trigger must not fire until the 3rd category's still-open
+        // session has actually closed too.
+        let (mut state, ..) = setup_for_contest(1, 1);
+        assert!(!state.contest_round_fully_decided(Round::Two));
+
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Creativity,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Intelligence,
+                ton_won: true,
+            },
+        )
+        .unwrap();
+        // Ton already has an unbeatable majority, but Strength hasn't
+        // recorded yet -- not fully decided.
+        assert_eq!(state.contest_round_winner(Round::Two), Some(true));
+        assert!(!state.contest_round_fully_decided(Round::Two));
+
+        apply_command(
+            &mut state,
+            Command::RecordContestResult {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+                ton_won: false,
+            },
+        )
+        .unwrap();
+        assert!(state.contest_round_fully_decided(Round::Two));
     }
 }

@@ -1242,6 +1242,14 @@ fn Play() -> Element {
                             on_command: send_cmd,
                             minigame_timers: minigame_timers(),
                         }
+                        if category_choice_timer().is_none()
+                            && v.denouncement.is_none()
+                            && !v.open_contest_minigames.iter().any(|s| s.category == category)
+                        {
+                            p { class: "field-description",
+                                "You've finished your games -- waiting for the other tracks to finish before the Denouncement starts."
+                            }
+                        }
                     } else if let Some((_, state)) = category_choice_timer() {
                         p { "Choose which category to compete in this round -- choose wisely, once picked you can't switch." }
                         ProgressBarFill { state }

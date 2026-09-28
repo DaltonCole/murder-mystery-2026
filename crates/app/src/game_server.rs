@@ -732,6 +732,46 @@ fn auto_advance_round_two_contests(
     new_events
 }
 
+/// Auto-opens the Denouncement for Round 2/4 the instant that round's
+/// contests are fully decided (TODO.md: "Denouncment should auto start
+/// after even rounds have concluded" / "...once all round 4 contests are
+/// over") -- Round 1/3/5/Finale keep the Host's existing manual "Open
+/// Denouncement" click, since there's no equivalent "the room is done"
+/// signal to automate from there.
+///
+/// Uses `GameState::contest_round_fully_decided`, NOT
+/// `contest_round_winner` -- the latter can resolve early, the moment one
+/// faction has an unbeatable 2-0 majority over just 2 of the round's 3
+/// categories, while the 3rd category's session (Round 2's still-open
+/// Strength step, or one of Round 4's 3 parallel tracks) is still live.
+/// Opening the Denouncement at that point would stray players out of a
+/// contest they haven't finished yet. Waiting for all 3 recorded results
+/// avoids that regardless of how lopsided the room's votes are.
+///
+/// Fires at most once per round: once open,
+/// `state.denouncement_phase().is_some()` blocks any later re-check (e.g.
+/// a stray `ContestMinigameClosed` from an ad-hoc Host-reopened session)
+/// from trying again.
+fn auto_open_denouncement_after_contests(
+    state: &mut GameState,
+    events: &[DomainEvent],
+) -> Vec<DomainEvent> {
+    let round = events.iter().find_map(|e| match e {
+        DomainEvent::ContestMinigameClosed {
+            round: round @ (Round::Two | Round::Four),
+            ..
+        } => Some(*round),
+        _ => None,
+    });
+    let Some(round) = round else {
+        return Vec::new();
+    };
+    if state.denouncement_phase().is_some() || !state.contest_round_fully_decided(round) {
+        return Vec::new();
+    }
+    apply_command(state, Command::OpenDenouncement).unwrap_or_default()
+}
+
 /// How long Round 4's category-choice window stays open before all three
 /// tracks auto-start regardless of who's chosen -- Dalton's own
 /// "everything should be automated" instruction, the same real-timer
@@ -1141,6 +1181,7 @@ pub fn apply(cmd: Command) -> Result<Vec<DomainEvent>, GameError> {
         events.extend(auto_close_denouncement_phase(&mut state));
         events.extend(auto_close_contest_session_on_full_participation(&mut state));
         events.extend(auto_advance_round_two_contests(&mut state, &events));
+        events.extend(auto_open_denouncement_after_contests(&mut state, &events));
         auto_open_round_four_choice_window(&events);
         track_minigame_timers(&state, &events);
         let elapsed_time_events = record_minigame_elapsed_time(&mut state, &events);
