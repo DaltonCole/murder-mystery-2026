@@ -891,6 +891,14 @@ fn Play() -> Element {
     let mut timer = use_signal(|| None::<TimerState>);
     let mut minigame_timers = use_signal(Vec::<MinigameTimer>::new);
     let mut category_choice_timer = use_signal(|| None::<(Round, TimerState)>);
+    // Declared here (not down by `tab_nav`) so the receive loop below can
+    // capture it -- it needs to know which tab the player is currently on
+    // to decide whether a Round/Game-tab-relevant update should flash
+    // that tab's button (Dalton's own explicit instruction: "give some
+    // sort of indication... make the button flash").
+    let mut active_tab = use_signal(|| PlayTab::Character);
+    let mut round_tab_flash = use_signal(|| false);
+    let mut game_tab_flash = use_signal(|| false);
     // The story-driven transition banner (Dalton's own explicit instruction:
     // something like "the party goers become restless..." between rounds,
     // "more on theme and elegant") -- entirely client-side, no new server
@@ -931,6 +939,29 @@ fn Play() -> Element {
                         }
                     }
                     last_seen_round.set(Some(round));
+                    // Flash the Round/Game tab buttons when something
+                    // relevant to them changes while the player's looking
+                    // at a *different* tab -- comparing consecutive `View`s
+                    // rather than snapshotting "as of last visit" is enough:
+                    // once flashed, the flag stays set (and the flash
+                    // visible) until they actually switch to that tab,
+                    // regardless of how many further updates arrive.
+                    if let Some(prev) = view() {
+                        let round_changed = prev.open_tasks != v.open_tasks
+                            || prev.open_contest_minigames != v.open_contest_minigames
+                            || prev.denouncement != v.denouncement
+                            || prev.my_contest_category_choice != v.my_contest_category_choice;
+                        if round_changed && active_tab() != PlayTab::Round {
+                            round_tab_flash.set(true);
+                        }
+                        let game_changed = prev.intermission_entrants != v.intermission_entrants
+                            || prev.i_opted_into_intermission != v.i_opted_into_intermission
+                            || prev.servant_leaderboard != v.servant_leaderboard
+                            || prev.whistledown != v.whistledown;
+                        if game_changed && active_tab() != PlayTab::Game {
+                            game_tab_flash.set(true);
+                        }
+                    }
                     view.set(Some(v));
                 }
                 Ok(ServerMsg::Failed { error: e }) => error.set(Some(e)),
@@ -993,11 +1024,6 @@ fn Play() -> Element {
     // with nothing to actually press or hold. Once tripped, stays revealed
     // for the rest of the game -- there's no reason to re-hide it.
     let mut revealed = use_signal(|| false);
-    // Which of the three tabs is showing -- meaningful once a bio's been
-    // submitted (see `PlayTab`'s own doc comment for the pre-game vs.
-    // post-game version of each); before that, `Play` shows a single
-    // Character Creation form instead, with no tabs at all.
-    let mut active_tab = use_signal(|| PlayTab::Character);
 
     let mut do_join = move || {
         let name = name_draft.peek().trim().to_string();
@@ -1065,13 +1091,27 @@ fn Play() -> Element {
                 "Character",
             }
             button {
-                class: if active_tab() == PlayTab::Round { "tab-active" },
-                onclick: move |_| active_tab.set(PlayTab::Round),
+                class: if active_tab() == PlayTab::Round {
+                    "tab-active"
+                } else if round_tab_flash() {
+                    "tab-flash"
+                },
+                onclick: move |_| {
+                    active_tab.set(PlayTab::Round);
+                    round_tab_flash.set(false);
+                },
                 "Round",
             }
             button {
-                class: if active_tab() == PlayTab::Game { "tab-active" },
-                onclick: move |_| active_tab.set(PlayTab::Game),
+                class: if active_tab() == PlayTab::Game {
+                    "tab-active"
+                } else if game_tab_flash() {
+                    "tab-flash"
+                },
+                onclick: move |_| {
+                    active_tab.set(PlayTab::Game);
+                    game_tab_flash.set(false);
+                },
                 "Game",
             }
             button {
@@ -1187,6 +1227,10 @@ fn Play() -> Element {
                 if v.current_round == Round::Four {
                     if let Some(category) = v.my_contest_category_choice {
                         p { "You're competing in {category:?} this round." }
+                        if let Some((_, state)) = category_choice_timer() {
+                            p { "Your games begin once the choice window closes:" }
+                            ProgressBarFill { state }
+                        }
                         ContestMinigamePanel {
                             my_id: id,
                             sessions: v
@@ -2244,6 +2288,13 @@ fn describe_check(check: &InfoCheckDelivery, roster: &[RosterEntry]) -> String {
     }
 }
 
+/// A short, always-visible explanation of what the Denouncement actually
+/// is -- Dalton's own explicit instruction ("add an explanation for the
+/// Denouncement process"). Matches rules.md §5's own in-fiction framing
+/// ("never called an execution or a vote... nominating someone is laying
+/// a calling card against them") rather than inventing new terminology.
+const DENOUNCEMENT_EXPLANATION: &str = "The room privately nominates who they suspect (\"laying a calling card\"), the top few names are surfaced for discussion, then everyone votes. Whoever's Cast Out is unmasked and sent to sit with the Servants -- but the room is never told why, or which side they were really on.";
+
 #[component]
 fn DenouncementPanel(
     my_id: PlayerId,
@@ -2252,7 +2303,10 @@ fn DenouncementPanel(
     on_command: EventHandler<Command>,
 ) -> Element {
     let Some(phase) = denouncement else {
-        return rsx! { p { "No Denouncement in progress." } };
+        return rsx! {
+            p { "No Denouncement in progress." }
+            p { class: "field-description", "{DENOUNCEMENT_EXPLANATION}" }
+        };
     };
     // A review found the Ballot and Runoff phases rendered identically
     // (same "Ballot" heading, same copy) -- a player who voted in a first
@@ -2268,7 +2322,7 @@ fn DenouncementPanel(
         .collect();
     active_others.sort_by(|a, b| a.name.cmp(&b.name));
 
-    match phase {
+    let phase_panel = match phase {
         DenouncementView::Nomination { i_have_acted } => {
             let mut pick = use_signal(|| None::<u32>);
             let options = active_others.clone();
@@ -2345,6 +2399,11 @@ fn DenouncementPanel(
                 }
             }
         }
+    };
+
+    rsx! {
+        p { class: "field-description", "{DENOUNCEMENT_EXPLANATION}" }
+        {phase_panel}
     }
 }
 
@@ -3066,6 +3125,7 @@ fn CreativeEntryForm(
 
     match kind {
         CreativityKind::Drawing => rsx! {
+            p { class: "field-description", "{creativity_kind_description(kind)}" }
             DrawingCanvas {
                 on_submit: move |data_url| {
                     on_command.call(Command::SubmitCreativeEntry {
@@ -3076,21 +3136,37 @@ fn CreativeEntryForm(
                 }
             }
         },
-        CreativityKind::Joke | CreativityKind::Smut => rsx! {
+        CreativityKind::Joke => rsx! {
+            p { class: "field-description", "{creativity_kind_description(kind)}" }
             input {
-                placeholder: if kind == CreativityKind::Joke { "Your joke" } else { "Your scene" },
+                placeholder: "Your joke",
+                value: "{text}",
+                oninput: move |e| text.set(e.value()),
+            }
+            button { onclick: move |_| submit(), "Submit" }
+        },
+        CreativityKind::Smut => rsx! {
+            p { class: "field-description", "{creativity_kind_description(kind)}" }
+            textarea {
+                class: "paragraph-box",
+                placeholder: "Your scene",
+                rows: 8,
                 value: "{text}",
                 oninput: move |e| text.set(e.value()),
             }
             button { onclick: move |_| submit(), "Submit" }
         },
         CreativityKind::Dictionarium => rsx! {
+            p { class: "field-description", "{creativity_kind_description(kind)}" }
+            label { "Word:" }
             input { placeholder: "Your new word", value: "{word}", oninput: move |e| word.set(e.value()) }
+            label { "Definition:" }
             input {
                 placeholder: "Definition",
                 value: "{definition}",
                 oninput: move |e| definition.set(e.value()),
             }
+            label { "Example sentence:" }
             input {
                 placeholder: "Example sentence",
                 value: "{example}",
@@ -3098,6 +3174,28 @@ fn CreativeEntryForm(
             }
             button { onclick: move |_| submit(), "Submit" }
         },
+    }
+}
+
+/// A short, plain-language instruction shown above each Creativity kind's
+/// write form -- Dalton's own explicit instruction ("give a short
+/// description of what they should do"), since the round's own `prompt`
+/// text alone doesn't say *how* to respond to it (write vs. draw vs.
+/// invent a word).
+fn creativity_kind_description(kind: CreativityKind) -> &'static str {
+    match kind {
+        CreativityKind::Drawing => {
+            "Draw whatever the prompt describes. Once time's up, everyone rates every drawing 1-5 stars."
+        }
+        CreativityKind::Joke => {
+            "Write a short, funny joke on the theme above. Once time's up, everyone rates every joke 1-5 stars."
+        }
+        CreativityKind::Dictionarium => {
+            "Invent a brand-new word, write its definition, and use it in an example sentence. Once time's up, everyone rates every word 1-5 stars."
+        }
+        CreativityKind::Smut => {
+            "Write a short, steamy scene on the theme above. Once time's up, everyone rates every scene 1-5 stars."
+        }
     }
 }
 
@@ -3117,8 +3215,8 @@ fn CreativeEntryDisplay(entry: CreativeEntry) -> Element {
             },
             CreativeEntry::Dictionarium { word, definition, example } => rsx! {
                 p { strong { "{word}" } }
-                p { "{definition}" }
-                p { em { "{example}" } }
+                p { "Definition: " em { "{definition}" } }
+                p { "Example: " em { "{example}" } }
             },
         }
     }

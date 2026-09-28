@@ -276,6 +276,41 @@ strong {
   color: var(--color-bg-card);
 }
 
+/* A Round/Game-tab-relevant update arrived while the player was looking
+ * at a different tab -- Dalton's own explicit instruction ("make the
+ * button flash"). Stops once they actually switch to that tab. */
+.tab-nav .tab-flash {
+  animation: tab-flash-pulse 1s ease-in-out infinite;
+}
+
+@keyframes tab-flash-pulse {
+  0%,
+  100% {
+    background: var(--color-accent-light);
+  }
+  50% {
+    background: var(--color-bg-card);
+  }
+}
+
+/* A short "what am I supposed to do here" instruction above a Creativity
+ * write form -- distinct from ordinary body text so it reads as a hint,
+ * not a status line. */
+.field-description {
+  font-style: italic;
+  color: var(--color-primary-dark);
+  margin-bottom: 0.4rem;
+}
+
+/* Smut-acular's write box -- a real scene deserves more than a single-line
+ * input. */
+.paragraph-box {
+  width: 100%;
+  font-family: inherit;
+  font-size: inherit;
+  resize: vertical;
+}
+
 /* Every "something went wrong" message shares this class now instead of
  * an inline `color:red` -- plain red on this theme's parchment background
  * measures well under WCAG AA contrast, exactly the text a confused host

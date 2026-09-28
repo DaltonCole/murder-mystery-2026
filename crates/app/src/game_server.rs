@@ -1535,10 +1535,7 @@ fn round_four_steps(category: ContestCategory) -> Vec<(String, OpenMinigameDetai
                 CreativityKind::Dictionarium,
                 "Invent a Bridgerton-themed word!",
             ),
-            (
-                CreativityKind::Smut,
-                "Write a short Bridgerton-themed scene!",
-            ),
+            (CreativityKind::Smut, "Write a short smut scene!"),
         ]
         .into_iter()
         .map(|(kind, prompt)| (prompt.to_string(), OpenMinigameDetail::Creativity(kind)))
