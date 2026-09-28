@@ -942,6 +942,26 @@ pub fn minigame_timer_states() -> Vec<crate::MinigameTimer> {
         .collect()
 }
 
+/// Round 4's category-choice window countdown, if one is currently open
+/// -- `ServerMsg::CategoryChoiceTimer`'s data source, the same shape as
+/// `minigame_timer_states` but for the one room-wide window rather than a
+/// per-category deadline.
+pub fn category_choice_timer_state() -> Option<(Round, crate::TimerState)> {
+    let (round, deadline) = server()
+        .category_choice_deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .copied()?;
+    Some((
+        round,
+        crate::TimerState {
+            remaining_secs: deadline.saturating_duration_since(Instant::now()).as_secs() as i64,
+            total_secs: CATEGORY_CHOICE_WINDOW_SECS as u32,
+        },
+    ))
+}
+
 /// Arms/clears this module's own wall-clock bookkeeping in response to
 /// whatever `events` a just-applied command produced -- same "scan the
 /// just-applied events" shape as `auto_push_on_round_advance`, but writes

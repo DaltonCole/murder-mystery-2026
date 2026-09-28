@@ -230,6 +230,11 @@ enum ClientMsg {
     /// randomly-drawn physical challenge description -- see
     /// `game_server::open_physical_session`'s doc comment.
     OpenPhysicalSession { round: Round },
+    /// `/host` only: force-closes Round 4's category-choice window right
+    /// now, ahead of its own 45s timer -- mirrors
+    /// `ForceAdvanceCreativeWriting`'s own "always keep a manual escape
+    /// hatch" reasoning. See `game_server::force_close_category_choice_window`.
+    ForceCloseCategoryChoiceWindow,
 }
 
 /// A running timer's remaining and total duration -- enough for
@@ -293,6 +298,12 @@ enum ServerMsg {
     /// nothing structurally forbids more than one round's session being
     /// open at the same time.
     MinigameTimers(Vec<MinigameTimer>),
+    /// Round 4's category-choice window countdown, if one is currently
+    /// open -- sent alongside `Timer`/`MinigameTimers` on the same
+    /// occasions. `None` outside the window (before it opens, or once
+    /// every category's 3-game track has started). See `game_server::
+    /// category_choice_timer_state`'s doc comment.
+    CategoryChoiceTimer(Option<(Round, TimerState)>),
     /// `/host` only, direct reply to `ClientMsg::HostLogin`: whether the
     /// submitted passphrase was correct.
     HostLoginResult {
@@ -479,7 +490,13 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                             .send(ServerMsg::MinigameTimers(game_server::minigame_timer_states()))
                             .await
                             .is_ok();
-                        sent_view && sent_minigame_timers
+                        let sent_category_choice_timer = socket
+                            .send(ServerMsg::CategoryChoiceTimer(
+                                game_server::category_choice_timer_state(),
+                            ))
+                            .await
+                            .is_ok();
+                        sent_view && sent_minigame_timers && sent_category_choice_timer
                     }
                     Err(e) => socket
                         .send(ServerMsg::Failed { error: e.to_string() })
@@ -531,6 +548,12 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                         && socket
                                             .send(ServerMsg::MinigameTimers(
                                                 game_server::minigame_timer_states(),
+                                            ))
+                                            .await
+                                            .is_ok()
+                                        && socket
+                                            .send(ServerMsg::CategoryChoiceTimer(
+                                                game_server::category_choice_timer_state(),
                                             ))
                                             .await
                                             .is_ok()
@@ -594,11 +617,18 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                     ))
                                     .await
                                     .is_ok();
+                                let sent_category_choice_timer = socket
+                                    .send(ServerMsg::CategoryChoiceTimer(
+                                        game_server::category_choice_timer_state(),
+                                    ))
+                                    .await
+                                    .is_ok();
                                 sent_view
                                     && sent_templates
                                     && sent_banned
                                     && sent_timer
                                     && sent_minigame_timers
+                                    && sent_category_choice_timer
                             }
                         }
                         ClientMsg::Do(cmd) => {
@@ -646,6 +676,13 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                         ClientMsg::OpenPhysicalSession { round } => {
                             if is_host_authed {
                                 respond!(game_server::open_physical_session(round))
+                            } else {
+                                reject!("host login required")
+                            }
+                        }
+                        ClientMsg::ForceCloseCategoryChoiceWindow => {
+                            if is_host_authed {
+                                respond!(game_server::force_close_category_choice_window())
                             } else {
                                 reject!("host login required")
                             }
@@ -788,6 +825,16 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                     {
                         break;
                     }
+                    // Same reasoning, for Round 4's category-choice window.
+                    if socket
+                        .send(ServerMsg::CategoryChoiceTimer(
+                            game_server::category_choice_timer_state(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -843,6 +890,7 @@ fn Play() -> Element {
     let mut name_draft = use_signal(String::new);
     let mut timer = use_signal(|| None::<TimerState>);
     let mut minigame_timers = use_signal(Vec::<MinigameTimer>::new);
+    let mut category_choice_timer = use_signal(|| None::<(Round, TimerState)>);
     // The story-driven transition banner (Dalton's own explicit instruction:
     // something like "the party goers become restless..." between rounds,
     // "more on theme and elegant") -- entirely client-side, no new server
@@ -898,6 +946,7 @@ fn Play() -> Element {
                 ) => {}
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
                 Ok(ServerMsg::MinigameTimers(timers)) => minigame_timers.set(timers),
+                Ok(ServerMsg::CategoryChoiceTimer(t)) => category_choice_timer.set(t),
                 Err(_) => break,
             }
         }
@@ -1135,7 +1184,46 @@ fn Play() -> Element {
                 // `game_server::auto_close_tasks_on_denouncement_open_or_even_round`
                 // already makes sure are closed and gone from
                 // `open_tasks` by the time a round actually reaches here).
-                if matches!(v.current_round, Round::Two | Round::Four) {
+                if v.current_round == Round::Four {
+                    if let Some(category) = v.my_contest_category_choice {
+                        p { "You're competing in {category:?} this round." }
+                        ContestMinigamePanel {
+                            my_id: id,
+                            sessions: v
+                                .open_contest_minigames
+                                .iter()
+                                .cloned()
+                                .filter(|s| s.category == category)
+                                .collect::<Vec<_>>(),
+                            on_command: send_cmd,
+                            minigame_timers: minigame_timers(),
+                        }
+                    } else if let Some((_, state)) = category_choice_timer() {
+                        p { "Choose which category to compete in this round -- choose wisely, once picked you can't switch." }
+                        ProgressBarFill { state }
+                        div {
+                            for category in [
+                                ContestCategory::Creativity,
+                                ContestCategory::Intelligence,
+                                ContestCategory::Strength,
+                            ] {
+                                button {
+                                    key: "{category:?}",
+                                    onclick: move |_| {
+                                        send_cmd(Command::ChooseContestCategory {
+                                            player: id,
+                                            round: Round::Four,
+                                            category,
+                                        });
+                                    },
+                                    "{category:?}",
+                                }
+                            }
+                        }
+                    } else {
+                        p { "You didn't choose a category this round." }
+                    }
+                } else if v.current_round == Round::Two {
                     ContestMinigamePanel {
                         my_id: id,
                         sessions: v.open_contest_minigames.clone(),
@@ -3398,6 +3486,7 @@ fn Host() -> Element {
     let mut banned_task_prompts: Signal<Vec<String>> = use_signal(Vec::new);
     let mut timer = use_signal(|| None::<TimerState>);
     let mut minigame_timers = use_signal(Vec::<MinigameTimer>::new);
+    let mut category_choice_timer = use_signal(|| None::<(Round, TimerState)>);
     // Gates the whole console behind `game_server::check_host_password` --
     // the server itself now enforces this too (`command_authorized`/the
     // `Watch`/`ViewPlayer`/etc. checks in `game_ws`), not just this UI
@@ -3440,6 +3529,7 @@ fn Host() -> Element {
                 }
                 Ok(ServerMsg::Timer(remaining)) => timer.set(remaining),
                 Ok(ServerMsg::MinigameTimers(timers)) => minigame_timers.set(timers),
+                Ok(ServerMsg::CategoryChoiceTimer(t)) => category_choice_timer.set(t),
                 Ok(ServerMsg::ViewedPlayer(v)) => viewed_player.set(v),
                 Ok(ServerMsg::BannedTaskPrompts(prompts)) => banned_task_prompts.set(prompts),
                 Ok(ServerMsg::HostLoginResult { ok }) => {
@@ -3555,6 +3645,13 @@ fn Host() -> Element {
             let _ = socket.send(ClientMsg::OpenPhysicalSession { round }).await;
         });
     };
+    let mut force_close_category_choice_window = move || {
+        let socket = socket;
+        error.set(None);
+        spawn(async move {
+            let _ = socket.send(ClientMsg::ForceCloseCategoryChoiceWindow).await;
+        });
+    };
     let start_timer = move |seconds: u32| {
         let socket = socket;
         spawn(async move {
@@ -3651,6 +3748,7 @@ fn Host() -> Element {
     let denouncement_phase = view().and_then(|v| v.denouncement);
     let open_tasks = view().map(|v| v.open_tasks).unwrap_or_default();
     let contest_results = view().map(|v| v.contest_results).unwrap_or_default();
+    let contest_round_winners = view().map(|v| v.contest_round_winners).unwrap_or_default();
     let open_contest_minigames = view().map(|v| v.open_contest_minigames).unwrap_or_default();
     let winner = view().and_then(|v| v.winner);
     let task_candidates = view().map(|v| v.task_candidates).unwrap_or_default();
@@ -4011,12 +4109,22 @@ fn Host() -> Element {
         if host_page() == HostPage::Contests {
         div {
             h3 { "Contest rounds (Round 2 & 4)" }
-            p { "Creativity and Intelligence run as real in-app mini-games; Strength is judged live in person, with each participant self-reporting their own placement in-app (never a \"Ton vs the room\" vote -- players aren't supposed to know who's on which side). \"Record result\" below stays as a manual fallback." }
+            p { "Creativity and Intelligence run as real in-app mini-games; Strength is judged live in person, with each participant self-reporting their own placement in-app (never a \"Ton vs the room\" vote -- players aren't supposed to know who's on which side). Both rounds now run fully automatically -- the controls below are a manual fallback, not the normal path." }
             p {
                 if contest_round() == Round::Two {
-                    "Round 2: the whole room competes together, one category at a time."
+                    "Round 2: fully automatic the instant the round begins -- Drawing, then Trivia, then a push-up contest, each closing itself and opening the next with no click needed."
                 } else {
-                    "Round 4: 3 simultaneous zones, one per category -- open all three sessions at once and let players self-select which zone they're in by which one they submit to."
+                    "Round 4: a 45-second category-choice window opens automatically the instant the round begins; once it closes, all three categories' 3-game tracks start simultaneously. A player's choice is locked and enforced -- they can only submit to the category they chose."
+                }
+            }
+            if let Some((round, state)) = category_choice_timer() {
+                div {
+                    p { "Round {round:?}'s category-choice window is open." }
+                    ProgressBarFill { state }
+                    button {
+                        onclick: move |_| force_close_category_choice_window(),
+                        "Force-close the choice window now",
+                    }
                 }
             }
             select {
@@ -4190,6 +4298,9 @@ fn Host() -> Element {
                         li {
                             key: "{session.round:?}-{session.category:?}",
                             "{session.round:?} / {session.category:?}: \"{session.prompt}\" -- {session.submission_count} submitted"
+                            if let Some((step, total)) = session.sequence_progress {
+                                " (step {step} of {total})"
+                            }
                             if session.is_wordle {
                                 if let Some(answer) = &session.answer {
                                     " (answer: {answer})"
@@ -4292,6 +4403,22 @@ fn Host() -> Element {
                                     key: "{round:?}-{category:?}",
                                     "{round:?} / {category:?}: {winner} won"
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+            h4 { "Round outcomes" }
+            p { "Majority of that round's 3 categories (2 out of 3) -- host-only self-audit, players never see this." }
+            if contest_round_winners.is_empty() {
+                p { "No round fully decided yet." }
+            } else {
+                ul {
+                    for (round , ton_won) in contest_round_winners.clone() {
+                        {
+                            let winner = if ton_won { "Ton" } else { "Uprising" };
+                            rsx! {
+                                li { key: "{round:?}", "{round:?}: {winner} wins the round" }
                             }
                         }
                     }
@@ -4563,7 +4690,8 @@ fn Display() -> Element {
                     | ServerMsg::HostLoginResult { .. }
                     | ServerMsg::ViewedPlayer(_)
                     | ServerMsg::BannedTaskPrompts(_)
-                    | ServerMsg::MinigameTimers(_),
+                    | ServerMsg::MinigameTimers(_)
+                    | ServerMsg::CategoryChoiceTimer(_),
                 ) => {}
                 // See the identical comment in `Host` -- without this, a
                 // closed connection spins this loop forever with no yield.

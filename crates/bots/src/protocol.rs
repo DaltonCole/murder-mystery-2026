@@ -84,6 +84,12 @@ pub enum ServerMsg {
     /// parse, for the same "protocol drift fails loudly" reason as
     /// `BannedTaskPrompts` below.
     MinigameTimers(Vec<MinigameTimer>),
+    /// Mirrors `app`'s own `ServerMsg::CategoryChoiceTimer` -- Round 4's
+    /// category-choice window countdown. This crate never acts on it
+    /// either (bots don't exercise Round 4's category choice, only
+    /// `RecordContestResult`), but it still has to parse, for the same
+    /// "protocol drift fails loudly" reason as `MinigameTimers` above.
+    CategoryChoiceTimer(Option<(Round, TimerState)>),
     /// Mirrors `app`'s own `ServerMsg::HostLoginResult` -- the direct reply
     /// to `ClientMsg::HostLogin`, which `Conn::host_login` now sends and
     /// waits for.
@@ -269,6 +275,7 @@ impl Conn {
                 Some(ServerMsg::LocationTaskTemplates(_)) => {}
                 Some(ServerMsg::Timer(_)) => {}
                 Some(ServerMsg::MinigameTimers(_)) => {}
+                Some(ServerMsg::CategoryChoiceTimer(_)) => {}
                 Some(ServerMsg::HostLoginResult { .. }) => {}
                 Some(ServerMsg::ViewedPlayer(_)) => {}
                 Some(ServerMsg::BannedTaskPrompts(_)) => {}
@@ -293,6 +300,7 @@ impl Conn {
                 Some(ServerMsg::LocationTaskTemplates(_)) => continue,
                 Some(ServerMsg::Timer(_)) => continue,
                 Some(ServerMsg::MinigameTimers(_)) => continue,
+                Some(ServerMsg::CategoryChoiceTimer(_)) => continue,
                 Some(ServerMsg::HostLoginResult { .. }) => continue,
                 Some(ServerMsg::ViewedPlayer(_)) => continue,
                 Some(ServerMsg::BannedTaskPrompts(_)) => continue,
@@ -311,6 +319,7 @@ impl Conn {
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
                 | Some(ServerMsg::MinigameTimers(_))
+                | Some(ServerMsg::CategoryChoiceTimer(_))
                 | Some(ServerMsg::HostLoginResult { .. })
                 | Some(ServerMsg::ViewedPlayer(_))
                 | Some(ServerMsg::BannedTaskPrompts(_)) => continue,
@@ -334,6 +343,7 @@ impl Conn {
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
                 | Some(ServerMsg::MinigameTimers(_))
+                | Some(ServerMsg::CategoryChoiceTimer(_))
                 | Some(ServerMsg::HostLoginResult { .. })
                 | Some(ServerMsg::ViewedPlayer(_))
                 | Some(ServerMsg::BannedTaskPrompts(_)) => continue,
@@ -364,6 +374,7 @@ impl Conn {
                 | Some(ServerMsg::LocationTaskTemplates(_))
                 | Some(ServerMsg::Timer(_))
                 | Some(ServerMsg::MinigameTimers(_))
+                | Some(ServerMsg::CategoryChoiceTimer(_))
                 | Some(ServerMsg::ViewedPlayer(_))
                 | Some(ServerMsg::BannedTaskPrompts(_)) => continue,
                 None => return Err(ConnError::ClosedEarly),
