@@ -82,8 +82,8 @@ fn bio_detail(bio: Option<&Bio>, id: PlayerId) -> String {
     .map(String::as_str)
     .filter(|s| !s.trim().is_empty())
     .collect();
-    let Some(&detail) = filled
-        .get((id.0 as usize / CAST_OUT_TEMPLATES.len()) % filled.len().max(1))
+    let Some(&detail) =
+        filled.get((id.0 as usize / CAST_OUT_TEMPLATES.len()) % filled.len().max(1))
     else {
         return "a reputation this author has yet to properly uncover".to_string();
     };
