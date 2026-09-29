@@ -297,3 +297,19 @@ pub enum GameError {
         category: ContestCategory,
     },
 }
+
+/// Shared "reject an over-length free-text field" check behind every
+/// client-suppliable string this engine caps for reliability -- see
+/// `GameError::FieldTooLong`'s own doc comment for why this is one generic
+/// rejection rather than a bespoke one per field. Every caller that used to
+/// inline `let len = value.chars().count(); if len > max { return
+/// Err(FieldTooLong { .. }) }` by hand (a player's name, a task prompt, a
+/// location task's code, a Bio field, a contest mini-game entry) should call
+/// this instead.
+pub(crate) fn check_len(field: &'static str, value: &str, max: usize) -> Result<(), GameError> {
+    let len = value.chars().count();
+    if len > max {
+        return Err(GameError::FieldTooLong { field, len, max });
+    }
+    Ok(())
+}

@@ -2258,14 +2258,7 @@ fn close_runoff(
 }
 
 fn add_player(state: &mut GameState, name: String) -> Result<Vec<DomainEvent>, GameError> {
-    let len = name.chars().count();
-    if len > crate::player::MAX_PLAYER_NAME_LEN {
-        return Err(GameError::FieldTooLong {
-            field: "player name",
-            len,
-            max: crate::player::MAX_PLAYER_NAME_LEN,
-        });
-    }
+    crate::error::check_len("player name", &name, crate::player::MAX_PLAYER_NAME_LEN)?;
     if state.players.len() >= crate::player::MAX_PLAYERS {
         return Err(GameError::TooManyPlayers {
             max: crate::player::MAX_PLAYERS,
@@ -2296,23 +2289,13 @@ fn push_task(
     qualifying_players: BTreeSet<PlayerId>,
     expected_code: Option<String>,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    let prompt_len = prompt.chars().count();
-    if prompt_len > crate::task::MAX_TASK_PROMPT_LEN {
-        return Err(GameError::FieldTooLong {
-            field: "task prompt",
-            len: prompt_len,
-            max: crate::task::MAX_TASK_PROMPT_LEN,
-        });
-    }
+    crate::error::check_len("task prompt", &prompt, crate::task::MAX_TASK_PROMPT_LEN)?;
     if let Some(code) = &expected_code {
-        let code_len = code.chars().count();
-        if code_len > crate::task::MAX_LOCATION_CODE_LEN {
-            return Err(GameError::FieldTooLong {
-                field: "location task code",
-                len: code_len,
-                max: crate::task::MAX_LOCATION_CODE_LEN,
-            });
-        }
+        crate::error::check_len(
+            "location task code",
+            code,
+            crate::task::MAX_LOCATION_CODE_LEN,
+        )?;
     }
 
     let id = TaskId(state.next_task_id);
@@ -3206,14 +3189,11 @@ fn attempt_location_task(
     if state.task_attempts.contains_key(&(player, task)) {
         return Err(GameError::AlreadyAttemptedTask { player, task });
     }
-    let code_len = code.chars().count();
-    if code_len > crate::task::MAX_LOCATION_CODE_LEN {
-        return Err(GameError::FieldTooLong {
-            field: "location task code guess",
-            len: code_len,
-            max: crate::task::MAX_LOCATION_CODE_LEN,
-        });
-    }
+    crate::error::check_len(
+        "location task code guess",
+        &code,
+        crate::task::MAX_LOCATION_CODE_LEN,
+    )?;
 
     let credited = code.trim().eq_ignore_ascii_case(expected.trim());
     let credited = apply_normal_ton_auto_succeed(state, player, credited);

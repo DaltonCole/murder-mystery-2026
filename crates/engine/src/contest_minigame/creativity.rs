@@ -221,15 +221,7 @@ impl CreativityPayload {
 }
 
 pub(crate) fn check_entry_len(field: &'static str, text: &str) -> Result<(), GameError> {
-    let len = text.chars().count();
-    if len > MAX_CONTEST_ENTRY_LEN {
-        return Err(GameError::FieldTooLong {
-            field,
-            len,
-            max: MAX_CONTEST_ENTRY_LEN,
-        });
-    }
-    Ok(())
+    crate::error::check_len(field, text, MAX_CONTEST_ENTRY_LEN)
 }
 
 pub(crate) fn check_drawing(data_url: &str) -> Result<(), GameError> {

@@ -284,17 +284,12 @@ pub(crate) fn resolve_ton_won(state: &GameState, scores: &[(PlayerId, i64)], top
 }
 
 /// Shared length cap check for a session's `prompt` -- see
-/// `MAX_CONTEST_ENTRY_LEN`'s doc comment.
+/// `MAX_CONTEST_ENTRY_LEN`'s doc comment. Same underlying check as every
+/// other capped free-text field (`crate::error::check_len`); kept as its
+/// own named function since "contest mini-game prompt" is baked into every
+/// call site otherwise.
 pub(crate) fn check_prompt_len(prompt: &str) -> Result<(), GameError> {
-    let len = prompt.chars().count();
-    if len > MAX_CONTEST_ENTRY_LEN {
-        return Err(GameError::FieldTooLong {
-            field: "contest mini-game prompt",
-            len,
-            max: MAX_CONTEST_ENTRY_LEN,
-        });
-    }
-    Ok(())
+    creativity::check_entry_len("contest mini-game prompt", prompt)
 }
 
 /// rules.md §4: contests only ever run in Round 2 or Round 4 -- the same
