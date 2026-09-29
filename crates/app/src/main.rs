@@ -542,6 +542,34 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
             };
         }
 
+        // Sends the round `Timer`, the Creativity `MinigameTimers`
+        // countdowns, and Round 4's `CategoryChoiceTimer` window, in that
+        // order -- the exact trio a `Join`, a `Watch` switch, and the idle
+        // "something changed" tick all need a fresh snapshot of. A macro
+        // (not a function), same reasoning as `respond!`/`reject!` above:
+        // it needs to reach `socket` directly without spelling out this
+        // connection's concrete, unnameable websocket type. Evaluates to
+        // `true` only if every send succeeded, short-circuiting on the
+        // first failure exactly like the inlined `&&` chains it replaces.
+        macro_rules! send_timer_trio {
+            () => {
+                socket
+                    .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
+                    .await
+                    .is_ok()
+                    && socket
+                        .send(ServerMsg::MinigameTimers(game_server::minigame_timer_states()))
+                        .await
+                        .is_ok()
+                    && socket
+                        .send(ServerMsg::CategoryChoiceTimer(
+                            game_server::category_choice_timer_state(),
+                        ))
+                        .await
+                        .is_ok()
+            };
+        }
+
         loop {
             tokio::select! {
                 incoming = socket.recv() => {
@@ -563,22 +591,7 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                             .send(ServerMsg::View(game_server::view(Viewer::Player(id))))
                                             .await
                                             .is_ok()
-                                        && socket
-                                            .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
-                                            .await
-                                            .is_ok()
-                                        && socket
-                                            .send(ServerMsg::MinigameTimers(
-                                                game_server::minigame_timer_states(),
-                                            ))
-                                            .await
-                                            .is_ok()
-                                        && socket
-                                            .send(ServerMsg::CategoryChoiceTimer(
-                                                game_server::category_choice_timer_state(),
-                                            ))
-                                            .await
-                                            .is_ok()
+                                        && send_timer_trio!()
                                 }
                                 Err(e) => socket
                                     .send(ServerMsg::Failed { error: e.to_string() })
@@ -629,28 +642,8 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                                 } else {
                                     true
                                 };
-                                let sent_timer = socket
-                                    .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
-                                    .await
-                                    .is_ok();
-                                let sent_minigame_timers = socket
-                                    .send(ServerMsg::MinigameTimers(
-                                        game_server::minigame_timer_states(),
-                                    ))
-                                    .await
-                                    .is_ok();
-                                let sent_category_choice_timer = socket
-                                    .send(ServerMsg::CategoryChoiceTimer(
-                                        game_server::category_choice_timer_state(),
-                                    ))
-                                    .await
-                                    .is_ok();
-                                sent_view
-                                    && sent_templates
-                                    && sent_banned
-                                    && sent_timer
-                                    && sent_minigame_timers
-                                    && sent_category_choice_timer
+                                let sent_timers = send_timer_trio!();
+                                sent_view && sent_templates && sent_banned && sent_timers
                             }
                         }
                         ClientMsg::Do(cmd) => {
@@ -827,34 +820,13 @@ async fn game_ws(options: WebSocketOptions) -> Result<Websocket<ClientMsg, Serve
                             break;
                         }
                     }
-                    // Keeps the round timer display live for everyone even
+                    // Keeps the round timer, a Creativity session's own
+                    // Writing/Rating phase countdown, and Round 4's
+                    // category-choice window all live for everyone even
                     // when the only thing that happened was the ticker's
                     // own once-a-second nudge (`game_server::ensure_ticker_running`)
                     // -- harmless to send on every other kind of change too.
-                    if socket
-                        .send(ServerMsg::Timer(game_server::timer_remaining_secs()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    // Same reasoning, for a Creativity session's own
-                    // Writing/Rating phase countdown.
-                    if socket
-                        .send(ServerMsg::MinigameTimers(game_server::minigame_timer_states()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    // Same reasoning, for Round 4's category-choice window.
-                    if socket
-                        .send(ServerMsg::CategoryChoiceTimer(
-                            game_server::category_choice_timer_state(),
-                        ))
-                        .await
-                        .is_err()
-                    {
+                    if !send_timer_trio!() {
                         break;
                     }
                 }
