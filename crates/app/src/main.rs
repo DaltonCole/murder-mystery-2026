@@ -373,11 +373,34 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
         | Command::StartContestSequence { .. }
         | Command::DrawIntermissionEntrants { .. }
         | Command::AwardServantPoints { .. }
-        | Command::ResolveGalleryPredictions { .. } => None,
+        | Command::ResolveGalleryPredictions { .. }
+        // Both of these carry a field that must come from real,
+        // server-rolled randomness, never a client-supplied value --
+        // `TransferKingQueen`'s `new_holder` (rules.md: "the title passes
+        // to a *random* remaining Ton player") and `BartenderTarget`'s
+        // `lands` (Dalton's own explicit instruction: "for any character
+        // involving randomness, the engine decides it, never the player").
+        // The *real* self-service entry points for these two abilities are
+        // the dedicated `ClientMsg::TransferKingQueen`/`BartenderTarget`
+        // messages below, which carry no such field at all and call
+        // `game_server::transfer_king_queen_randomly`/
+        // `bartender_target_randomly` to roll it server-side. Putting the
+        // raw `Command` variants in the `Some(*player)` bucket instead (as
+        // they used to be) let a King/Queen or Bartender bypass that
+        // entirely by sending `Do(Command::TransferKingQueen { new_holder:
+        // <their own pick>, .. })` / `Do(Command::BartenderTarget { lands:
+        // true, .. })` directly -- a real hole this same 2026-09-25 security
+        // review should have caught alongside the actor-identity check
+        // above, the same "asymmetric with `RecordQuizElapsedTime`/
+        // `RecordWordleElapsedTime`" gap those two variants were already
+        // correctly guarded against. `None` here means only the Host can
+        // reach them through the raw `Do` path -- which is harmless, since
+        // the Host is already trusted for everything.
+        | Command::TransferKingQueen { .. }
+        | Command::BartenderTarget { .. } => None,
 
         Command::SubmitInterestLevel { player, .. }
         | Command::SubmitBio { player, .. }
-        | Command::TransferKingQueen { player, .. }
         | Command::AttemptTask { player, .. }
         | Command::AttemptLocationTask { player, .. }
         | Command::UseOracle { player, .. }
@@ -387,7 +410,6 @@ fn command_actor(cmd: &Command) -> Option<PlayerId> {
         | Command::SetDeceiverArmed { player, .. }
         | Command::PriestProtect { player, .. }
         | Command::MedicProtect { player, .. }
-        | Command::BartenderTarget { player, .. }
         | Command::ActivatePotionImmunity { player, .. }
         | Command::ActivateDoubleVote { player }
         | Command::DuelistChallenge { player, .. }

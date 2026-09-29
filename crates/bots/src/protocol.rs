@@ -35,6 +35,25 @@ pub enum ClientMsg {
     HostLogin {
         password: String,
     },
+    /// Mirrors `app`'s own `ClientMsg::TransferKingQueen` -- the King/Queen's
+    /// crown-transfer ability. Not a plain `Command::TransferKingQueen`
+    /// (`Do`): a security review found the raw `Command` variant carries a
+    /// `new_holder` field that must come from real, server-rolled
+    /// randomness (rules.md: "a *random* remaining Ton player"), so
+    /// `app::main::command_actor` now routes it to Host-only, and this is
+    /// the actual self-service entry point every bot must use instead.
+    TransferKingQueen {
+        player: PlayerId,
+    },
+    /// Mirrors `app`'s own `ClientMsg::BartenderTarget` -- the Bartender's
+    /// ability. Same reasoning as `TransferKingQueen` above: the raw
+    /// `Command::BartenderTarget`'s `lands` field must be a real server
+    /// coin flip, never player-supplied, so this carries no `lands` field
+    /// at all; the server rolls it.
+    BartenderTarget {
+        player: PlayerId,
+        target: PlayerId,
+    },
 }
 
 /// Mirrors `app`'s own `TimerState` -- see `ServerMsg::Timer`'s doc

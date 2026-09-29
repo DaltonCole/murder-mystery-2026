@@ -435,13 +435,18 @@ impl PlayerBot {
         }
         if a.bartender_available == Some(true) {
             if let Some(target) = active_others(&view.roster, self.id).choose(&mut self.rng) {
-                let lands = self.rng.random_range(0..2) == 0;
-                self.send(Command::BartenderTarget {
-                    player: self.id,
-                    target: target.id,
-                    lands,
-                })
-                .await?;
+                // Not the raw `Command::BartenderTarget` (`Do`) -- its
+                // `lands` field must be a real server coin flip, never
+                // player-supplied (see `app::main::command_actor`'s doc
+                // comment), so this goes through the dedicated
+                // `ClientMsg::BartenderTarget`, the same self-service entry
+                // point a real `/play` connection uses.
+                self.conn
+                    .send(&ClientMsg::BartenderTarget {
+                        player: self.id,
+                        target: target.id,
+                    })
+                    .await?;
             }
         }
         if a.potion_maker_available == Some(true) {
@@ -485,13 +490,17 @@ impl PlayerBot {
             && view.current_round < Round::Five
             && self.transfer_king_queen_attempts < MAX_BLIND_ATTEMPTS
         {
-            if let Some(target) = active_others(&view.roster, self.id).choose(&mut self.rng) {
+            // Not the raw `Command::TransferKingQueen` (`Do`) -- its
+            // `new_holder` field must be a real server-random pick, never
+            // player-supplied (rules.md: "a *random* remaining Ton
+            // player"; see `app::main::command_actor`'s doc comment), so
+            // there's no target to guess here at all -- just whether
+            // there's anyone else left to receive the crown.
+            if !active_others(&view.roster, self.id).is_empty() {
                 self.transfer_king_queen_attempts += 1;
-                self.send(Command::TransferKingQueen {
-                    player: self.id,
-                    new_holder: target.id,
-                })
-                .await?;
+                self.conn
+                    .send(&ClientMsg::TransferKingQueen { player: self.id })
+                    .await?;
             }
         }
 
