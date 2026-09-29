@@ -59,15 +59,38 @@ const CAST_OUT_TEMPLATES: [&str; 4] = [
 /// true faction/role. Falls back to a deliberately vague, detail-free
 /// phrase if they never submitted a bio at all (e.g. a very late-arriving
 /// Servant) -- still grammatical wherever `{detail}` appears in a template.
+///
+/// Picks only from that category's *filled-in* entries: `bio::
+/// MIN_CATEGORY_ENTRIES` only guarantees at least 3 of 5 slots are
+/// non-blank, so a raw positional index into the fixed 5-slot array (this
+/// function's original behavior) could land on a blank slot and produce a
+/// broken sentence like "an enthusiasm for " on a shared screen in front of
+/// the whole room -- a real, likely-to-trigger bug given most players will
+/// fill in only the required minimum. Filtering to non-empty entries first
+/// keeps the same deterministic, no-caller-randomness selection while
+/// guaranteeing a real value always lands in `{detail}`.
 fn bio_detail(bio: Option<&Bio>, id: PlayerId) -> String {
     let Some(bio) = bio else {
         return "a reputation this author has yet to properly uncover".to_string();
     };
-    let index = (id.0 as usize / CAST_OUT_TEMPLATES.len()) % 5;
-    match id.0 as usize % 3 {
-        0 => format!("an enthusiasm for {}", bio.hobbies[index]),
-        1 => format!("being seen everywhere in {}", bio.clothing_features[index]),
-        _ => format!("a considerable talent for {}", bio.skills[index]),
+    let category = id.0 as usize % 3;
+    let filled: Vec<&str> = match category {
+        0 => bio.hobbies.iter(),
+        1 => bio.clothing_features.iter(),
+        _ => bio.skills.iter(),
+    }
+    .map(String::as_str)
+    .filter(|s| !s.trim().is_empty())
+    .collect();
+    let Some(&detail) = filled
+        .get((id.0 as usize / CAST_OUT_TEMPLATES.len()) % filled.len().max(1))
+    else {
+        return "a reputation this author has yet to properly uncover".to_string();
+    };
+    match category {
+        0 => format!("an enthusiasm for {detail}"),
+        1 => format!("being seen everywhere in {detail}"),
+        _ => format!("a considerable talent for {detail}"),
     }
 }
 
@@ -489,6 +512,37 @@ mod tests {
             detail,
             bio_detail(None, id),
             "a submitted bio must change the detail"
+        );
+    }
+
+    #[test]
+    fn bio_detail_never_selects_a_blank_entry_in_an_under_filled_category() {
+        // Only 3 of 5 hobbies filled in -- legal per `bio::MIN_CATEGORY_ENTRIES`
+        // (a real bio only has to fill in at least 3 of 5 per category), so
+        // this is a normal, expected shape, not an edge case nobody would
+        // ever submit.
+        let bio = crate::bio::Bio {
+            character_name: "Lady A".into(),
+            real_name: "Alice".into(),
+            occupation: "Debutante".into(),
+            hobbies: [
+                "chess".into(),
+                "fencing".into(),
+                "poetry".into(),
+                "".into(),
+                "".into(),
+            ],
+            clothing_features: std::array::from_fn(|i| format!("feature{i}")),
+            skills: std::array::from_fn(|i| format!("skill{i}")),
+        };
+        // PlayerId(12) selects the hobbies category (12 % 3 == 0) and, under
+        // the old raw-positional-index behavior, landed on `hobbies[3]` --
+        // one of the two blank slots -- producing a broken "an enthusiasm
+        // for " sentence on the shared Whistledown screen.
+        let detail = bio_detail(Some(&bio), PlayerId(12));
+        assert!(
+            detail.contains("chess") || detail.contains("fencing") || detail.contains("poetry"),
+            "must pick one of the actually-filled-in hobbies, got {detail:?}"
         );
     }
 }
