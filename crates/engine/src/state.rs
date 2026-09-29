@@ -1589,9 +1589,7 @@ fn convert(
     if state.cult_leader != Some(converter) {
         return Err(GameError::NotCurrentLeader(converter));
     }
-    if !state.is_active(converter) {
-        return Err(GameError::NotActive(converter));
-    }
+    require_active(state, converter)?;
     if state.available_recruitment_slots == 0 {
         return Err(GameError::NoRecruitmentSlotAvailable);
     }
@@ -1896,12 +1894,8 @@ fn nominate(
     if state.denouncement.is_none() {
         return Err(GameError::NoDenouncementOpen);
     }
-    if !state.is_active(voter) {
-        return Err(GameError::NotActive(voter));
-    }
-    if !state.is_active(nominee) {
-        return Err(GameError::NotActive(nominee));
-    }
+    require_active(state, voter)?;
+    require_active(state, nominee)?;
     if state.drunk_this_round.contains(&voter) {
         return Err(GameError::PlayerIsDrunk(voter));
     }
@@ -1975,9 +1969,7 @@ fn cast_ballot(
     voter: PlayerId,
     ballot: Ballot,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(voter) {
-        return Err(GameError::NotActive(voter));
-    }
+    require_active(state, voter)?;
     if state.drunk_this_round.contains(&voter) {
         return Err(GameError::PlayerIsDrunk(voter));
     }
@@ -2068,6 +2060,76 @@ fn close_denouncement(state: &mut GameState) {
     state.medic_protected_last_round = state.medic_protected_this_round.take();
 }
 
+/// Removes the Doctor/Medic's and Potion Maker's currently-protected
+/// targets, if any, from `tally` entirely -- not merely spared, so the
+/// next-highest vote-getter backfills the freed slot (Dalton's "backfill
+/// from the next candidate" resolution) rather than the slot going
+/// unfilled. Shared by `close_ballot` and `close_runoff`.
+///
+/// The Potion Maker's target is drained via `.take()`, clearing it for
+/// good -- NOT in `consume_ballot_modifiers` (which only flips
+/// `potion_maker_used`, before this ever reads it): left un-cleared, this
+/// same stale target would silently keep getting pulled out of every
+/// future Denouncement's tally too. The Medic's is deliberately left
+/// un-cleared here -- `close_denouncement` is where that one rotates (see
+/// its own doc comment on why "last round" has to mean "last
+/// Denouncement").
+///
+/// Returns both targets (the Medic's copied, the Potion Maker's already
+/// taken above) so a caller that also needs to know who they were --
+/// `close_runoff`'s `already_locked_in` filter -- doesn't have to re-read
+/// state after this already cleared one of them.
+fn remove_protected_targets_from_tally(
+    state: &mut GameState,
+    tally: &mut BTreeMap<PlayerId, u32>,
+) -> (Option<PlayerId>, Option<PlayerId>) {
+    let medic_protected = state.medic_protected_this_round;
+    if let Some(protected) = medic_protected {
+        tally.remove(&protected);
+    }
+    let potion_protected = state.potion_immunity_target.take();
+    if let Some(protected) = potion_protected {
+        tally.remove(&protected);
+    }
+    (medic_protected, potion_protected)
+}
+
+/// Resolves every already-decided Cast-Out from one ballot/runoff's `cast_out`
+/// list in a single pass, skipping anyone another cast-out's own cascade
+/// already swept out of the game earlier in this same batch -- e.g. the
+/// King/Queen and Prince/Princess both surfacing and both getting a slot in
+/// the same multi-slot Denouncement: casting out the King/Queen already
+/// casts out the Prince/Princess too (rules.md §5). Skipping here instead of
+/// re-resolving matters because `resolve_cast_out` correctly rejects an
+/// already-inactive target, and letting that rejection propagate would abort
+/// the whole command partway through, leaving `state` mutated despite
+/// returning `Err` (violating this function's own "no mutation on error"
+/// contract). Passing the full `cast_out` list as `also_departing` on every
+/// call additionally keeps a title cascade from crowning/electing someone
+/// else also in this same batch -- see `resolve_cast_out`'s doc comment.
+///
+/// Shared by `close_ballot` and `close_runoff`, the only two places a batch
+/// of simultaneous cast-outs is ever resolved.
+fn resolve_cast_outs(
+    state: &mut GameState,
+    cast_out: &[PlayerId],
+    fallback_replacement: Option<PlayerId>,
+) -> Result<Vec<DomainEvent>, GameError> {
+    let mut events = Vec::new();
+    for &player in cast_out {
+        if !state.is_active(player) {
+            continue;
+        }
+        events.extend(resolve_cast_out(
+            state,
+            player,
+            fallback_replacement,
+            cast_out,
+        )?);
+    }
+    Ok(events)
+}
+
 fn close_ballot(
     state: &mut GameState,
     fallback_replacement: Option<PlayerId>,
@@ -2095,23 +2157,9 @@ fn close_ballot(
 
     // Doctor/Medic's protection (rules.md §3.2) and the Potion Maker's
     // named-target immunity (rules.md §3.1, mechanically the same "protect
-    // family" shape since Dalton's follow-up ruling): each protected
-    // player is pulled out of the tally entirely -- not merely spared --
-    // so the next-highest vote-getter backfills the freed slot (Dalton's
-    // "backfill from the next candidate" resolution) rather than the slot
-    // going unfilled.
-    if let Some(protected) = state.medic_protected_this_round {
-        tally.remove(&protected);
-    }
-    // Cleared here, not in `consume_ballot_modifiers` (which already ran
-    // above) -- that function only flips `potion_maker_used`, since
-    // clearing the target there would happen *before* this removal ever
-    // reads it. Left un-cleared, this same stale target would silently
-    // keep getting pulled out of every future Denouncement's tally too,
-    // reintroducing the exact carryover bug this whole redesign fixes.
-    if let Some(protected) = state.potion_immunity_target.take() {
-        tally.remove(&protected);
-    }
+    // family" shape since Dalton's follow-up ruling) -- see
+    // `remove_protected_targets_from_tally`'s own doc comment.
+    remove_protected_targets_from_tally(state, &mut tally);
 
     let resolution = resolve_ballot(&tally, slots);
 
@@ -2121,32 +2169,7 @@ fn close_ballot(
         events.push(DomainEvent::BallotClosed {
             cast_out: cast_out.clone(),
         });
-        for &player in &cast_out {
-            // A player who was voted out independently can *also* be swept
-            // by another cast-out's own cascade within this same batch --
-            // e.g. the King/Queen and Prince/Princess both surfacing and
-            // both getting a slot in the same multi-slot Round 3
-            // Denouncement: casting out the King/Queen already casts out
-            // the Prince/Princess too (rules.md §5). Skip anyone the loop
-            // has already resolved this way instead of re-resolving them --
-            // `resolve_cast_out` correctly rejects an already-inactive
-            // target, and letting that rejection propagate here would
-            // abort the whole command partway through, leaving `state`
-            // mutated despite returning `Err` (violating this function's
-            // own "no mutation on error" contract). Passing `&cast_out` as
-            // `also_departing` additionally keeps a title cascade from
-            // crowning/electing someone else *also* in this same batch --
-            // see `resolve_cast_out`'s doc comment.
-            if !state.is_active(player) {
-                continue;
-            }
-            events.extend(resolve_cast_out(
-                state,
-                player,
-                fallback_replacement,
-                &cast_out,
-            )?);
-        }
+        events.extend(resolve_cast_outs(state, &cast_out, fallback_replacement)?);
         close_denouncement(state);
     } else {
         let slots_remaining = slots - resolution.locked_in.len();
@@ -2201,28 +2224,18 @@ fn close_runoff(
     };
     consume_ballot_modifiers(state);
 
-    if let Some(protected) = state.medic_protected_this_round {
-        tally.remove(&protected);
-    }
-    // Read once via `.take()` (clearing it), not `consume_ballot_modifiers`
-    // (which already ran above and only flips `potion_maker_used`) -- both
-    // this removal and the `already_locked_in` filter below need the same
-    // value, and leaving it un-cleared would silently keep protecting this
-    // same target in every future Denouncement for the rest of the game.
-    let potion_immunity_target = state.potion_immunity_target.take();
-    if let Some(protected) = potion_immunity_target {
-        tally.remove(&protected);
-    }
-    // The Medic (or the Potion Maker) can also target someone already
-    // locked in from the *original* ballot (before the tie) during the
-    // runoff window -- no ranked backfill is possible for an
-    // already-decided list like this, so the protected player is simply
-    // saved and that slot goes unfilled.
+    // See `remove_protected_targets_from_tally`'s own doc comment for why
+    // both targets come back out here: the Medic (or the Potion Maker) can
+    // also target someone already locked in from the *original* ballot
+    // (before the tie) during the runoff window -- no ranked backfill is
+    // possible for an already-decided list like this, so the protected
+    // player is simply saved and that slot goes unfilled, via the filter
+    // below.
+    let (medic_protected, potion_protected) =
+        remove_protected_targets_from_tally(state, &mut tally);
     let already_locked_in: Vec<PlayerId> = already_locked_in
         .into_iter()
-        .filter(|&id| {
-            Some(id) != state.medic_protected_this_round && Some(id) != potion_immunity_target
-        })
+        .filter(|&id| Some(id) != medic_protected && Some(id) != potion_protected)
         .collect();
 
     let resolution = resolve_ballot(&tally, slots_remaining);
@@ -2239,22 +2252,7 @@ fn close_runoff(
         cast_out: cast_out.clone(),
         unfilled_slot,
     }];
-    for &player in &cast_out {
-        // See the identical guard + `also_departing` argument in
-        // `close_ballot` -- a player already swept by another cast-out's
-        // own cascade earlier in this same batch must be skipped, not
-        // re-resolved, and no cascade in this batch may crown/elect anyone
-        // else who's also in it.
-        if !state.is_active(player) {
-            continue;
-        }
-        events.extend(resolve_cast_out(
-            state,
-            player,
-            fallback_replacement,
-            &cast_out,
-        )?);
-    }
+    events.extend(resolve_cast_outs(state, &cast_out, fallback_replacement)?);
     close_denouncement(state);
     Ok(events)
 }
@@ -2354,13 +2352,22 @@ fn close_tasks(state: &mut GameState) -> Vec<DomainEvent> {
     events
 }
 
-/// Whether the Ton hit "that round's talking-task completion threshold"
-/// (rules.md §3.2) -- a number rules.md never actually specifies anywhere.
-/// First-pass, documented-as-tunable default (same spirit as
-/// `recruitment::recruitment_window_size`'s schedule): at least half of
-/// the currently-active Ton players must be credited on at least one of
-/// `closed`'s tasks. Vacuously met if there are no active Ton players at
-/// all (nobody to fail it).
+/// The percentage of currently-active Ton players who must be credited on
+/// at least one of a closing task round's tasks to count as having hit
+/// "that round's talking-task completion threshold" (rules.md §3.2) -- a
+/// number rules.md never actually specifies. First-pass,
+/// documented-as-tunable default (same spirit as
+/// `recruitment::recruitment_window_size`'s schedule).
+///
+/// *** EDIT THIS to retune before game night -- no other code changes
+/// needed. ***
+const TON_TASK_THRESHOLD_PERCENT: usize = 50;
+
+/// Whether the Ton hit `TON_TASK_THRESHOLD_PERCENT` on `closed`'s tasks.
+/// Vacuously met if there are no active Ton players at all (nobody to fail
+/// it). Compared as `credited * 100 >= active_ton.len() *
+/// TON_TASK_THRESHOLD_PERCENT` to stay in exact integer arithmetic -- no
+/// float rounding at a headcount boundary.
 fn ton_met_task_threshold(state: &GameState, closed: &[TaskId]) -> bool {
     let active_ton: Vec<PlayerId> = state
         .players
@@ -2383,7 +2390,7 @@ fn ton_met_task_threshold(state: &GameState, closed: &[TaskId]) -> bool {
             })
         })
         .count();
-    credited * 2 >= active_ton.len()
+    credited * 100 >= active_ton.len() * TON_TASK_THRESHOLD_PERCENT
 }
 
 /// The Leader's Confidants effect (rules.md §3.2): reveals identities
@@ -2978,9 +2985,7 @@ fn opt_into_intermission(
     state: &mut GameState,
     player: PlayerId,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_active(state, player)?;
     state.intermission_opt_ins.insert(player);
     Ok(vec![DomainEvent::IntermissionOptedIn { player }])
 }
@@ -3165,9 +3170,7 @@ fn attempt_task(
         return Err(GameError::DuplicateNamedPlayerForTask);
     }
     for &id in &named {
-        if !state.is_active(id) {
-            return Err(GameError::NotActive(id));
-        }
+        require_active(state, id)?;
     }
 
     let credited = named.iter().any(|id| def.qualifying_players.contains(id));
@@ -3240,6 +3243,18 @@ fn apply_normal_ton_auto_succeed(state: &mut GameState, player: PlayerId, credit
     credited
 }
 
+/// Shared precondition for the many commands whose only actor/target-side
+/// requirement is "this player is still `Active`" -- see
+/// `error::GameError::NotActive`'s own doc comment. `require_character`
+/// below builds directly on this for the stronger "...and holds this
+/// specific character" check.
+fn require_active(state: &GameState, id: PlayerId) -> Result<(), GameError> {
+    if !state.is_active(id) {
+        return Err(GameError::NotActive(id));
+    }
+    Ok(())
+}
+
 /// Shared precondition for every Phase 2 ability command: the actor must be
 /// active and currently hold the specific character the ability belongs to.
 /// See `error::GameError::NotCharacter`'s doc comment for why this is one
@@ -3249,9 +3264,7 @@ fn require_character(
     player: PlayerId,
     required: Character,
 ) -> Result<(), GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_active(state, player)?;
     if state.players.get(&player).and_then(|p| p.character) != Some(required) {
         return Err(GameError::NotCharacter { player, required });
     }
@@ -3530,9 +3543,7 @@ fn priest_protect(
             character: Character::PriestPriestess,
         });
     }
-    if !state.is_active(target) {
-        return Err(GameError::NotActive(target));
-    }
+    require_active(state, target)?;
     if state.priest_protected_ever.contains(&target) {
         return Err(GameError::AlreadyProtectedByPriest(target));
     }
@@ -3560,9 +3571,7 @@ fn medic_protect(
     if state.denouncement.is_none() {
         return Err(GameError::NoActiveBallotToProtectAgainst);
     }
-    if !state.is_active(target) {
-        return Err(GameError::NotActive(target));
-    }
+    require_active(state, target)?;
     if state.medic_protected_last_round == Some(target) {
         return Err(GameError::CannotProtectSameTargetConsecutively(target));
     }
@@ -3583,9 +3592,7 @@ fn bartender_target(
             character: Character::Bartender,
         });
     }
-    if !state.is_active(target) {
-        return Err(GameError::NotActive(target));
-    }
+    require_active(state, target)?;
 
     state.bartender_used_this_round = true;
     if lands {
@@ -3632,9 +3639,7 @@ fn activate_potion_immunity(
     // `require_denouncement_open`'s doc comment for why this is checked
     // after the "already used" case above, not before.
     require_denouncement_open(state)?;
-    if !state.is_active(target) {
-        return Err(GameError::NotActive(target));
-    }
+    require_active(state, target)?;
     state.potion_immunity_target = Some(target);
     Ok(vec![DomainEvent::PotionImmunityActivated {
         player,
@@ -3650,9 +3655,7 @@ fn activate_double_vote(
     state: &mut GameState,
     player: PlayerId,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_active(state, player)?;
     let character = state.players.get(&player).and_then(|p| p.character);
     if !matches!(
         character,
@@ -3726,9 +3729,7 @@ fn duelist_challenge(
             character: Character::Duelist,
         });
     }
-    if !state.is_active(target) {
-        return Err(GameError::NotActive(target));
-    }
+    require_active(state, target)?;
     match state.denouncement.as_ref().map(|d| &d.phase) {
         Some(DenouncementPhase::Nomination { .. }) => {}
         Some(_) => return Err(GameError::NominationNotOpen),
@@ -3757,9 +3758,7 @@ fn agitator_redirect(
             character: Character::Agitator,
         });
     }
-    if !state.is_active(target) {
-        return Err(GameError::NotActive(target));
-    }
+    require_active(state, target)?;
     let denouncement = state
         .denouncement
         .as_mut()
