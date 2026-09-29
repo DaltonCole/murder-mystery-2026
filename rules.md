@@ -162,7 +162,7 @@ In-fiction, this mechanic is never called an "execution" or a "vote" — to play
 - **A regular Cultist, an innocent bystander, or anyone else:** simply removed. No faction or role is ever confirmed publicly for any Cast-Out player, including a correctly-caught Cultist — every result gets the same deliberately uninformative public treatment (§6). Full transparency is saved entirely for the Last Denouncement.
 
 ### What happens to a Cast Out player
-**They remain a member of their faction** — if that faction goes on to win the game, they win too, even though they can no longer act. Operationally, for the rest of the game they participate alongside the Servants: their app reveals their own full role and history for closure, they're locked out of future nominations/votes/abilities, but they can keep playing contest rounds — as a participant or as a zone scorekeeper — and get the **Gallery** role for the finale (§7).
+**They remain a member of their faction** — if that faction goes on to win the game, they win too, even though they can no longer act on its behalf. Operationally, for the rest of the game they participate alongside the Servants: their app reveals their own full role and history for closure, they're locked out of future nominations/votes/abilities, but they keep playing everything else — tasks and contest rounds alike, as a participant or as a zone scorekeeper — and get the **Gallery** role for the finale (§7). Their task/contest results still count toward their own original faction, exactly as if they'd never been Cast Out.
 
 ---
 

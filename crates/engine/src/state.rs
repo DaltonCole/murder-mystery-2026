@@ -2510,9 +2510,7 @@ fn submit_creative_entry(
     round: Round,
     entry: CreativeEntry,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_player_for_task_or_contest(state, player)?;
     check_contest_category_choice(state, player, round, ContestCategory::Creativity)?;
     contest_minigame::check_creative_entry(&entry)?;
     let payload = creativity_payload_mut(state, round)?;
@@ -2532,9 +2530,7 @@ fn rate_creative_entry(
     round: Round,
     stars: u8,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_player_for_task_or_contest(state, player)?;
     check_contest_category_choice(state, player, round, ContestCategory::Creativity)?;
     if !(1..=5).contains(&stars) {
         return Err(GameError::StarRatingOutOfRange(stars));
@@ -2610,9 +2606,7 @@ fn submit_quiz_answer(
     question_index: usize,
     choice_index: usize,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_player_for_task_or_contest(state, player)?;
     check_contest_category_choice(state, player, round, ContestCategory::Intelligence)?;
     let quiz = quiz_payload_mut(state, round)?;
     let progress = quiz.progress.entry(player).or_default();
@@ -2665,9 +2659,7 @@ fn submit_memory_score(
     round: Round,
     longest_sequence: u32,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_player_for_task_or_contest(state, player)?;
     check_contest_category_choice(state, player, round, ContestCategory::Intelligence)?;
     contest_minigame::check_memory_sequence_length(longest_sequence)?;
     let category = ContestCategory::Intelligence;
@@ -2711,9 +2703,7 @@ fn submit_wordle_guess(
     round: Round,
     guess: String,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_player_for_task_or_contest(state, player)?;
     check_contest_category_choice(state, player, round, ContestCategory::Intelligence)?;
     let guess = contest_minigame::normalize_wordle_guess(&guess)
         .map_err(|_| GameError::WordleGuessMustBeAFiveLetterWord)?;
@@ -2769,9 +2759,7 @@ fn submit_physical_placement(
     round: Round,
     placement: u32,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_player_for_task_or_contest(state, player)?;
     check_contest_category_choice(state, player, round, ContestCategory::Strength)?;
     if placement == 0 {
         return Err(GameError::PlacementOutOfRange(placement));
@@ -2962,9 +2950,7 @@ fn choose_contest_category(
     round: Round,
     category: ContestCategory,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_player_for_task_or_contest(state, player)?;
     if round != Round::Four {
         return Err(GameError::NotAContestRound(round));
     }
@@ -3160,9 +3146,7 @@ fn attempt_task(
     task: TaskId,
     named: [PlayerId; 3],
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_player_for_task_or_contest(state, player)?;
     let def = state.tasks.get(&task).ok_or(GameError::UnknownTask(task))?;
     if def.expected_code.is_some() {
         return Err(GameError::NotATalkTask(task));
@@ -3208,9 +3192,7 @@ fn attempt_location_task(
     task: TaskId,
     code: String,
 ) -> Result<Vec<DomainEvent>, GameError> {
-    if !state.is_active(player) {
-        return Err(GameError::NotActive(player));
-    }
+    require_player_for_task_or_contest(state, player)?;
     let def = state.tasks.get(&task).ok_or(GameError::UnknownTask(task))?;
     let Some(expected) = def.expected_code.as_deref() else {
         return Err(GameError::NotALocationTask(task));
@@ -3281,6 +3263,24 @@ fn require_character(
 /// precondition to check first.
 fn require_player(state: &GameState, id: PlayerId) -> Result<&Player, GameError> {
     state.players.get(&id).ok_or(GameError::UnknownPlayer(id))
+}
+
+/// Shared precondition for every task/contest-mini-game submission command
+/// (`AttemptTask`, `AttemptLocationTask`, `ChooseContestCategory`,
+/// `SubmitCreativeEntry`/`RateCreativeEntry`, `SubmitQuizAnswer`,
+/// `SubmitMemoryScore`, `SubmitWordleGuess`, `SubmitPhysicalPlacement`) --
+/// deliberately weaker than `is_active`. rules.md §5: a Cast-Out player
+/// keeps playing the rest of the game "just like a Servant" (tasks,
+/// contest mini-games), losing only their nominations/votes/abilities, not
+/// their ability to act here. Their scores still count toward their own
+/// *true* faction wherever a contest result is tallied --
+/// `contest_minigame::resolve_ton_won` already keys off `true_faction()`,
+/// never `PlayerStatus`, so this needs no matching change there: "they
+/// still win or lose with their original faction." Only rejects a
+/// genuinely unknown `PlayerId`.
+fn require_player_for_task_or_contest(state: &GameState, id: PlayerId) -> Result<(), GameError> {
+    require_player(state, id)?;
+    Ok(())
 }
 
 /// Shared precondition for the four procedural Denouncement modifiers
@@ -6927,7 +6927,9 @@ mod tests {
     }
 
     #[test]
-    fn attempt_location_task_rejects_an_inactive_player() {
+    fn attempt_location_task_still_credits_a_cast_out_player() {
+        // rules.md §5: a Cast-Out player keeps playing tasks/contests "just
+        // like a Servant" for the rest of the game.
         let (mut state, everyone) = setup_game_with_extra_voters(0);
         let task = push_location_task(
             &mut state,
@@ -6943,15 +6945,39 @@ mod tests {
             },
         )
         .unwrap();
-        let result = apply_command(
+        let events = apply_command(
             &mut state,
             Command::AttemptLocationTask {
                 player: everyone[0],
                 task,
                 code: "OPEN SESAME".into(),
             },
+        )
+        .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::TaskAttempted { credited: true, .. })));
+    }
+
+    #[test]
+    fn attempt_location_task_rejects_an_unknown_player() {
+        let (mut state, _everyone) = setup_game_with_extra_voters(0);
+        let task = push_location_task(
+            &mut state,
+            "Find the code at the bar",
+            TaskTier::Hard,
+            "OPEN SESAME",
         );
-        assert_eq!(result, Err(GameError::NotActive(everyone[0])));
+        let unknown = PlayerId(9999);
+        let result = apply_command(
+            &mut state,
+            Command::AttemptLocationTask {
+                player: unknown,
+                task,
+                code: "OPEN SESAME".into(),
+            },
+        );
+        assert_eq!(result, Err(GameError::UnknownPlayer(unknown)));
     }
 
     #[test]
@@ -7205,26 +7231,50 @@ mod tests {
     }
 
     #[test]
-    fn attempt_task_rejects_an_inactive_player() {
+    fn attempt_task_still_credits_a_cast_out_player() {
+        // rules.md §5: a Cast-Out player keeps playing tasks/contests "just
+        // like a Servant" for the rest of the game. Casting out `everyone[4]`
+        // (a plain Ton extra, not the King/Queen) avoids the King/Queen
+        // cascade sweeping the Prince/Princess (`everyone[1]`) out too,
+        // which would otherwise make them an invalid `named` contact below.
         let (mut state, everyone) = setup_game_with_extra_voters(2);
         let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
         apply_command(
             &mut state,
             Command::CastOut {
-                player: everyone[0],
+                player: everyone[4],
                 fallback_replacement: None,
             },
         )
         .unwrap();
+        let events = apply_command(
+            &mut state,
+            Command::AttemptTask {
+                player: everyone[4],
+                task,
+                named: [everyone[1], everyone[2], everyone[3]],
+            },
+        )
+        .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::TaskAttempted { credited: true, .. })));
+    }
+
+    #[test]
+    fn attempt_task_rejects_an_unknown_player() {
+        let (mut state, everyone) = setup_game_with_extra_voters(2);
+        let task = push_task(&mut state, "Talk to someone", TaskTier::Easy, &everyone);
+        let unknown = PlayerId(9999);
         let result = apply_command(
             &mut state,
             Command::AttemptTask {
-                player: everyone[0],
+                player: unknown,
                 task,
                 named: [everyone[1], everyone[2], everyone[3]],
             },
         );
-        assert_eq!(result, Err(GameError::NotActive(everyone[0])));
+        assert_eq!(result, Err(GameError::UnknownPlayer(unknown)));
     }
 
     #[test]
@@ -11575,6 +11625,31 @@ mod tests {
     }
 
     #[test]
+    fn submit_creative_entry_still_accepts_a_cast_out_player() {
+        // rules.md §5: a Cast-Out player keeps playing contest rounds
+        // "just like a Servant" for the rest of the game.
+        let (mut state, ton, ..) = setup_for_contest(1, 1);
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: ton[0],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        open_creativity(&mut state, Round::Two, CreativityKind::Joke, "Tell a joke");
+        let result = apply_command(
+            &mut state,
+            Command::SubmitCreativeEntry {
+                player: ton[0],
+                round: Round::Two,
+                entry: joke("a"),
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn submit_creative_entry_rejects_an_invalid_drawing_data_url() {
         let (mut state, ton, ..) = setup_for_contest(1, 1);
         open_creativity(
@@ -11904,6 +11979,61 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, DomainEvent::ContestResultRecorded { ton_won: false, .. })));
+    }
+
+    #[test]
+    fn resolve_ton_won_still_counts_a_cast_out_players_own_true_faction() {
+        // rules.md §5: a Cast-Out player "still wins or loses with their
+        // original faction" -- their contest score keeps counting for Ton
+        // even after they're Cast Out.
+        let (mut state, ton, room) = setup_for_contest(1, 1);
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: ton[0],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::OpenContestMinigame {
+                round: Round::Two,
+                prompt: "Tug of war".into(),
+                detail: OpenMinigameDetail::Strength,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitPhysicalPlacement {
+                player: ton[0],
+                round: Round::Two,
+                placement: 1,
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command::SubmitPhysicalPlacement {
+                player: room[0],
+                round: Round::Two,
+                placement: 2,
+            },
+        )
+        .unwrap();
+
+        let events = apply_command(
+            &mut state,
+            Command::CloseContestMinigame {
+                round: Round::Two,
+                category: ContestCategory::Strength,
+            },
+        )
+        .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ContestResultRecorded { ton_won: true, .. })));
     }
 
     #[test]
@@ -13200,6 +13330,30 @@ mod tests {
             state.contest_category_choice(Round::Four, ton[0]),
             Some(ContestCategory::Creativity)
         );
+    }
+
+    #[test]
+    fn choose_contest_category_still_accepts_a_cast_out_player() {
+        // rules.md §5: a Cast-Out player keeps playing contest rounds
+        // "just like a Servant" for the rest of the game.
+        let (mut state, ton, _room) = setup_for_round_four(1, 1);
+        apply_command(
+            &mut state,
+            Command::CastOut {
+                player: ton[0],
+                fallback_replacement: None,
+            },
+        )
+        .unwrap();
+        let result = apply_command(
+            &mut state,
+            Command::ChooseContestCategory {
+                player: ton[0],
+                round: Round::Four,
+                category: ContestCategory::Creativity,
+            },
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
