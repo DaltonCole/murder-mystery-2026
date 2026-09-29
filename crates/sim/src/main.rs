@@ -33,8 +33,9 @@
 //! not just unit coverage.
 
 use engine::{
-    apply_command, evaluate_win_conditions, Ballot, Character, Command, DenouncementPhase,
-    DomainEvent, Faction, GameOutcome, GameState, PlayerId, PlayerStatus, TaskId, TaskTier, Viewer,
+    apply_command, evaluate_win_conditions, ton_split_count, Ballot, Character, Command,
+    DenouncementPhase, DomainEvent, Faction, GameOutcome, GameState, PlayerId, PlayerStatus,
+    TaskId, TaskTier, Viewer,
 };
 use rand::rngs::StdRng;
 use rand::seq::{IndexedRandom, SliceRandom};
@@ -233,7 +234,7 @@ fn setup_game(state: &mut GameState, player_count: usize, rng: &mut StdRng) -> R
         .ok_or_else(|| {
             format!("{player_count} players is too few to seed Servants + a Cult Leader")
         })?;
-    let ton_count = ((remaining as f64) * 0.6).round() as usize;
+    let ton_count = ton_split_count(remaining);
     let uprising_count = remaining - ton_count;
 
     if ton_count < 2 || uprising_count < 1 {

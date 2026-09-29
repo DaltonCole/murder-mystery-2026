@@ -55,8 +55,8 @@ pub use finale_reveal::{
 pub use history::{RoundHistoryEntry, TaskHistoryEntry, TaskOutcome};
 pub use player::{Faction, Player, PlayerId, MAX_PLAYERS, MAX_PLAYER_NAME_LEN};
 pub use raffle::{
-    raffle_priority, raffle_winners, ticket_count, ticket_slots, MAX_INTEREST_LEVEL,
-    MIN_INTEREST_LEVEL, RAFFLED_ROLES,
+    raffle_priority, raffle_winners, ticket_count, ticket_slots, ton_split_count,
+    MAX_INTEREST_LEVEL, MIN_INTEREST_LEVEL, RAFFLED_ROLES, TON_SHARE,
 };
 pub use recruitment::recruitment_window_size;
 pub use round::Round;

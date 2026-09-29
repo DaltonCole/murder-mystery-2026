@@ -36,6 +36,26 @@ pub fn ticket_count(interest_level: u8) -> u32 {
     }
 }
 
+/// rules.md §1: once the raffle's major roles are assigned, the leftover
+/// pool splits "unevenly on purpose -- the Ton outnumbers the Uprising,
+/// roughly 60/40." The exact split, factored out once so every caller that
+/// performs it -- the real host's `game_server::run_raffle`, the bot test
+/// harness's `HostDriver::setup_game`, and the headless `sim` binary's own
+/// from-scratch setup -- tunes the ratio from one place instead of three
+/// independently-typed `0.6` literals.
+///
+/// *** EDIT THIS to retune the split before game night -- no other code
+/// changes needed. ***
+pub const TON_SHARE: f64 = 0.6;
+
+/// How many of `remaining` (a shuffled pool with no raffle-won role) become
+/// Ton, per [`TON_SHARE`] -- the rest become Uprising. Pure arithmetic, no
+/// randomness of its own; the caller supplies an already-shuffled slice (or
+/// count) and splits it at this index.
+pub fn ton_split_count(remaining: usize) -> usize {
+    (remaining as f64 * TON_SHARE).round() as usize
+}
+
 /// Every named role the setup raffle assigns, in the order roles are
 /// filled -- the four major titles first (rules.md's own framing: "a
 /// weighted raffle for major roles"), then the rest of the Phase 2/3
@@ -117,6 +137,16 @@ pub fn raffle_winners(priority: &[PlayerId]) -> Vec<(Character, PlayerId)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ton_split_count_rounds_to_the_nearest_whole_player() {
+        assert_eq!(ton_split_count(10), 6);
+        assert_eq!(ton_split_count(0), 0);
+        // 17 * 0.6 == 10.2 -- rounds down to 10.
+        assert_eq!(ton_split_count(17), 10);
+        // 15 * 0.6 == 9.0 exactly.
+        assert_eq!(ton_split_count(15), 9);
+    }
 
     #[test]
     fn ticket_counts_match_rules_md_exactly() {

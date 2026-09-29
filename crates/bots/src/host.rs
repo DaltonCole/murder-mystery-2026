@@ -33,8 +33,9 @@
 
 use crate::protocol::{Conn, ConnError};
 use engine::{
-    raffle_priority, raffle_winners, ticket_count, ticket_slots, Character, Command,
-    ContestCategory, DenouncementView, Faction, PlayerId, PlayerView, Round, TaskTier, Viewer,
+    raffle_priority, raffle_winners, ticket_count, ticket_slots, ton_split_count, Character,
+    Command, ContestCategory, DenouncementView, Faction, PlayerId, PlayerView, Round, TaskTier,
+    Viewer,
 };
 use rand::rngs::StdRng;
 use rand::seq::{IndexedRandom, SliceRandom};
@@ -252,7 +253,7 @@ impl HostDriver {
             .filter(|id| !won_a_role.contains(id))
             .collect();
         remaining.shuffle(&mut rng);
-        let ton_count = (remaining.len() as f64 * 0.6).round() as usize;
+        let ton_count = ton_split_count(remaining.len());
         let (ton, uprising) = remaining.split_at(ton_count);
         for (group, faction) in [(ton, Faction::Ton), (uprising, Faction::Uprising)] {
             for &id in group {

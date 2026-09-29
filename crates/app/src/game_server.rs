@@ -14,9 +14,9 @@
 
 use engine::{
     apply_command, contest_submission_count, math_questions, raffle_priority, raffle_winners,
-    task_candidates, ticket_count, ticket_slots, trivia_questions, view_for, Command,
-    ContestCategory, CreativityKind, CreativityPhase, DenouncementPhase, DomainEvent, Faction,
-    GameError, GameState, IntelligenceKind, MinigamePayload, OpenMinigameDetail, PlayerId,
+    task_candidates, ticket_count, ticket_slots, ton_split_count, trivia_questions, view_for,
+    Command, ContestCategory, CreativityKind, CreativityPhase, DenouncementPhase, DomainEvent,
+    Faction, GameError, GameState, IntelligenceKind, MinigamePayload, OpenMinigameDetail, PlayerId,
     PlayerStatus, PlayerView, RatingStep, Round, TaskTier, Viewer, WORD_LIST,
 };
 use rand::seq::{IndexedRandom, SliceRandom};
@@ -1265,7 +1265,7 @@ pub fn run_raffle() -> Result<Vec<DomainEvent>, String> {
             .filter(|id| !won_a_role.contains(id))
             .collect();
         remaining.shuffle(&mut rng);
-        let ton_count = (remaining.len() as f64 * 0.6).round() as usize;
+        let ton_count = ton_split_count(remaining.len());
         let (ton, uprising) = remaining.split_at(ton_count);
         for (group, faction) in [(ton, Faction::Ton), (uprising, Faction::Uprising)] {
             for &id in group {
